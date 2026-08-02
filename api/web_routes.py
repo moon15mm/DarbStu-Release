@@ -454,7 +454,13 @@ async def web_send_absence_messages(req: Request):
         for i, stu in enumerate(students):
             # تأخير عشوائي بين الرسائل (إلا الأولى)
             if i > 0:
-                await asyncio.sleep(random.uniform(7, 15))
+                # تباعد متصاعد: يبطؤ كلما طالت الدفعة، فالدفعة الطويلة
+                # المتسارعة هي ما يلفت كاشف الإزعاج لا الرسالة المفردة
+                try:
+                    import wa_limits
+                    await asyncio.sleep(wa_limits.next_delay())
+                except Exception:
+                    await asyncio.sleep(random.uniform(8, 16))
             
             sid   = str(stu.get("student_id", ""))
             sname = stu.get("student_name", "")
@@ -506,7 +512,13 @@ async def web_send_tardiness_messages(req: Request):
         sent = failed = 0
         for i, stu in enumerate(students):
             if i > 0:
-                await asyncio.sleep(random.uniform(7, 15))
+                # تباعد متصاعد: يبطؤ كلما طالت الدفعة، فالدفعة الطويلة
+                # المتسارعة هي ما يلفت كاشف الإزعاج لا الرسالة المفردة
+                try:
+                    import wa_limits
+                    await asyncio.sleep(wa_limits.next_delay())
+                except Exception:
+                    await asyncio.sleep(random.uniform(8, 16))
                 
             sid   = str(stu.get("student_id", ""))
             sname = stu.get("student_name", "")

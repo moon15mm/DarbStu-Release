@@ -295,6 +295,12 @@ class TardinessMessagesTabMixin:
 
                 # ── تأخير بين الرسائل لتجنب حظر الواتساب ──
                 delay_sec = self.tard_msg_delay_var.get() if hasattr(self, "tard_msg_delay_var") else 8
+                try:
+                    import wa_limits
+                    # التباعد المتصاعد أهم من رقم ثابت يختاره المستخدم
+                    delay_sec = max(delay_sec, wa_limits.next_delay())
+                except Exception:
+                    pass
                 time.sleep(max(1, delay_sec))
 
                 # سجّل في message_log

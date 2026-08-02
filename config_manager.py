@@ -302,6 +302,77 @@ def feminize(text):
     return pattern.sub(_pick, str(text))
 
 
+# ═══════════════════════════════════════════════════════════════
+#  مفتاح إيقاف كل البوتات
+# ═══════════════════════════════════════════════════════════════
+# ستة أشياء تعمل تلقائياً: رسائل الغياب، الاستئذان، الإشعارات الذكية،
+# التقرير اليومي، رابط التأخر المجدوَل، ومكافأة الحضور الأسبوعية.
+# إطفاؤها واحداً واحداً متعب، ونسيان واحد يعني رسائل تخرج بلا قصد.
+#
+# المفتاح الرئيسي يعلو عليها جميعاً **دون أن يمحو ضبطها الفردي**:
+# إطفاؤه ثم تشغيله يُعيد كل شيء كما كان، لا يشغّل ما كان مطفأً.
+
+BOT_FLAGS = (
+    "absence_bot_enabled",
+    "permission_bot_enabled",
+    "alert_enabled",
+    "daily_report_enabled",
+    "tardiness_auto_send_enabled",
+    "weekly_reward_enabled",
+)
+
+
+def bots_master_on() -> bool:
+    """هل المفتاح الرئيسي للبوتات مُشغَّل؟ (الافتراضي: نعم)"""
+    try:
+        return bool(load_config().get("bots_master_enabled", True))
+    except Exception:
+        return True
+
+
+def set_bots_master(on: bool) -> bool:
+    """يشغّل/يوقف كل البوتات دفعةً واحدة."""
+    try:
+        cfg = load_config()
+        cfg["bots_master_enabled"] = bool(on)
+        save_config(cfg)
+        print(f"[BOTS] المفتاح الرئيسي: {'تشغيل' if on else 'إيقاف'}")
+        return True
+    except Exception as e:
+        print(f"[BOTS] تعذّر الحفظ: {e}")
+        return False
+
+
+def bot_enabled(flag: str, default: bool = True) -> bool:
+    """
+    هل هذه المهمة التلقائية مسموح لها بالعمل؟
+
+    استعملها بدل `cfg.get(flag)` المباشر في كل موضع يُطلق إرسالاً
+    تلقائياً — وإلا أفلتت مهمة من المفتاح الرئيسي وأرسلت بلا إذن.
+    """
+    try:
+        cfg = load_config()
+        if not cfg.get("bots_master_enabled", True):
+            return False
+        return bool(cfg.get(flag, default))
+    except Exception:
+        return default
+
+
+def bots_status() -> dict:
+    """حالة كل البوتات — للعرض في الواجهة."""
+    try:
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    master = bool(cfg.get("bots_master_enabled", True))
+    return {
+        "master": master,
+        "flags": {f: bool(cfg.get(f, False)) for f in BOT_FLAGS},
+        "active": sum(1 for f in BOT_FLAGS if master and cfg.get(f, False)),
+    }
+
+
 def render_template(tpl: str, **extra) -> str:
     """
     تصيير أي قالب رسالة مع كل مصطلحات الجنس تلقائياً.

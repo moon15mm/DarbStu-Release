@@ -99,6 +99,17 @@ def send_whatsapp_message(phone: str, message_body: str, student_data: dict = No
         print(f"[WHATSAPP-WARN] {msg}")
         return False, msg
 
+    # السقف اليومي والإحماء — يُفحص قبل الإرسال لا بعده. تجاوز السقف
+    # يعني تجميد ٢٤ ساعة، ورسالة واحدة زائدة تُوقف كل رسائل الغد.
+    try:
+        import wa_limits
+        _ok, _why = wa_limits.try_consume(_port)
+        if not _ok:
+            print(f"[WA-LIMITS] ⛔ {_why}")
+            return False, _why
+    except Exception as _e:
+        print(f"[WA-LIMITS] تعذّر فحص السقف: {_e}")
+
     # تحويل التنسيق المحلي إلى دولي
     if len(cleaned_phone) == 10 and cleaned_phone.startswith('05'):
         cleaned_phone = '966' + cleaned_phone[1:]

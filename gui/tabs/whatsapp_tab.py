@@ -225,6 +225,81 @@ class WhatsappTabMixin:
             lf.pack(fill="x", **PAD)
             return lf
 
+        # ── بطاقة 0: المفتاح الرئيسي ────────────────────────────
+        # ستة أشياء ترسل تلقائياً. إطفاؤها واحداً واحداً متعب، ونسيان
+        # واحد يعني رسائل تخرج بلا قصد — خاصة أثناء التجربة والتجهيز.
+        from config_manager import (set_bots_master, bots_status, BOT_FLAGS)
+
+        _BOT_AR = {
+            "absence_bot_enabled":        "رسائل الغياب",
+            "permission_bot_enabled":     "رسائل الاستئذان",
+            "alert_enabled":              "الإشعارات الذكية",
+            "daily_report_enabled":       "التقرير اليومي",
+            "tardiness_auto_send_enabled": "رابط التأخر المجدوَل",
+            "weekly_reward_enabled":      "مكافأة الحضور الأسبوعية",
+        }
+
+        mst_card = _card(inner, "🛑  المفتاح الرئيسي للإرسال التلقائي", "#b91c1c")
+        tk.Label(mst_card,
+                 text="يوقف كل ما يُرسل تلقائياً دفعةً واحدة. لا يمحو إعداداتك — "
+                      "عند التشغيل يعود كل شيء كما كان.",
+                 font=("Tahoma", 9), bg="white", fg="#6b7280",
+                 justify="right", wraplength=560).pack(anchor="e", padx=10, pady=(6, 2))
+
+        mst_row = tk.Frame(mst_card, bg="white")
+        mst_row.pack(fill="x", padx=10, pady=(0, 4))
+        self._wm_master_lbl = tk.Label(mst_row, text="",
+                                       font=("Tahoma", 11, "bold"), bg="white")
+        self._wm_master_lbl.pack(side="right", padx=(0, 10))
+        self._wm_master_detail = tk.Label(mst_card, text="", font=("Tahoma", 9),
+                                          bg="white", fg="#6b7280",
+                                          justify="right", wraplength=560)
+        self._wm_master_detail.pack(anchor="e", padx=10, pady=(0, 8))
+
+        def _refresh_master():
+            st = bots_status()
+            if st["master"]:
+                self._wm_master_lbl.config(text="✅  الإرسال التلقائي مُشغَّل",
+                                           fg="#059669")
+                names = [_BOT_AR[f] for f in BOT_FLAGS if st["flags"].get(f)]
+                self._wm_master_detail.config(
+                    text=("العاملة الآن: " + "، ".join(names)) if names
+                    else "لا توجد مهمة مفعّلة حالياً — كلها مطفأة فردياً.",
+                    fg="#6b7280")
+                self._wm_master_off.config(state="normal", bg="#fee2e2", fg="#b91c1c")
+                self._wm_master_on.config(state="disabled", bg="#f3f4f6", fg="#9ca3af")
+            else:
+                self._wm_master_lbl.config(text="⛔  الإرسال التلقائي موقوف بالكامل",
+                                           fg="#b91c1c")
+                self._wm_master_detail.config(
+                    text="لن تخرج أي رسالة تلقائية. الإرسال اليدوي يعمل كالمعتاد.",
+                    fg="#b91c1c")
+                self._wm_master_off.config(state="disabled", bg="#f3f4f6", fg="#9ca3af")
+                self._wm_master_on.config(state="normal", bg="#dcfce7", fg="#059669")
+
+        def _set_master(on):
+            set_bots_master(on)
+            _refresh_master()
+            try:
+                if on:
+                    _set_absence_bot(load_config().get("absence_bot_enabled", True))
+                    _set_permission_bot(load_config().get("permission_bot_enabled", True))
+            except Exception:
+                pass
+
+        btn_row = tk.Frame(mst_card, bg="white")
+        btn_row.pack(fill="x", padx=10, pady=(0, 10))
+        self._wm_master_off = tk.Button(btn_row, text="⛔  إيقاف كل البوتات",
+            font=("Tahoma", 10, "bold"), relief="flat", cursor="hand2",
+            padx=14, pady=6, command=lambda: _set_master(False))
+        self._wm_master_off.pack(side="right", padx=(0, 6))
+        self._wm_master_on = tk.Button(btn_row, text="▶  تشغيل كل البوتات",
+            font=("Tahoma", 10, "bold"), relief="flat", cursor="hand2",
+            padx=14, pady=6, command=lambda: _set_master(True))
+        self._wm_master_on.pack(side="right")
+
+        self._wm_refresh_master = _refresh_master
+
         # ── بطاقة 1: خادم الواتساب ──────────────────────────────
         srv_card = _card(inner, "🖥️  خادم الواتساب", "#1565C0")
 
@@ -472,6 +547,10 @@ class WhatsappTabMixin:
 
         def _load_initial():
             cfg = load_config()
+            try:
+                self._wm_refresh_master()
+            except Exception:
+                pass
             _set_absence_bot(cfg.get("absence_bot_enabled", True))
             _set_permission_bot(cfg.get("permission_bot_enabled", True))
             # جلب حالة بوت الأعذار في خيط خلفي

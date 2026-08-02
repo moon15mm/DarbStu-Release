@@ -5,7 +5,8 @@ alerts_service.py — نظام الإشعارات الذكية والتقاري�
 import datetime, threading, os, json, sqlite3
 from typing import List, Dict, Any, Optional
 from constants import DB_PATH, DATA_DIR, TZ_OFFSET, CONFIG_JSON, now_riyadh_date
-from config_manager import load_config, get_terms, render_message
+from config_manager import (load_config, get_terms, render_message,
+                            bot_enabled)
 from database import (get_db, query_absences, query_tardiness,
                       _apply_class_name_fix, load_students, get_cloud_client)
 from whatsapp_service import send_whatsapp_message, check_whatsapp_server_status
@@ -17,7 +18,7 @@ def _get_compute_today_metrics():
 def safe_send_absence_alert(student_id: str, student_name: str, class_name: str, date_str: str) -> (bool, str):
     """يرسل تنبيه الغياب مع فحص حالة الخادم أولاً"""
     _cfg = load_config()
-    if not _cfg.get("absence_bot_enabled", True):
+    if not bot_enabled("absence_bot_enabled", True):
         return False, "بوت رسائل الغياب موقوف — فعّله من تبويب إدارة الواتساب."
 
     if not check_whatsapp_server_status():
@@ -413,7 +414,7 @@ def run_smart_alerts(month: str = None, log_cb=None) -> Dict:
     يُرجع ملخص العملية.
     """
     cfg = load_config()
-    if not cfg.get("alert_enabled", True):
+    if not bot_enabled("alert_enabled", True):
         return {"skipped": True, "reason": "الإشعارات معطّلة"}
 
     if month is None:
@@ -447,7 +448,11 @@ def run_smart_alerts(month: str = None, log_cb=None) -> Dict:
             status = "✅" if (res["parent"] or res["admin"]) else "❌"
             log_cb("{} {} — {} يوم غياب".format(
                 status, s["student_name"], s["absence_count"]))
-        time.sleep(_delay)  # تأخير بين الرسائل لتجنب حظر الواتساب
+        try:
+            import wa_limits
+            time.sleep(max(_delay, wa_limits.next_delay()))
+        except Exception:
+            time.sleep(_delay)
 
     return {
         "month": month, "threshold": threshold,
@@ -771,7 +776,7 @@ def schedule_daily_report(root_widget):
     لا يعمل في الخلفية — يُجدَّد مرة واحدة فقط عند الاستدعاء.
     """
     cfg = load_config()
-    if not cfg.get("daily_report_enabled", False):
+    if not bot_enabled("daily_report_enabled", False):
         return  # معطّل — لا تجدول
 
     now   = datetime.datetime.now()
@@ -791,7 +796,7 @@ def schedule_daily_report(root_widget):
 
     def _fire():
         cfg2 = load_config()
-        if cfg2.get("daily_report_enabled", False):
+        if bot_enabled("daily_report_enabled", False):
             import threading as _th
             _th.Thread(
                 target=lambda: send_daily_report_to_admin(),
@@ -883,7 +888,7 @@ def delete_permission(pid):
 def send_permission_request(pid: int) -> tuple:
     """يرسل رسالة واتساب لولي الأمر يطلب موافقته — بدون جدولة."""
     _cfg = load_config()
-    if not _cfg.get("permission_bot_enabled", True):
+    if not bot_enabled("permission_bot_enabled", True):
         return False, "بوت رسائل الاستئذان موقوف — فعّله من تبويب إدارة الواتساب."
     if not check_whatsapp_server_status():
         return False, "خادم واتساب غير متصل — شغّله أولاً"
@@ -993,7 +998,7 @@ def run_weekly_rewards(log_cb=None) -> Dict:
     """يقوم بحصر الطلاب الملتزمين وإرسال رسائل تهنئة لهم."""
     from config_manager import render_reward_message
     cfg = load_config()
-    if not cfg.get("weekly_reward_enabled", False):
+    if not bot_enabled("weekly_reward_enabled", False):
         return {"skipped": True, "reason": "ميزة التعزيز الأسبوعي معطّلة"}
 
     if not check_whatsapp_server_status():

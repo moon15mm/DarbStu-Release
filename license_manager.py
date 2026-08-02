@@ -274,7 +274,7 @@ LICENSE_PUBKEY = "IPPBJM2OB1Xf1hirk7hH6V8t5CytLliqQhQi5ro8VDc="
 
 LICENSE_FILE   = os.path.join(BASE_DIR, ".darb_license")
 TRIAL_FILE     = os.path.join(BASE_DIR, ".darb_trial")
-TRIAL_DAYS     = 7
+TRIAL_DAYS     = 14
 
 # يعمل البرنامج بلا إنترنت بآخر تذكرة صالحة لهذه المدة قبل أن يطالب بالاتصال
 OFFLINE_GRACE_DAYS = 14
