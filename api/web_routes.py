@@ -516,15 +516,10 @@ async def web_send_tardiness_messages(req: Request):
             if not phone:
                 failed += 1; continue
 
-            _t  = get_terms()
-            msg = template.format(
-                school_name=school,
-                student_name=sname,
-                class_name=cname,
-                date=date_str,
-                minutes_late=mins,
-                guardian=_t["guardian"], son=_t["son"],
-                late_v=_t["late_v"], his=_t["his"])
+            from config_manager import render_template
+            msg = render_template(
+                template, student_name=sname, class_name=cname,
+                date=date_str, minutes_late=mins)
 
             ok, _ = send_whatsapp_message(phone, msg, humanize=True)
             if ok: sent += 1

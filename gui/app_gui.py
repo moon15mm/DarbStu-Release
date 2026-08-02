@@ -163,6 +163,14 @@ class AppGUI(
 ):
     """الواجهة الرئيسية للتطبيق — تجمع كل Mixins في class واحد."""
     def __init__(self, root, public_url=None):
+        # تأنيث تسميات الواجهة في مدارس البنات — قبل بناء أي أداة،
+        # فالأدوات المُنشأة قبل الترقيع تبقى مذكَّرة.
+        try:
+            from gender_ui import install_tk_patch
+            install_tk_patch()
+        except Exception as _e:
+            print(f"[GENDER-UI] تعذّر ترقيع الواجهة: {_e}")
+
         # 1. تعيين المتغيرات الأساسية أولاً
         self.root = root
         self.root.title(APP_TITLE)

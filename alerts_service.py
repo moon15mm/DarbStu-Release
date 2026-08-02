@@ -375,10 +375,10 @@ def send_alert_for_student(student: Dict, cfg: Dict = None) -> Dict:
     if cfg.get("alert_notify_parent") and phone:
         tpl = cfg.get("alert_template_parent", "")
         try:
-            msg = tpl.format(
-                school_name=school, student_name=sname,
-                class_name=cls, absence_count=count,
-                last_date=last_date, parent_phone=phone, guardian=get_terms()["guardian"], son=get_terms()["son"], absent_v=get_terms()["absent_v"])
+            from config_manager import render_template
+            msg = render_template(
+                tpl, student_name=sname, class_name=cls,
+                absence_count=count, last_date=last_date, parent_phone=phone)
             ok, status = send_whatsapp_message(phone, msg)
             result["parent"] = ok
             if not ok:
@@ -392,10 +392,11 @@ def send_alert_for_student(student: Dict, cfg: Dict = None) -> Dict:
         if admin_phone:
             tpl = cfg.get("alert_template_admin", "")
             try:
-                msg = tpl.format(
-                    school_name=school, student_name=sname,
-                    class_name=cls, absence_count=count,
-                    last_date=last_date, parent_phone=phone or "غير مسجّل")
+                from config_manager import render_template
+                msg = render_template(
+                    tpl, student_name=sname, class_name=cls,
+                    absence_count=count, last_date=last_date,
+                    parent_phone=phone or "غير مسجّل")
                 ok, status = send_whatsapp_message(admin_phone, msg)
                 result["admin"] = ok
                 if not ok:

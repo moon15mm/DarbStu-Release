@@ -19,8 +19,8 @@ DEFAULT_CONFIG = {
     "message_template": (
         "⚠️ تنبيه غياب من {school_name}\n"
         "{guardian}/ {student_name}\n"
-        "نفيدكم بتغيب {son} عن فصله ({class_name}) بتاريخ {date}.\n"
-        "نأمل متابعة {his} لضمان استمرارية تحصيله العلمي.\n"
+        "نفيدكم بتغيب {son} عن {his_class} ({class_name}) بتاريخ {date}.\n"
+        "نأمل متابعة {his} لضمان استمرارية {his_attain} العلمي.\n"
         "مع التقدير،\nإدارة المدرسة"
     ),
     "period_times": ["07:00", "07:50", "08:40", "09:50", "10:40", "11:30", "12:20"],
@@ -31,7 +31,7 @@ DEFAULT_CONFIG = {
         "{guardian}/ {student_name}\n"
         "نُحيطكم علماً بأن {son} {late_v} عن الحضور اليوم ({date})\n"
         "بمقدار {minutes_late} دقيقة.\n"
-        "نأمل الاهتمام بحضوره في الوقت المحدد.\n"
+        "نأمل الاهتمام ب{his_attend} في الوقت المحدد.\n"
         "مع التقدير،\nإدارة {school_name}"
     ),
     # ─── إعدادات الإشعارات الذكية ─────────────────────────────
@@ -56,7 +56,7 @@ DEFAULT_CONFIG = {
     ),
     "alert_template_admin": (
         "📊 تقرير غياب متكرر\n"
-        "الطالب: {student_name}\n"
+        "{student}: {student_name}\n"
         "الفصل: {class_name}\n"
         "عدد أيام الغياب: {absence_count} يوم\n"
         "آخر غياب: {last_date}\n"
@@ -93,7 +93,7 @@ DEFAULT_CONFIG = {
     "weekly_reward_template": (
         "🌟 تهنئة من {school_name}\n"
         "{guardian}/ {student_name}\n"
-        "نحيي {his} على التزامه وحضوره المكتمل طوال هذا الأسبوع.\n"
+        "نحيي {son} على {his_commit} و{his_attend} المكتمل طوال هذا الأسبوع.\n"
         "الاستمرار في هذا الانضباط هو سر النجاح والتفوق. فخورون بك!\n"
         "مع التقدير،\nإدارة {school_name}"
     ),
@@ -126,6 +126,12 @@ def get_terms() -> dict:
             "guardian":     "ولية أمر الطالبة",
             "absent_days":  "أيام غياب ابنتكم",
             "his":          "حضورها",
+            # ضمائر كانت مثبَّتة داخل القوالب فتبقى مذكَّرة في مدارس البنات
+            "his_class":    "فصلها",
+            "his_attain":   "تحصيلها",
+            "his_commit":   "التزامها",
+            "his_attend":   "حضورها",
+            "affairs":      "وكيلة شؤون الطالبات",
             "gender":       "girls",
         }
     else:
@@ -139,6 +145,11 @@ def get_terms() -> dict:
             "guardian":     "ولي أمر الطالب",
             "absent_days":  "أيام غياب ابنكم",
             "his":          "حضوره",
+            "his_class":    "فصله",
+            "his_attain":   "تحصيله",
+            "his_commit":   "التزامه",
+            "his_attend":   "حضوره",
+            "affairs":      "وكيل شؤون الطلاب",
             "gender":       "boys",
         }
 
@@ -202,35 +213,127 @@ def get_message_template() -> str:
     cfg = load_config()
     return (cfg.get("message_template") or DEFAULT_CONFIG["message_template"]).strip()
 
-def render_message(student_name: str, class_name: str, date_str: str) -> str:
-    cfg   = load_config()
-    terms = get_terms()
-    school = cfg.get("school_name", "المدرسة")
-    tpl    = get_message_template()
+class _SafeTerms(dict):
+    """
+    قاموس تنسيق لا ينهار على متغيّر مجهول.
+
+    القوالب محفوظة في config.json لكل مدرسة، فقالب مدرسة قديمة قد يحوي
+    متغيّراً لم يعد موجوداً — والسلوك السابق كان يرفع KeyError ثم يعيد
+    التنسيق بأربعة متغيّرات فقط، فيرفع KeyError ثانية بلا التقاط
+    وتفشل الرسالة كلها. الآن يُترك المجهول كما هو وتصل الرسالة.
+    """
+    def __missing__(self, key):
+        return "{" + key + "}"
+
+
+# ═══════════════════════════════════════════════════════════════
+#  تأنيث النصوص لمدارس البنات
+# ═══════════════════════════════════════════════════════════════
+# ألفاظ التذكير مثبَّتة في مئات المواضع (عناوين مستندات، تسميات واجهة،
+# نصوص خطابات)، ولا يمكن تمرير كلٍّ منها عبر get_terms يدوياً. هذه
+# الدالة تعالجها عند التصيير في نقاط الاختناق.
+#
+# مقصورة على **الأسماء والألقاب** عمداً. الأفعال (تغيّب/تغيّبت) تُترك
+# لنظام القوالب: تصريفها يعتمد على موقعها في الجملة، والاستبدال الأعمى
+# يُنتج عربية مكسورة.
+_FEM_RULES = [
+    # الأطول أولاً — وإلا التقطت القاعدة الأقصر جزءاً من عبارة أطول
+    (r"وكيل شؤون الطلاب",     "وكيلة شؤون الطالبات"),
+    (r"وكيل المدرسة",          "وكيلة المدرسة"),
+    (r"الموجّه الطلابي",       "الموجّهة الطلابية"),
+    (r"الموجه الطلابي",        "الموجهة الطلابية"),
+    (r"المرشد الطلابي",        "المرشدة الطلابية"),
+    (r"مدير المدرسة",          "مديرة المدرسة"),
+    (r"ولي أمر الطالب(?!ة)",   "ولية أمر الطالبة"),
+    (r"ولي الأمر",             "ولية الأمر"),
+    (r"ولي أمر",               "ولية أمر"),
+    (r"أولياء الأمور",         "أولياء الأمور"),       # تبقى كما هي
+    (r"اسم الطالب(?!ة|ات)",    "اسم الطالبة"),
+    # لا تُمسّ النسبة «الطلابي/الطلابية» — «النشاط الطلابي» ليس جمعاً
+    (r"الطلاب(?!ي)",           "الطالبات"),
+    (r"طلاب(?!ي)",             "طالبات"),
+    (r"الطالب(?!ة|ات)",        "الطالبة"),
+    (r"بالطالب(?!ة|ات)",       "بالطالبة"),
+    (r"طالباً",                "طالبة"),
+    # النكرة المجرَّدة «إضافة طالب». اللواحق مستثناة كي لا تُمسّ
+    # «طالبة/طالبات/طالباً» ولا النسبة «طالبي»
+    (r"طالب(?!ة|ات|اً|ين|ي)",  "طالبة"),
+    (r"المعلمين",              "المعلمات"),
+    (r"المعلمون",              "المعلمات"),
+    (r"المعلم(?!ة|ات|ين|ون)",  "المعلمة"),
+    (r"ابنكم",                 "ابنتكم"),
+    (r"ابنك(?!م|ة)",           "ابنتك"),
+]
+
+_FEM_COMPILED = None
+
+
+def feminize(text):
+    """
+    يؤنّث نص واجهة/مستند إذا كانت المدرسة بنات، ويعيده كما هو خلاف ذلك.
+
+    تُستدعى في نقاط التصيير النهائية (مولّدات PDF مثلاً) لا على البيانات
+    المخزّنة — تحويل المخزَّن يفسده عند تغيير نوع المدرسة.
+    """
+    global _FEM_COMPILED
+    if not text:
+        return text
     try:
-        return tpl.format(
-            school_name=school, student_name=student_name,
-            class_name=class_name, date=date_str,
-            guardian=terms["guardian"], son=terms["son"],
-            his=terms["his"], absent_v=terms["absent_v"],
-        )
-    except KeyError:
-        return tpl.format(school_name=school, student_name=student_name,
-                          class_name=class_name, date=date_str)
+        if load_config().get("school_gender") != "girls":
+            return text
+    except Exception:
+        return text
+    if _FEM_COMPILED is None:
+        import re as _re
+        # مرور واحد بتناوب مُرتَّب: تطبيق القواعد تِباعاً كان يجعل قاعدة
+        # لاحقة تعيد مطابقة ناتج سابقة — «الموجه الطلابي» صارت
+        # «الموجهة الطالباتية». المرور الواحد يستهلك كل موضع مرة.
+        joined = "|".join(f"(?P<g{i}>{p})" for i, (p, _) in enumerate(_FEM_RULES))
+        _FEM_COMPILED = (_re.compile(joined), [r for _, r in _FEM_RULES])
+
+    pattern, reps = _FEM_COMPILED
+
+    def _pick(m):
+        for i, rep in enumerate(reps):
+            if m.group(f"g{i}") is not None:
+                return rep
+        return m.group(0)
+
+    return pattern.sub(_pick, str(text))
+
+
+def render_template(tpl: str, **extra) -> str:
+    """
+    تصيير أي قالب رسالة مع كل مصطلحات الجنس تلقائياً.
+
+    استعملها بدل `tpl.format(...)` المباشر: تمرير المصطلحات يدوياً في كل
+    موضع كان يُنسي بعضها، فتبقى الرسالة مذكَّرة في مدرسة بنات أو تفشل
+    بـ KeyError عند إضافة مصطلح جديد لقالب.
+    """
+    return _render(tpl, **extra)
+
+
+def _render(tpl: str, **extra) -> str:
+    cfg = load_config()
+    data = _SafeTerms(get_terms())
+    data["school_name"] = cfg.get("school_name", "المدرسة")
+    data.update(extra)
+    try:
+        return tpl.format_map(data)
+    except Exception as e:
+        print(f"[Config] تعذّر تصيير القالب: {e}")
+        return tpl
+
+
+def render_message(student_name: str, class_name: str, date_str: str) -> str:
+    return _render(get_message_template(), student_name=student_name,
+                   class_name=class_name, date=date_str)
+
 
 def render_reward_message(student_name: str) -> str:
-    cfg   = load_config()
-    terms = get_terms()
-    school = cfg.get("school_name", "المدرسة")
-    tpl    = cfg.get("weekly_reward_template") or DEFAULT_CONFIG["weekly_reward_template"]
-    try:
-        return tpl.format(
-            school_name=school, student_name=student_name,
-            guardian=terms["guardian"], son=terms["son"],
-            his=terms["his"]
-        )
-    except KeyError:
-        return tpl.format(school_name=school, student_name=student_name)
+    cfg = load_config()
+    tpl = cfg.get("weekly_reward_template") or DEFAULT_CONFIG["weekly_reward_template"]
+    return _render(tpl, student_name=student_name)
 
 def logo_img_tag_from_config(cfg: Dict[str, Any]) -> str:
     path = (cfg.get("logo_path") or "").strip()

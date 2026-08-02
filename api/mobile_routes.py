@@ -11,7 +11,8 @@ from constants import (DB_PATH, DATA_DIR, TEACHERS_JSON, HOST, PORT, TZ_OFFSET,
                        STATIC_DOMAIN, STUDENTS_STORE, BASE_DIR,
                        now_riyadh_date, local_ip, navbar_html, debug_on,
                        CURRENT_USER, ROLES)
-from config_manager import load_config, get_terms, logo_img_tag_from_config, ar
+from config_manager import (load_config, get_terms, logo_img_tag_from_config,
+                            ar, feminize as _fem)
 from database import (get_db, load_students, load_teachers,
                       insert_absences, query_absences,
                       query_tardiness, insert_tardiness, delete_tardiness,
@@ -1418,7 +1419,9 @@ def get_manifest():
     return {
         "name": school_name,
         "short_name": "الغياب",
-        "description": "نظام إدارة غياب الطلاب",
+        # وسيط التأنيث يعالج HTML وحده، وهذا JSON — فنؤنّثه هنا صراحةً.
+        # يظهر اسماً للتطبيق على جوال المعلمة عند تثبيته.
+        "description": _fem("نظام إدارة غياب الطلاب"),
         "start_url": "/mobile",
         "scope": "/",
         "display": "standalone",

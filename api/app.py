@@ -29,6 +29,14 @@ class RemoveCSPMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(RemoveCSPMiddleware)
 
+# تأنيث صفحات مدارس البنات — يعمل على HTML فقط ولا يفعل شيئاً في
+# مدارس البنين. انظر gender_ui.py.
+try:
+    from gender_ui import install_web_middleware as _install_fem
+    _install_fem(app)
+except Exception as _e:
+    print(f"[GENDER-UI] تعذّر تركيب وسيط التأنيث: {_e}")
+
 # ── تسجيل الـ Routers مباشرة عند استيراد هذا الملف ──
 from api.mobile_routes    import router as _mobile_router
 from api.misc_routes      import router as _misc_router

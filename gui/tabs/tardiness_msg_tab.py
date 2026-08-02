@@ -278,15 +278,12 @@ class TardinessMessagesTabMixin:
                     continue
                 try:
                     mins = row.get("minutes_late",0)
-                    _t   = get_terms()
-                    msg  = tpl.format(
-                        school_name=school,
+                    from config_manager import render_template
+                    msg  = render_template(
+                        tpl,
                         student_name=row.get("student_name",""),
                         class_name=row.get("class_name",""),
-                        date=date_str,
-                        minutes_late=mins,
-                        guardian=_t["guardian"], son=_t["son"],
-                        late_v=_t["late_v"], his=_t["his"])
+                        date=date_str, minutes_late=mins)
                 except Exception:
                     _t = get_terms()
                     msg = "تنبيه: {late_v} {son} {} دقيقة بتاريخ {}".format(

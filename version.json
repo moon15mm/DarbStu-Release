@@ -1,6 +1,0 @@
-{
-  "version": "3.6.8",
-  "notes": "دعم المرحلتين المتوسطة والابتدائية، وقراءة مرحلة المدرسة من ملف نور، ونافذة ترميز الصفوف عند اللبس مع استبعاد المنتسبين، وإصلاح استيراد الطلاب من الويب",
-  "download_url": "https://github.com/moon15mm/DarbStu-Release/archive/refs/heads/main.zip",
-  "release_date": "2026-08-01"
-}

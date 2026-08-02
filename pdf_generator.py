@@ -5,7 +5,7 @@ pdf_generator.py — توليد ملفات PDF (جلسات الموجّه، ال
 import os, io, base64, datetime, json, sqlite3
 from typing import List, Dict, Any, Optional
 from constants import BASE_DIR, DATA_DIR, DB_PATH
-from config_manager import load_config
+from config_manager import load_config, feminize as _feminize
 from database import get_db
 
 def generate_session_pdf(session_data: dict) -> bytes:
@@ -57,7 +57,9 @@ def generate_session_pdf(session_data: dict) -> bytes:
         def _ar(txt):
             if not txt:
                 return ""
-            txt = str(txt)
+            # نقطة الاختناق الوحيدة لكل نص عربي في المستند — التأنيث هنا
+            # يغطي مئات العناوين المثبَّتة بلا تعديل كل موضع على حدة.
+            txt = _feminize(str(txt))
             try:
                 reshaped = _reshaper.reshape(txt)
                 return _bidi_display(reshaped)
@@ -66,7 +68,7 @@ def generate_session_pdf(session_data: dict) -> bytes:
     except ImportError:
         # إذا لم تكن المكتبات مثبّتة نُعيد النص كما هو
         def _ar(txt):
-            return str(txt) if txt else ""
+            return _feminize(str(txt)) if txt else ""
 
     # ── جلب إعدادات المدرسة ──────────────────────────────────
     cfg          = load_config()
@@ -232,14 +234,14 @@ def generate_behavioral_contract_pdf(contract_data: dict) -> bytes:
         from bidi.algorithm import get_display as _bidi_display
         def _ar(txt):
             if not txt: return ""
-            txt = str(txt)
+            txt = _feminize(str(txt))
             try:
                 return _bidi_display(_reshaper.reshape(txt))
             except Exception:
                 return txt
     except ImportError:
         def _ar(txt):
-            return str(txt) if txt else ""
+            return _feminize(str(txt)) if txt else ""
 
     cfg          = load_config()
     school       = contract_data.get("school_name") or cfg.get("school_name", "المدرسة")
@@ -773,14 +775,15 @@ def generate_academic_inquiry_pdf(inq_data: dict) -> bytes:
         from bidi.algorithm import get_display as _bidi_display
         def _ar(txt):
             if not txt: return ""
-            txt = str(txt)
+            txt = _feminize(str(txt))
             try: return _bidi_display(_reshaper.reshape(txt))
             except Exception: return txt
     except ImportError:
-        def _ar(txt): return str(txt) if txt else ""
+        def _ar(txt): return _feminize(str(txt)) if txt else ""
 
-    from config_manager import load_config
-    import os
+    # لا تُعِد `import os` هنا: استيراده داخل الدالة يجعل الاسم محلياً،
+    # فيفشل `os.path.exists` في حلقة الخطوط أعلاه بـ UnboundLocalError
+    # وتتعطّل الاستمارة كلياً. الوحدة مستوردة في رأس الملف.
     cfg = load_config()
     school = cfg.get("school_name", "المدرسة")
     
