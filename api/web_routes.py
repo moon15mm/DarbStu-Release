@@ -1594,12 +1594,11 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
     gender         = cfg.get("school_gender", "boys")
 
     # جلب التنبيهات الذكية
-    from database import get_unread_referrals_count, get_unread_circulars_count, get_unread_lab_submissions_count
+    from database import get_unread_referrals_count, get_unread_circulars_count
     unread_referrals = 0
     if role in ("admin", "deputy", "supervisor", "counselor"):
         unread_referrals = get_unread_referrals_count()
     unread_circs = get_unread_circulars_count(username, role)
-    unread_lab_submissions = get_unread_lab_submissions_count() if role == "admin" else 0
 
     # ── قائمة التبويبات مع مجموعاتها ──────────────────────────
     SIDEBAR_GROUPS = [
@@ -1666,7 +1665,6 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
             ("المستخدمون",          "users",                "fas fa-user-shield"),
             ("النسخ الاحتياطية",    "backup",               "fas fa-hdd"),
             ("ملاحظات سريعة",       "quick_notes",          "fas fa-sticky-note"),
-            ("شواهد الأداء",        "lab_submissions",      "fas fa-clipboard-check"),
         ]),
     ]
 
@@ -1680,9 +1678,6 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
         sidebar_html += '<div class="sb-group">' + grp_title + '</div>'
         for name, key, icon in visible:
             badge = ''
-            if key == 'lab_submissions' and unread_lab_submissions > 0:
-                badge = (f'<span style="background:#ef4444;color:white;border-radius:20px;'
-                         f'padding:1px 7px;font-size:11px;margin-right:6px">{unread_lab_submissions}</span>')
             sidebar_html += (
                 '<button class="tab-btn" data-key="' + key + '" onclick="showTab(\'' + key + '\')">'
                 '<i class="ti ' + icon + '"></i>' + name + badge + '</button>'
@@ -1848,21 +1843,20 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
     _circ_add_btn = '<button class="btn bp1 bsm" onclick="si(\'circulars\',\'circ-add\')">+ إصدار تعميم</button>' if role == 'admin' else ''
     _alert_referral_html = ('<div class="ab ai" style="background:#FFF7ED; border:1px solid #FFEDD5; color:#C2410C; padding:15px; border-radius:12px; display:flex; align-items:center; gap:12px; cursor:pointer" onclick="showTab(\'referral_deputy\')"><i class="fas fa-exclamation-circle" style="font-size:20px"></i> <div><b>تنبيه:</b> يوجد عدد <b>' + str(unread_referrals) + '</b> تحويلات جديدة بانتظار مراجعتك.</div></div>') if unread_referrals > 0 else ''
     _alert_circs_html = ('<div class="ab ai" style="background:#F0F9FF; border:1px solid #E0F2FE; color:#0369A1; padding:15px; border-radius:12px; display:flex; align-items:center; gap:12px; cursor:pointer" onclick="showTab(\'circulars\')"><i class="fas fa-scroll" style="font-size:20px"></i> <div><b>تعميم جديد:</b> لديك <b>' + str(unread_circs) + '</b> تعاميم غير مقروءة.</div></div>') if unread_circs > 0 else ''
-    _alert_lab_html = ('<div class="ab ai" style="background:#F0FDF4; border:1px solid #BBF7D0; color:#166534; padding:15px; border-radius:12px; display:flex; align-items:center; gap:12px; cursor:pointer" onclick="window.open(\'/web/lab-docs/submissions\',\'_blank\')"><i class="fas fa-clipboard-check" style="font-size:20px"></i> <div><b>شواهد أداء جديدة:</b> وصل <b>' + str(unread_lab_submissions) + '</b> ملف شواهد أداء وظيفي من المحضر.</div></div>') if unread_lab_submissions > 0 else ''
+    _alert_lab_html = ''
     content_html = f'''
 <div id="tab-dashboard">
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px">
     <h2 class="pt"><i class="fas fa-chart-line"></i> لوحة المراقبة</h2>
     <input type="date" id="dash-date" onchange="loadDashboard()" style="width:auto">
   </div>
-  <div id="smart-alert-banner" style="margin-bottom:20px; display: {'block' if (unread_referrals > 0 or unread_circs > 0 or unread_lab_submissions > 0) else 'none'}">
+  <div id="smart-alert-banner" style="margin-bottom:20px; display: {'block' if (unread_referrals > 0 or unread_circs > 0) else 'none'}">
     <div style="display:flex; flex-direction:column; gap:10px">
       {_alert_referral_html}
       {_alert_circs_html}
       {_alert_lab_html}
     </div>
   </div>
-  {'<div style="margin-bottom:18px"><a href="/web/lab-docs" target="_blank" style="display:flex;align-items:center;gap:14px;background:linear-gradient(135deg,#0f6e56,#2da88a);color:white;padding:16px 22px;border-radius:12px;text-decoration:none;font-weight:700;font-size:15px;box-shadow:0 4px 14px rgba(45,168,138,0.35)"><span style="font-size:28px">📋</span><div><div>توثيق شواهد الأداء الوظيفي</div><div style="font-size:12px;font-weight:400;opacity:0.85;margin-top:3px">سجّل وأرشف شواهد أدائك الوظيفي بشكل تفاعلي</div></div><span style="margin-right:auto;opacity:0.7">↗</span></a></div>' if role == "lab" else ''}
   <div class="stat-cards" id="dash-cards"><div class="loading">⏳ جارٍ التحميل...</div></div>
   <div class="section"><div class="st">أكثر الفصول غياباً</div>
     <div class="tw"><table><thead><tr><th>الفصل</th><th>الغائبون</th><th>الحاضرون</th><th>نسبة الغياب</th></tr></thead>
@@ -2909,22 +2903,6 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
     </div>
     <div id="qn-list"></div>
   </div>
-</div>
-
-<div id="tab-lab_submissions">
-  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px">
-    <h2 class="pt"><i class="fas fa-clipboard-check"></i> شواهد الأداء الوظيفي</h2>
-    <a href="/web/lab-docs/submissions" target="_blank"
-       style="background:#1565C0;color:white;padding:8px 16px;border-radius:8px;text-decoration:none;font-size:13px;font-weight:700">
-      ↗ فتح في نافذة جديدة
-    </a>
-  </div>
-  <iframe src="/web/lab-docs/submissions"
-          style="width:100%;height:calc(100vh - 160px);border:none;border-radius:12px;background:white"
-          id="lab-subs-frame"
-          onload="this.style.opacity=1"
-          style="opacity:0;transition:opacity .3s">
-  </iframe>
 </div>
 
 <div id="tab-referral_teacher">

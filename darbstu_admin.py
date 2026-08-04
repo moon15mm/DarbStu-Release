@@ -107,10 +107,16 @@ class AdminApp:
         nb.pack(fill="both", expand=True, padx=10, pady=(8, 8))
         self.tab_new  = tk.Frame(nb, bg=GRAY)
         self.tab_list = tk.Frame(nb, bg=GRAY)
+        self.tab_pub  = tk.Frame(nb, bg=GRAY)
         nb.add(self.tab_new,  text="  تجهيز مدرسة جديدة  ")
         nb.add(self.tab_list, text="  المدارس المسجّلة  ")
+        self.tab_keys = tk.Frame(nb, bg=GRAY)
+        nb.add(self.tab_pub,  text="  نشر تحديث  ")
+        nb.add(self.tab_keys, text="  🔐 نسخ المفاتيح  ")
         self._build_new(self.tab_new)
         self._build_list(self.tab_list)
+        self._build_publish(self.tab_pub)
+        self._build_keys(self.tab_keys)
 
     # ── منطقة قابلة للتمرير ──────────────────────────────────────
     def _scrollable(self, parent):
@@ -347,12 +353,286 @@ class AdminApp:
         p(("step", 3, "ok", ""))
         p(("done", sid, sub, port, js))
 
+    # ── تبويب نسخ المفاتيح ───────────────────────────────────────
+    def _build_keys(self, parent):
+        """
+        نسخ احتياطي مشفَّر لمفتاحَي الخادم.
+
+        ضياع مفتاح التحديث يقطع القناة عن كل المدارس بلا إصلاح عن بُعد،
+        وضياع مفتاح التراخيص يوقفها عند انتهاء اشتراكاتها. والمفتاحان
+        اليوم في ملفين على خادم واحد بلا نسخة.
+        """
+        body = tk.Frame(parent, bg=GRAY, padx=22, pady=14)
+        body.pack(fill="both", expand=True)
+
+        tk.Label(body, text="🔐  نسخة احتياطية من مفاتيح الخادم", bg=GRAY,
+                 fg=NAVY, font=("Tahoma", 13, "bold")).pack(anchor="e")
+        tk.Label(body, bg=GRAY, fg=MUTED, font=("Tahoma", 9), justify="right",
+                 wraplength=680, anchor="e",
+                 text=("المفتاحان على خادم واحد. ضياعهما لا يُصلَح عن بُعد:\n"
+                       "• مفتاح التحديث — تنقطع التحديثات عن كل المدارس نهائياً\n"
+                       "• مفتاح التراخيص — تتوقف المدارس عند انتهاء اشتراكاتها\n"
+                       "⚠️ النسخة تُشفَّر بكلمة سرّ إلزامية — احفظها فمن يملك "
+                       "الملف وكلمتها يوقّع تحديثاً تقبله كل المدارس.")
+                 ).pack(anchor="e", pady=(2, 10))
+
+        row = tk.Frame(body, bg=GRAY)
+        row.pack(fill="x", pady=(4, 8))
+        tk.Button(row, text="💾  أخذ نسخة احتياطية", bg=GREEN, fg=WHITE,
+                  relief="flat", font=("Tahoma", 10, "bold"), cursor="hand2",
+                  padx=16, pady=7, command=self._keys_backup).pack(side="right",
+                                                                   padx=(0, 8))
+        tk.Button(row, text="🔍  فحص نسخة موجودة", bg=BLUE, fg=WHITE,
+                  relief="flat", font=("Tahoma", 10, "bold"), cursor="hand2",
+                  padx=16, pady=7, command=self._keys_verify).pack(side="right")
+        tk.Button(row, text="استرجاع إلى الخادم", bg=LBLUE, fg=RED,
+                  relief="flat", font=("Tahoma", 9), cursor="hand2",
+                  padx=10, pady=6, command=self._keys_restore).pack(side="left")
+
+        self._keys_out = tk.Text(body, height=16, font=("Consolas", 9),
+                                 bg="#0f1720", fg="#d6e2ee", wrap="word",
+                                 relief="flat", state="disabled")
+        self._keys_out.pack(fill="both", expand=True)
+
+    def _keys_log(self, txt, clear=False):
+        self._keys_out.config(state="normal")
+        if clear:
+            self._keys_out.delete("1.0", "end")
+        self._keys_out.insert("end", txt)
+        self._keys_out.see("end")
+        self._keys_out.config(state="disabled")
+
+    def _ask_pass(self, confirm=False) -> str:
+        from tkinter import simpledialog
+        p1 = simpledialog.askstring("كلمة سرّ النسخة",
+                                    "أدخل كلمة سرّ (٨ أحرف فأكثر):",
+                                    show="*", parent=self.root)
+        if not p1:
+            return ""
+        if confirm:
+            p2 = simpledialog.askstring("تأكيد", "أعد كتابة كلمة السرّ:",
+                                        show="*", parent=self.root)
+            if p1 != p2:
+                messagebox.showerror("غير متطابقة", "كلمتا السرّ مختلفتان.")
+                return ""
+        return p1
+
+    def _keys_backup(self):
+        pw = self._ask_pass(confirm=True)
+        if not pw:
+            return
+        dest = filedialog.asksaveasfilename(
+            title="احفظ النسخة", defaultextension=".dsbak",
+            initialfile="darbstu_keys.dsbak",
+            filetypes=[("نسخة مفاتيح DarbStu", "*.dsbak")])
+        if not dest:
+            return
+        self._keys_log("⏳ جارٍ الجلب من الخادم والتشفير...\n", clear=True)
+
+        def _w():
+            try:
+                import key_backup as kb
+                rep = kb.backup(dest, pw, SSH_HOST)
+                lines = [f"✅ حُفظت النسخة\n   {rep['path']}\n",
+                         f"   التاريخ: {rep['created']}\n\n",
+                         "المفاتيح العامة (للتأكد أنها نسختك):\n"]
+                for n, p in rep["publics"].items():
+                    lines.append(f"   {n}\n     {p}\n")
+                lines.append("\n✅ فُكَّت النسخة وتحقّقت فوراً — صالحة.\n"
+                             if rep["verified"] else "\n⚠️ تعذّر التحقق.\n")
+                lines.append("\n⚠️ احفظ الملف وكلمة السرّ في مكانين مختلفين، "
+                             "خارج هذا الجهاز.\n")
+                self.q.put(("keys", True, "".join(lines)))
+            except Exception as e:
+                self.q.put(("keys", False, f"⛔ فشل: {e}\n"))
+
+        threading.Thread(target=_w, daemon=True).start()
+
+    def _keys_verify(self):
+        path = filedialog.askopenfilename(title="اختر نسخة",
+                                          filetypes=[("نسخة مفاتيح", "*.dsbak"),
+                                                     ("كل الملفات", "*.*")])
+        if not path:
+            return
+        pw = self._ask_pass()
+        if not pw:
+            return
+        self._keys_log("⏳ جارٍ الفحص...\n", clear=True)
+
+        def _w():
+            try:
+                import key_backup as kb
+                r = kb.verify(path, pw)
+                out = [f"{'✅ النسخة سليمة' if r['ok'] else '⛔ النسخة تالفة'}\n",
+                       f"   تاريخها: {r.get('created')}\n\n"]
+                for n, d in r["keys"].items():
+                    out.append(f"   {'✅' if d['matches'] else '❌'} {n}"
+                               f"  ({d['size']} بايت)\n     {d['public']}\n")
+                self.q.put(("keys", r["ok"], "".join(out)))
+            except Exception as e:
+                self.q.put(("keys", False, f"⛔ {e}\n"))
+
+        threading.Thread(target=_w, daemon=True).start()
+
+    def _keys_restore(self):
+        if not messagebox.askyesno(
+                "استرجاع المفاتيح",
+                "سيُستبدل المفتاحان على الخادم بما في النسخة.\n\n"
+                "لا تفعل هذا إلا إذا ضاعت المفاتيح الأصلية أو تلفت.\n\n"
+                "المتابعة؟", icon="warning", default="no"):
+            return
+        path = filedialog.askopenfilename(title="اختر النسخة",
+                                          filetypes=[("نسخة مفاتيح", "*.dsbak")])
+        if not path:
+            return
+        pw = self._ask_pass()
+        if not pw:
+            return
+        self._keys_log("⏳ جارٍ الاسترجاع...\n", clear=True)
+
+        def _w():
+            try:
+                import key_backup as kb
+                r = kb.restore(path, pw, SSH_HOST)
+                self.q.put(("keys", True,
+                            "✅ استُرجع: " + "، ".join(r["restored"]) +
+                            "\n\nأعد تشغيل خدمة التراخيص إن لزم:\n"
+                            "   systemctl restart darbstu-license\n"))
+            except Exception as e:
+                self.q.put(("keys", False, f"⛔ فشل الاسترجاع: {e}\n"))
+
+        threading.Thread(target=_w, daemon=True).start()
+
+    # ── تبويب نشر التحديث ────────────────────────────────────────
+    def _build_publish(self, parent):
+        """
+        نشر تحديث للمدارس.
+
+        خطوتان إلزاميتان: فحص أولاً ثم نشر. النشر يصل إلى **كل** المدارس
+        تلقائياً، فزرٌّ واحد بلا فحص خطأ فيه يُصيبها جميعاً دفعة واحدة.
+        """
+        body = tk.Frame(parent, bg=GRAY, padx=22, pady=14)
+        body.pack(fill="both", expand=True)
+
+        tk.Label(body, text="📤  نشر تحديث لكل المدارس", bg=GRAY, fg=NAVY,
+                 font=("Tahoma", 13, "bold")).pack(anchor="e")
+        tk.Label(body, bg=GRAY, fg=MUTED, font=("Tahoma", 9), justify="right",
+                 wraplength=680, anchor="e",
+                 text=("يرفع المصدر إلى GitHub، ويبني الحزمة ويوقّعها على خادمك، "
+                       "ثم يتحقق منها من الإنترنت كما تفعل المدرسة.\n"
+                       "⚠️ ما يُنشر يصل تلقائياً إلى كل المدارس المثبَّتة.")
+                 ).pack(anchor="e", pady=(2, 10))
+
+        self._pub_script = _find_publish_script()
+        path_txt = self._pub_script or "⚠️ لم يُعثر على publish_update.py"
+        self._pub_path_lbl = tk.Label(body, text=path_txt, bg=GRAY,
+                                      fg=(MUTED if self._pub_script else RED),
+                                      font=("Consolas", 8), anchor="e")
+        self._pub_path_lbl.pack(anchor="e", fill="x")
+
+        row = tk.Frame(body, bg=GRAY)
+        row.pack(fill="x", pady=(10, 8))
+        self._pub_check_btn = tk.Button(
+            row, text="①  فحص قبل النشر", bg=BLUE, fg=WHITE, relief="flat",
+            font=("Tahoma", 10, "bold"), cursor="hand2", padx=16, pady=7,
+            command=lambda: self._pub_run(False))
+        self._pub_check_btn.pack(side="right", padx=(0, 8))
+        self._pub_send_btn = tk.Button(
+            row, text="②  نشر للمدارس", bg="#9e9e9e", fg=WHITE, relief="flat",
+            font=("Tahoma", 10, "bold"), cursor="hand2", padx=16, pady=7,
+            state="disabled", command=lambda: self._pub_run(True))
+        self._pub_send_btn.pack(side="right")
+        tk.Button(row, text="اختيار الملف يدوياً", bg=LBLUE, fg=NAVY,
+                  relief="flat", font=("Tahoma", 9), cursor="hand2",
+                  padx=10, pady=6, command=self._pub_browse).pack(side="left")
+
+        self._pub_out = tk.Text(body, height=18, font=("Consolas", 9),
+                                bg="#0f1720", fg="#d6e2ee", wrap="word",
+                                relief="flat", state="disabled")
+        self._pub_out.pack(fill="both", expand=True)
+
+    def _pub_browse(self):
+        from tkinter import filedialog
+        p = filedialog.askopenfilename(title="اختر publish_update.py",
+                                       filetypes=[("Python", "*.py")])
+        if p:
+            self._pub_script = p
+            self._pub_path_lbl.config(text=p, fg=MUTED)
+
+    def _pub_log(self, txt, clear=False):
+        self._pub_out.config(state="normal")
+        if clear:
+            self._pub_out.delete("1.0", "end")
+        self._pub_out.insert("end", txt)
+        self._pub_out.see("end")
+        self._pub_out.config(state="disabled")
+
+    def _pub_run(self, confirm: bool):
+        if not self._pub_script or not os.path.isfile(self._pub_script):
+            messagebox.showerror("غير موجود",
+                                 "لم يُعثر على publish_update.py — اختره يدوياً.")
+            return
+        if confirm:
+            if not messagebox.askyesno(
+                    "تأكيد النشر",
+                    "سيصل هذا التحديث إلى كل المدارس المثبَّتة تلقائياً.\n\n"
+                    "هل راجعت نتيجة الفحص؟ هل الإصدار صحيح؟\n\nالمتابعة؟",
+                    icon="warning", default="no"):
+                return
+
+        self._pub_check_btn.config(state="disabled")
+        self._pub_send_btn.config(state="disabled")
+        self._pub_log("", clear=True)
+        self._pub_log(("⏳ جارٍ النشر...\n\n" if confirm
+                       else "⏳ جارٍ الفحص...\n\n"))
+
+        def _worker():
+            args = [_find_python(), self._pub_script]
+            if confirm:
+                args.append("--confirm")
+            env = dict(os.environ, PYTHONIOENCODING="utf-8")
+            try:
+                pr = subprocess.Popen(
+                    args, cwd=os.path.dirname(self._pub_script),
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                    errors="replace", env=env, **_NO_WINDOW)
+                # السكربت يطلب كلمة تأكيد على stdin — نمرّرها بعد أن
+                # أكّد المستخدم في النافذة أعلاه
+                out, _ = pr.communicate(input="PUBLISH\n" if confirm else "\n",
+                                        timeout=900)
+                self.q.put(("pub", pr.returncode == 0, out or "", confirm))
+            except subprocess.TimeoutExpired:
+                self.q.put(("pub", False, "انتهت المهلة (١٥ دقيقة).", confirm))
+            except Exception as e:
+                self.q.put(("pub", False, f"تعذّر التشغيل: {e}", confirm))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _pump(self):
         try:
             while True:
                 msg = self.q.get_nowait()
                 kind = msg[0]
-                if kind == "step":
+                if kind == "keys":
+                    self._keys_log(msg[2])
+                elif kind == "pub":
+                    # الوضع يأتي صريحاً لا مستنتَجاً من النص: مخرجات
+                    # الفحص تحوي «--confirm» في سطر الإرشاد، فاستنتاجه
+                    # منها كان يفتح زر النشر بعد النشر ويقفله بعد الفحص.
+                    _, ok, out, was_publish = msg
+                    self._pub_log(out + "\n")
+                    self._pub_check_btn.config(state="normal")
+                    if not ok:
+                        self._pub_send_btn.config(state="disabled", bg="#9e9e9e")
+                        self._pub_log("\n⛔ لم يكتمل — راجع ما سبق.\n")
+                    elif was_publish:
+                        self._pub_send_btn.config(state="disabled", bg="#9e9e9e")
+                        self._pub_log("\n✅ اكتمل النشر ووصل الخادم.\n")
+                    else:
+                        self._pub_send_btn.config(state="normal", bg=AMBER)
+                        self._pub_log("\n✅ الفحص نجح — راجعه ثم اضغط «نشر للمدارس».\n")
+                elif kind == "step":
                     self._set_step(msg[1], msg[2], msg[3])
                 elif kind == "fail":
                     self.result.config(text="⛔  " + msg[1], fg=RED)
@@ -511,6 +791,33 @@ class AdminApp:
             self.q.put(("info", out if ok else f"فشل: {out}"))
             self._load_list()
         threading.Thread(target=w, daemon=True).start()
+
+
+def _find_python() -> str:
+    """مسار بايثون. `sys.executable` هو الـ EXE نفسه في النسخة المجمّدة."""
+    import shutil
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+    for c in (shutil.which("python"), shutil.which("py"),
+              r"C:\Users\%s\AppData\Local\Programs\Python\Python311\python.exe"
+              % os.environ.get("USERNAME", "")):
+        if c and os.path.isfile(c):
+            return c
+    return "python"
+
+
+def _find_publish_script() -> str:
+    """يبحث عن publish_update.py في المواضع المعتادة."""
+    here = os.path.dirname(sys.executable if getattr(sys, "frozen", False)
+                           else os.path.abspath(__file__))
+    home = os.path.expanduser("~")
+    for c in (os.path.join(here, "publish_update.py"),
+              os.path.join(here, "..", "publish_update.py"),
+              os.path.join(home, "Desktop", "DarbStu_Dist", "publish_update.py")):
+        c = os.path.abspath(c)
+        if os.path.isfile(c):
+            return c
+    return ""
 
 
 def main():

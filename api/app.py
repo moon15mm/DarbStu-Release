@@ -42,13 +42,11 @@ from api.mobile_routes    import router as _mobile_router
 from api.misc_routes      import router as _misc_router
 from api.web_routes       import router as _web_router
 from api.points_api       import router as _points_router
-from api.lab_docs_routes  import router as _lab_docs_router
 from api.bus_routes       import router as _bus_router
 app.include_router(_mobile_router)
 app.include_router(_misc_router)
 app.include_router(_web_router)
 app.include_router(_points_router)
-app.include_router(_lab_docs_router)
 app.include_router(_bus_router)
 
 # ── خدمة الملفات الثابتة ──
