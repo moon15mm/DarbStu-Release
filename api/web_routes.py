@@ -2992,8 +2992,9 @@ function loadPromoPlan(){
     h += '<label style="display:flex;gap:8px;align-items:center;margin:14px 0;font-size:13.5px">'+
          '<input type="checkbox" id="promo-grad" checked> '+
          'تخريج طلاب الصف الأعلى وحذفهم من النظام</label>';
-    h += '<button class="btn bp3" onclick="openEndModal('year')">تنفيذ الترحيل وإنهاء السنة</button>';
+    h += '<button class="btn bp3" id="promo-run">تنفيذ الترحيل وإنهاء السنة</button>';
     box.innerHTML = h;
+    document.getElementById('promo-run').onclick = function(){ openEndModal('year'); };
   }).catch(function(){ box.innerHTML = '<div class="ab ae">تعذّر الاتصال</div>'; });
 }
 
