@@ -4144,3 +4144,112 @@ def get_bus_trips_summary(date: str) -> List[Dict]:
     con.close()
     return rows
 
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ترحيل الطلاب في نهاية العام
+# ═══════════════════════════════════════════════════════════════
+# لا يُفترض عدد الصفوف. المنطق القديم كان مثبَّتاً على ثلاثة (ثانوي)،
+# فمدرسة ابتدائية تفقد طلاب صفها الثالث كأنهم تخرّجوا وتبقى صفوفها
+# العليا مكانها.
+#
+# والابتدائي خاصةً لا ينضبط بقاعدة: بعض مدارس البنين تبدأ من الصف
+# الثالث (الأول والثاني مع البنات) وبعضها يضم الستة. لذلك تُستنتج
+# الخطة من الفصول الموجودة فعلاً، وتُعرض للمزوّد ليراجعها قبل التنفيذ.
+
+
+def _class_level(cid) -> int:
+    """رقم المستوى من معرّف الفصل: '3-A' -> 3. صفر إن تعذّر."""
+    head = str(cid).split("-", 1)[0].strip()
+    return int(head) if head.isdigit() else 0
+
+
+def _class_suffix(cid) -> str:
+    parts = str(cid).split("-", 1)
+    return parts[1] if len(parts) > 1 else ""
+
+
+def build_promotion_plan(classes=None) -> dict:
+    """
+    يبني خطة الترحيل من الفصول الموجودة.
+
+    يُرجع:
+      moves    [{from_id, from_name, to_id, to_name, count, target_exists}]
+      graduate [{id, name, count}]   ← أعلى مستوى موجود
+      levels   المستويات المكتشفة
+      orphans  فصول بمعرّف لا يبدأ برقم — تُترك كما هي
+    """
+    if classes is None:
+        classes = load_students(force_reload=True)["list"]
+
+    levels = sorted({_class_level(c.get("id")) for c in classes} - {0})
+    if not levels:
+        return {"moves": [], "graduate": [], "levels": [], "orphans": classes}
+
+    top = max(levels)
+    by_id = {str(c.get("id")): c for c in classes}
+    moves, graduate = [], []
+
+    for c in classes:
+        lvl = _class_level(c.get("id"))
+        if lvl == 0:
+            continue
+        n = len(c.get("students") or [])
+        if lvl == top:
+            graduate.append({"id": c["id"], "name": c.get("name", ""), "count": n})
+            continue
+        suffix = _class_suffix(c["id"])
+        to_id = f"{lvl + 1}-{suffix}"
+        tgt = by_id.get(to_id)
+        to_name = (tgt.get("name") if tgt else
+                   _noor_build_class_name(stage_level_name(str(lvl + 1)),
+                                          section_label_from_value(
+                                              suffix, stage_level_name(str(lvl + 1)))))
+        moves.append({"from_id": c["id"], "from_name": c.get("name", ""),
+                      "to_id": to_id, "to_name": to_name, "count": n,
+                      "target_exists": tgt is not None})
+
+    # الأعلى مستوى يُرحَّل أولاً كي لا يُكتب فوق طلاب لم يُنقلوا بعد
+    moves.sort(key=lambda m: -_class_level(m["from_id"]))
+    orphans = [c for c in classes if _class_level(c.get("id")) == 0]
+    return {"moves": moves, "graduate": graduate, "levels": levels,
+            "orphans": orphans}
+
+
+def apply_promotion_plan(plan: dict, graduate_top: bool = True) -> dict:
+    """
+    ينفّذ الخطة. `graduate_top=False` يُبقي طلاب أعلى مستوى مكانهم —
+    لمدرسة لا يتخرّج صفها الأعلى (كابتدائية تنتهي عند صف وسيط).
+    """
+    classes = load_students(force_reload=True)["list"]
+    by_id = {str(c.get("id")): c for c in classes}
+    moved = graduated = created = 0
+
+    if graduate_top:
+        for g in plan.get("graduate", []):
+            c = by_id.get(str(g["id"]))
+            if c:
+                graduated += len(c.get("students") or [])
+                c["students"] = []
+
+    for m in plan.get("moves", []):
+        src = by_id.get(str(m["from_id"]))
+        if not src or not src.get("students"):
+            continue
+        tgt = by_id.get(str(m["to_id"]))
+        if tgt is None:
+            tgt = {"id": m["to_id"], "name": m["to_name"], "students": []}
+            classes.append(tgt)
+            by_id[m["to_id"]] = tgt
+            created += 1
+        # إضافة لا استبدال: لو بقي في الفصل الهدف طلاب (حين لا يتخرّج
+        # الصف الأعلى) فالاستبدال يمحوهم بصمت. الإضافة لا تفقد أحداً،
+        # وفي المسار المعتاد يكون الهدف فارغاً فتتطابق مع الاستبدال.
+        tgt["students"] = (tgt.get("students") or []) + src["students"]
+        moved += len(src["students"])
+        src["students"] = []
+
+    _safe_write_json(STUDENTS_JSON, {"classes": classes})
+    constants.STUDENTS_STORE = None
+    return {"moved": moved, "graduated": graduated, "created": created,
+            "classes": len(classes)}

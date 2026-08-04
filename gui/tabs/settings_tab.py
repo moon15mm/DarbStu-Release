@@ -519,96 +519,133 @@ class SettingsTabMixin:
             messagebox.showerror("خطأ", f"فشل الحذف:\n{e}")
 
     def _end_academic_year(self):
-        """إنهاء السنة الدراسية — ترقية الطلاب + حذف الغياب والتأخر."""
+        """
+        إنهاء السنة — يعرض خطة الترحيل للمراجعة قبل التنفيذ.
+
+        المنطق القديم كان مثبَّتاً على ثلاثة صفوف (ثانوي)، فمدرسة
+        ابتدائية تفقد طلاب صفها الثالث كأنهم تخرّجوا وتبقى صفوفها
+        العليا مكانها. والابتدائي لا ينضبط بقاعدة: بعض مدارس البنين
+        تبدأ من الصف الثالث وبعضها يضم الستة. لذلك تُستنتج الخطة من
+        الفصول الموجودة وتُعرض ليقرّها المدير.
+        """
         if CURRENT_USER.get("role") != "admin":
             messagebox.showerror("غير مسموح", "هذا الإجراء للمدير فقط.")
             return
 
-        if not messagebox.askyesno("تأكيد إنهاء السنة",
-            "سيتم:\n• ترقية طلاب أول ثانوي → ثاني ثانوي\n• ترقية طلاب ثاني ثانوي → ثالث ثانوي\n• حذف طلاب ثالث ثانوي من البرنامج\n• حذف جميع سجلات الغياب والتأخر\n\nستُنشأ نسخة احتياطية تلقائياً قبل الإجراء.\n\nهل أنت متأكد؟", icon="warning"):
+        from database import build_promotion_plan, apply_promotion_plan
+        try:
+            plan = build_promotion_plan()
+        except Exception as e:
+            messagebox.showerror("خطأ", f"تعذّر بناء الخطة:\n{e}")
             return
 
+        if not plan["moves"] and not plan["graduate"]:
+            messagebox.showwarning("لا يوجد",
+                                   "لم أجد فصولاً قابلة للترحيل.")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("مراجعة خطة الترحيل")
+        win.configure(bg="white")
+        win.transient(self.root)
+        win.grab_set()
+
+        hdr = tk.Frame(win, bg="#b45309", height=52)
+        hdr.pack(fill="x"); hdr.pack_propagate(False)
+        tk.Label(hdr, text="🎓  إنهاء السنة وترحيل الطلاب", bg="#b45309",
+                 fg="white", font=("Tahoma", 13, "bold")).pack(pady=13)
+
+        tk.Label(win, bg="white", fg="#444", justify="right", anchor="e",
+                 font=("Tahoma", 9), wraplength=560,
+                 text=("الخطة مبنية على فصول مدرستك الفعلية — "
+                       f"المستويات الموجودة: "
+                       + " · ".join(str(x) for x in plan["levels"]) +
+                       "\nراجعها قبل التنفيذ.")
+                 ).pack(fill="x", padx=16, pady=(12, 8))
+
+        cols = ("from", "to", "n")
+        tv = ttk.Treeview(win, columns=cols, show="headings", height=11)
+        for c, t, w in zip(cols, ("من", "إلى", "الطلاب"), (210, 210, 70)):
+            tv.heading(c, text=t)
+            tv.column(c, width=w, anchor="center")
+        for m in plan["moves"]:
+            extra = "" if m["target_exists"] else "  (يُنشأ)"
+            tv.insert("", "end", values=(m["from_name"],
+                                         m["to_name"] + extra, m["count"]))
+        for g in plan["graduate"]:
+            tv.insert("", "end", values=(g["name"], "يتخرّجون", g["count"]),
+                      tags=("grad",))
+        tv.tag_configure("grad", background="#FEF3E2", foreground="#b45309")
+        tv.pack(fill="both", expand=True, padx=16)
+
+        grad_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(win, variable=grad_var, bg="white", anchor="e",
+                       font=("Tahoma", 9),
+                       text="تخريج طلاب الصف الأعلى وحذفهم من النظام"
+                       ).pack(fill="x", padx=16, pady=(8, 2))
+        tk.Label(win, bg="white", fg="#6b7280", anchor="e", font=("Tahoma", 8),
+                 text="تُؤخذ نسخة احتياطية تلقائياً قبل أي حذف."
+                 ).pack(fill="x", padx=16)
+
+        def _go():
+            win.destroy()
+            self._run_year_end(plan, grad_var.get())
+
+        row = tk.Frame(win, bg="white")
+        row.pack(fill="x", padx=16, pady=14)
+        tk.Button(row, text="✅  تنفيذ الترحيل", bg="#b45309", fg="white",
+                  relief="flat", font=("Tahoma", 10, "bold"), cursor="hand2",
+                  padx=16, pady=7, command=_go).pack(side="right", padx=(0, 8))
+        tk.Button(row, text="إلغاء", bg="#f3f4f6", relief="flat",
+                  font=("Tahoma", 10), cursor="hand2", padx=16, pady=7,
+                  command=win.destroy).pack(side="right")
+
+        win.update_idletasks()
+        try:
+            px, py = self.root.winfo_rootx(), self.root.winfo_rooty()
+            pw, ph = self.root.winfo_width(), self.root.winfo_height()
+            w, h = win.winfo_width(), win.winfo_height()
+            win.geometry(f"+{px + (pw - w) // 2}+{py + max(0,(ph - h) // 4)}")
+        except Exception:
+            pass
+
+    def _run_year_end(self, plan, graduate_top):
+        """ينفّذ الخطة بعد إقرارها: كلمة المرور ← نسخة احتياطية ← ترحيل."""
+        from database import apply_promotion_plan
+
         pw = simpledialog.askstring("تأكيد الهوية",
-            "أدخل كلمة مرور حسابك للمتابعة:", show="*")
+                                    "أدخل كلمة مرور حسابك للمتابعة:",
+                                    show="*", parent=self.root)
         if not pw:
             return
         if authenticate(CURRENT_USER.get("username"), pw) is None:
             messagebox.showerror("خطأ", "كلمة المرور غير صحيحة.")
             return
 
-        # نسخة احتياطية
         ok, path = self._create_term_backup("نهاية_سنة")
         if not ok:
-            messagebox.showerror("خطأ", "فشل إنشاء النسخة الاحتياطية:\n" + str(path))
+            messagebox.showerror("خطأ",
+                                 "فشل إنشاء النسخة الاحتياطية:\n" + str(path))
             return
 
-        # ── ترقية الطلاب ──
         try:
-            store = load_students(force_reload=True)
-            classes = store["list"]
-
-            # خريطة الترقية: ID الفصل → المستوى والقسم
-            # نفترض أن ID الفصل بصيغة "1-أ", "2-ب", "3-ج" إلخ
-            upgraded = 0
-            deleted  = 0
-            errors   = []
-
-            # جمّع الطلاب حسب المستوى
-            level1_classes = [c for c in classes if str(c["id"]).startswith("1-")]
-            level2_classes = [c for c in classes if str(c["id"]).startswith("2-")]
-            level3_classes = [c for c in classes if str(c["id"]).startswith("3-")]
-
-            # 1. احذف طلاب المستوى 3
-            for cls in level3_classes:
-                deleted += len(cls["students"])
-                cls["students"] = []
-
-            # 2. انقل طلاب المستوى 2 → المستوى 3
-            for cls2 in level2_classes:
-                suffix = str(cls2["id"])[2:]  # مثلاً "أ" من "2-أ"
-                target_id = f"3-{suffix}"
-                target = next((c for c in level3_classes if c["id"] == target_id), None)
-                if target:
-                    target["students"] = cls2["students"]
-                    upgraded += len(cls2["students"])
-                    cls2["students"] = []
-                else:
-                    errors.append(f"لم يُوجد فصل {target_id}")
-
-            # 3. انقل طلاب المستوى 1 → المستوى 2
-            for cls1 in level1_classes:
-                suffix = str(cls1["id"])[2:]
-                target_id = f"2-{suffix}"
-                target = next((c for c in level2_classes if c["id"] == target_id), None)
-                if target:
-                    target["students"] = cls1["students"]
-                    upgraded += len(cls1["students"])
-                    cls1["students"] = []
-                else:
-                    errors.append(f"لم يُوجد فصل {target_id}")
-
-            # احفظ الطلاب المُحدَّثين
-            with open(STUDENTS_JSON, "w", encoding="utf-8") as f:
-                json.dump({"classes": classes}, f, ensure_ascii=False, indent=2)
+            res = apply_promotion_plan(plan, graduate_top=graduate_top)
+            clear_yearly_data(reset_type="year")
 
             global STUDENTS_STORE
             STUDENTS_STORE = None
 
-            # احذف بيانات السنة
-            clear_yearly_data(reset_type='year')
-
-            msg = ("✅ تمت إنهاء السنة الدراسية بنجاح وتصفير كافة السجلات.\n\n"
-                   f"• طلاب مُرقَّون: {upgraded}\n"
-                   f"• طلاب محذوفون (ثالث): {deleted}\n"
-                   f"• النسخة الاحتياطية: {os.path.basename(path)}")
-            if errors:
-                msg += "\n\n⚠️ تحذيرات:\n" + "\n".join(errors)
+            msg = ("✅ أُنهيت السنة الدراسية.\n\n"
+                   f"• طلاب رُحِّلوا: {res['moved']}\n"
+                   f"• طلاب تخرّجوا: {res['graduated']}\n")
+            if res.get("created"):
+                msg += f"• فصول أُنشئت: {res['created']}\n"
+            msg += f"• النسخة الاحتياطية: {os.path.basename(path)}"
             messagebox.showinfo("تم", msg)
             self._load_term_backups()
             self.update_all_tabs_after_data_change()
-
         except Exception as e:
-            messagebox.showerror("خطأ", f"فشل ترقية الطلاب:\n{e}")
+            messagebox.showerror("خطأ", f"فشل الترحيل:\n{e}")
 
     def _restore_term_backup(self):
         """استعادة نسخة احتياطية من نسخ الفصول."""

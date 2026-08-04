@@ -112,11 +112,17 @@ class AdminApp:
         nb.add(self.tab_list, text="  المدارس المسجّلة  ")
         self.tab_keys = tk.Frame(nb, bg=GRAY)
         nb.add(self.tab_pub,  text="  نشر تحديث  ")
+        self.tab_vis = tk.Frame(nb, bg=GRAY)
         nb.add(self.tab_keys, text="  🔐 نسخ المفاتيح  ")
+        self.tab_frm = tk.Frame(nb, bg=GRAY)
+        nb.add(self.tab_frm,  text="  📥 الطلبات  ")
+        nb.add(self.tab_vis,  text="  📊 الزوّار  ")
         self._build_new(self.tab_new)
         self._build_list(self.tab_list)
         self._build_publish(self.tab_pub)
         self._build_keys(self.tab_keys)
+        self._build_forms(self.tab_frm)
+        self._build_visits(self.tab_vis)
 
     # ── منطقة قابلة للتمرير ──────────────────────────────────────
     def _scrollable(self, parent):
@@ -352,6 +358,116 @@ class AdminApp:
             return
         p(("step", 3, "ok", ""))
         p(("done", sid, sub, port, js))
+
+    # ── تبويب الطلبات ────────────────────────────────────────────
+    def _build_forms(self, parent):
+        """ما يصل من نموذجَي الموقع: طلب تجربة، وبيانات تجهيز مدرسة."""
+        body = tk.Frame(parent, bg=GRAY, padx=22, pady=14)
+        body.pack(fill="both", expand=True)
+
+        tk.Label(body, text="📥  الطلبات الواردة من الموقع", bg=GRAY,
+                 fg=NAVY, font=("Tahoma", 13, "bold")).pack(anchor="e")
+        tk.Label(body, bg=GRAY, fg=MUTED, font=("Tahoma", 9), justify="right",
+                 anchor="e", wraplength=680,
+                 text=("طلبات التجربة من darbstu.com، وبيانات التجهيز من "
+                       "darbstu.com/join/ التي ترسلها للعميل بعد الاتفاق.")
+                 ).pack(anchor="e", pady=(2, 10))
+
+        row = tk.Frame(body, bg=GRAY)
+        row.pack(fill="x", pady=(4, 8))
+        for lbl, arg in (("الكل", ""), ("طلبات التجربة", "lead"),
+                         ("بيانات التجهيز", "onboard")):
+            tk.Button(row, text=lbl, bg=BLUE, fg=WHITE, relief="flat",
+                      font=("Tahoma", 10, "bold"), cursor="hand2",
+                      padx=16, pady=6,
+                      command=lambda a=arg: self._forms_load(a)
+                      ).pack(side="right", padx=(0, 8))
+        tk.Button(row, text="🔗 نسخ رابط التجهيز", bg=LBLUE, fg=NAVY,
+                  relief="flat", font=("Tahoma", 9), cursor="hand2",
+                  padx=10, pady=6, command=self._copy_join_link).pack(side="left")
+
+        self._frm_out = tk.Text(body, font=("Consolas", 9), bg="#0f1720",
+                                fg="#d6e2ee", wrap="word", relief="flat",
+                                state="disabled")
+        self._frm_out.pack(fill="both", expand=True)
+        self._frm_log("اضغط لعرض الطلبات.\n")
+
+    def _copy_join_link(self):
+        url = f"https://{DOMAIN}/join/"
+        self.root.clipboard_clear()
+        self.root.clipboard_append(url)
+        messagebox.showinfo(
+            "نُسخ الرابط",
+            f"{url}\n\nأرسله للعميل بعد الاتفاق ليعبّئ بيانات مدرسته.")
+
+    def _frm_log(self, txt, clear=True):
+        self._frm_out.config(state="normal")
+        if clear:
+            self._frm_out.delete("1.0", "end")
+        self._frm_out.insert("end", txt)
+        self._frm_out.config(state="disabled")
+
+    def _forms_load(self, kind):
+        self._frm_log("⏳ جارٍ الجلب...\n")
+
+        def _w():
+            ok, out = run_remote(f"darbstu-forms {kind}".strip(), timeout=60)
+            self.q.put(("frm", ok, out or "لا طلبات بعد."))
+
+        threading.Thread(target=_w, daemon=True).start()
+
+    # ── تبويب الزوّار ────────────────────────────────────────────
+    def _build_visits(self, parent):
+        """
+        قياس اهتمام المدارس بصفحة العرض.
+
+        لا عدّاد مرئي على الصفحة عمداً: رقم صغير يراه مدير مدرسة يقرأ
+        كدليل على أن لا أحد يثق بالنظام. القياس هنا، لك وحدك.
+        """
+        body = tk.Frame(parent, bg=GRAY, padx=22, pady=14)
+        body.pack(fill="both", expand=True)
+
+        tk.Label(body, text="📊  اهتمام المدارس بصفحة darbstu.com", bg=GRAY,
+                 fg=NAVY, font=("Tahoma", 13, "bold")).pack(anchor="e")
+        tk.Label(body, bg=GRAY, fg=MUTED, font=("Tahoma", 9), justify="right",
+                 wraplength=680, anchor="e",
+                 text=("ثلاث إشارات مرتّبة بقوتها: نقرة واتساب (ترك الصفحة "
+                       "ليكلّمك) ← قراءة الدليل ← فتح الصفحة.\n"
+                       "يُقرأ من سجل الخادم مباشرة — بلا كوكيز ولا تتبّع "
+                       "خارجي على زوّارك.")
+                 ).pack(anchor="e", pady=(2, 10))
+
+        row = tk.Frame(body, bg=GRAY)
+        row.pack(fill="x", pady=(4, 8))
+        for lbl, days in (("اليوم", 1), ("٧ أيام", 7), ("٣٠ يوماً", 30),
+                          ("٩٠ يوماً", 90)):
+            tk.Button(row, text=lbl, bg=BLUE, fg=WHITE, relief="flat",
+                      font=("Tahoma", 10, "bold"), cursor="hand2",
+                      padx=16, pady=6,
+                      command=lambda d=days: self._visits_load(d)
+                      ).pack(side="right", padx=(0, 8))
+
+        self._vis_out = tk.Text(body, font=("Consolas", 9), bg="#0f1720",
+                                fg="#d6e2ee", wrap="word", relief="flat",
+                                state="disabled")
+        self._vis_out.pack(fill="both", expand=True)
+        self._vis_log("اضغط مدة لعرض التقرير.\n")
+
+    def _vis_log(self, txt, clear=True):
+        self._vis_out.config(state="normal")
+        if clear:
+            self._vis_out.delete("1.0", "end")
+        self._vis_out.insert("end", txt)
+        self._vis_out.config(state="disabled")
+
+    def _visits_load(self, days):
+        self._vis_log(f"⏳ جارٍ قراءة آخر {days} يوماً...\n")
+
+        def _w():
+            ok, out = run_remote(f"darbstu-visits {days}", timeout=60)
+            self.q.put(("vis", ok, out or "لا بيانات بعد."))
+
+        threading.Thread(target=_w, daemon=True).start()
 
     # ── تبويب نسخ المفاتيح ───────────────────────────────────────
     def _build_keys(self, parent):
@@ -614,7 +730,11 @@ class AdminApp:
             while True:
                 msg = self.q.get_nowait()
                 kind = msg[0]
-                if kind == "keys":
+                if kind == "frm":
+                    self._frm_log(msg[2] if msg[1] else "⛔ " + msg[2])
+                elif kind == "vis":
+                    self._vis_log(msg[2] if msg[1] else "⛔ " + msg[2])
+                elif kind == "keys":
                     self._keys_log(msg[2])
                 elif kind == "pub":
                     # الوضع يأتي صريحاً لا مستنتَجاً من النص: مخرجات

@@ -1663,6 +1663,7 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
         ("الإعدادات والنظام", [
             ("إعدادات المدرسة",     "school_settings",      "fas fa-university"),
             ("المستخدمون",          "users",                "fas fa-user-shield"),
+            ("إنهاء الفصل / السنة", "end_period",           "fas fa-calendar-check"),
             ("النسخ الاحتياطية",    "backup",               "fas fa-hdd"),
             ("ملاحظات سريعة",       "quick_notes",          "fas fa-sticky-note"),
         ]),
@@ -2893,6 +2894,144 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
   </div>
 </div>
 
+<div id="tab-end_period">
+  <h2 class="pt"><i class="fas fa-calendar-check"></i> إنهاء الفصل أو السنة</h2>
+
+  <div class="section">
+    <div class="ab ae" style="margin-bottom:16px;font-size:13px">
+      ⚠️ إجراء للمدير وحده. تُؤخذ نسخة احتياطية تلقائياً قبل أي حذف،
+      ويُطلب تأكيد بكلمة مرورك.
+    </div>
+
+    <h3 style="font-size:15px;margin:18px 0 8px;color:#0f6e56">
+      📘 إنهاء الفصل الدراسي
+    </h3>
+    <p style="font-size:13.5px;color:#64748b;margin:0 0 12px">
+      تُصفَّر سجلات الغياب والتأخر والأعذار والاستئذان والتحويلات.
+      <b>ويبقى الطلاب والفصول والمعلمون والمستخدمون كما هم.</b>
+    </p>
+    <button class="btn bp1" onclick="openEndModal('term')">
+      إنهاء الفصل الدراسي
+    </button>
+
+    <hr style="margin:26px 0;border:none;border-top:1px solid #e2e8f0">
+
+    <h3 style="font-size:15px;margin:0 0 8px;color:#b45309">
+      🎓 إنهاء السنة وترحيل الطلاب
+    </h3>
+    <p style="font-size:13.5px;color:#64748b;margin:0 0 12px">
+      يُرقّي كل صف إلى الأعلى ويُخرّج صف النهاية، ثم يُصفّر سجلات العام.
+      راجع الخطة قبل التنفيذ.
+    </p>
+    <button class="btn bp2" onclick="loadPromoPlan()">
+      🔍 اعرض خطة الترحيل
+    </button>
+    <div id="promo-plan" style="margin-top:16px"></div>
+  </div>
+</div>
+
+<div id="end-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;align-items:center;justify-content:center">
+  <div style="background:#fff;border-radius:14px;padding:28px;width:400px;max-width:95vw;box-shadow:0 8px 32px rgba(0,0,0,.25)">
+    <h3 id="end-title" style="margin:0 0 8px;font-size:16px;color:#1e293b"></h3>
+    <div id="end-warn" class="ab ae" style="margin-bottom:14px;font-size:13px"></div>
+    <div class="fg">
+      <label class="fl">كلمة مرور حسابك</label>
+      <input type="password" id="end-pw" placeholder="للتأكيد"
+             onkeydown="if(event.key==='Enter')doEndPeriod()">
+    </div>
+    <div id="end-st" style="margin:10px 0;min-height:22px"></div>
+    <div style="display:flex;gap:10px;justify-content:flex-end">
+      <button class="btn bp2" onclick="closeEndModal()">إلغاء</button>
+      <button class="btn bp3" id="end-go" onclick="doEndPeriod()">تنفيذ</button>
+    </div>
+  </div>
+</div>
+
+
+<script>
+var _endMode = null;
+
+function openEndModal(mode){
+  _endMode = mode;
+  document.getElementById('end-title').textContent =
+    mode === 'term' ? '📘 إنهاء الفصل الدراسي' : '🎓 إنهاء السنة وترحيل الطلاب';
+  document.getElementById('end-warn').innerHTML = mode === 'term'
+    ? '⚠️ ستُحذف سجلات الغياب والتأخر والأعذار والتحويلات. الطلاب والفصول والمعلمون يبقون.'
+    : '⚠️ سيُرحَّل الطلاب للصف الأعلى، ويُخرَّج صف النهاية، وتُحذف سجلات العام كاملة.';
+  document.getElementById('end-pw').value = '';
+  document.getElementById('end-st').innerHTML = '';
+  document.getElementById('end-go').disabled = false;
+  document.getElementById('end-go').textContent = 'تنفيذ';
+  document.getElementById('end-modal').style.display = 'flex';
+  setTimeout(function(){ document.getElementById('end-pw').focus(); }, 60);
+}
+function closeEndModal(){ document.getElementById('end-modal').style.display='none'; }
+
+function loadPromoPlan(){
+  var box = document.getElementById('promo-plan');
+  box.innerHTML = '<div style="color:#64748b;font-size:13px">جارٍ بناء الخطة...</div>';
+  fetch('/web/api/promotion-plan').then(function(r){return r.json();}).then(function(d){
+    if(!d.ok){ box.innerHTML = '<div class="ab ae">'+(d.msg||'تعذّر')+'</div>'; return; }
+    if(!d.moves.length && !d.graduate.length){
+      box.innerHTML = '<div class="ab ae">لا توجد فصول قابلة للترحيل.</div>'; return;
+    }
+    var h = '<div class="ab ai" style="margin-bottom:12px;font-size:13px">'+
+            'المستويات الموجودة: '+d.levels.join(' · ')+
+            ' — الخطة مبنية على فصول مدرستك الفعلية.</div>';
+    h += '<div class="tw"><table><thead><tr><th>من</th><th>إلى</th><th>الطلاب</th></tr></thead><tbody>';
+    d.moves.forEach(function(m){
+      h += '<tr><td>'+m.from_name+'</td><td>'+m.to_name+
+           (m.target_exists?'':' <span style="color:#0f6e56">(يُنشأ)</span>')+
+           '</td><td>'+m.count+'</td></tr>';
+    });
+    d.graduate.forEach(function(g){
+      h += '<tr style="background:#fef3e2"><td>'+g.name+
+           '</td><td><b>يتخرّجون</b></td><td>'+g.count+'</td></tr>';
+    });
+    h += '</tbody></table></div>';
+    h += '<label style="display:flex;gap:8px;align-items:center;margin:14px 0;font-size:13.5px">'+
+         '<input type="checkbox" id="promo-grad" checked> '+
+         'تخريج طلاب الصف الأعلى وحذفهم من النظام</label>';
+    h += '<button class="btn bp3" onclick="openEndModal('year')">تنفيذ الترحيل وإنهاء السنة</button>';
+    box.innerHTML = h;
+  }).catch(function(){ box.innerHTML = '<div class="ab ae">تعذّر الاتصال</div>'; });
+}
+
+function doEndPeriod(){
+  var pw = document.getElementById('end-pw').value;
+  var st = document.getElementById('end-st');
+  var go = document.getElementById('end-go');
+  if(!pw){ st.innerHTML='<span style="color:#c0451b">أدخل كلمة المرور</span>'; return; }
+  go.disabled = true; go.textContent = 'جارٍ التنفيذ...';
+  st.innerHTML = '<span style="color:#64748b">تُؤخذ نسخة احتياطية أولاً...</span>';
+
+  var gradEl = document.getElementById('promo-grad');
+  var body = { password: pw };
+  if(_endMode === 'year') body.graduate_top = gradEl ? gradEl.checked : true;
+
+  fetch(_endMode === 'term' ? '/web/api/end-term' : '/web/api/end-year', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  }).then(function(r){return r.json();}).then(function(d){
+    if(d.ok){
+      var m = _endMode === 'term'
+        ? 'تم إنهاء الفصل الدراسي.'
+        : ('تم: رُحِّل '+d.moved+' طالباً · تخرّج '+d.graduated+
+           (d.created ? ' · أُنشئ '+d.created+' فصل' : ''));
+      st.innerHTML = '<span style="color:#0f6e56">✅ '+m+'<br>'+
+                     'النسخة الاحتياطية: '+(d.backup||'')+'</span>';
+      go.textContent = 'تم';
+      setTimeout(function(){ location.reload(); }, 2600);
+    } else {
+      st.innerHTML = '<span style="color:#c0451b">'+(d.msg||'فشل')+'</span>';
+      go.disabled = false; go.textContent = 'تنفيذ';
+    }
+  }).catch(function(){
+    st.innerHTML = '<span style="color:#c0451b">تعذّر الاتصال</span>';
+    go.disabled = false; go.textContent = 'تنفيذ';
+  });
+}
+</script>
 <div id="tab-quick_notes">
   <h2 class="pt"><i class="fas fa-sticky-note"></i> ملاحظات سريعة</h2>
   <div class="section">
@@ -10536,3 +10675,96 @@ async def api_noor_absence(request: Request, date: str = None):
 
 if __name__ == "__main__":
     pass
+
+
+# ═══════════════════════════════════════════════════════════════
+#  إنهاء الفصل والسنة — من الويب
+# ═══════════════════════════════════════════════════════════════
+# كانت هذه في التطبيق المكتبي وحده، فمن يدير مدرسته من الويب لا
+# يجدها. والحمايات نفسها هنا: مدير فقط، وكلمة مروره، ونسخة احتياطية
+# قبل أي حذف.
+
+@router.get("/web/api/promotion-plan", response_class=JSONResponse)
+async def web_promotion_plan(request: Request):
+    user = _get_current_user(request)
+    if not user or user.get("role") != "admin":
+        return JSONResponse({"ok": False, "msg": "هذا الإجراء للمدير فقط"},
+                            status_code=403)
+    try:
+        from database import build_promotion_plan
+        plan = build_promotion_plan()
+        return JSONResponse({"ok": True, **plan,
+                             "orphans": [c.get("id") for c in plan.get("orphans", [])]})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+def _verify_admin_pw(user, pw):
+    """يتحقق أن الطالب للإجراء مديرٌ وأن كلمة مروره صحيحة."""
+    if not user or user.get("role") != "admin":
+        return "هذا الإجراء للمدير فقط"
+    if not pw:
+        return "كلمة المرور مطلوبة"
+    if authenticate(user.get("username", ""), pw) is None:
+        return "كلمة المرور غير صحيحة"
+    return None
+
+
+@router.post("/web/api/end-term", response_class=JSONResponse)
+async def web_end_term(request: Request):
+    user = _get_current_user(request)
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    err = _verify_admin_pw(user, (data.get("password") or "").strip())
+    if err:
+        return JSONResponse({"ok": False, "msg": err}, status_code=403)
+
+    try:
+        from database import create_backup, clear_yearly_data
+        ok, path, _ = create_backup()
+        if not ok:
+            return JSONResponse({"ok": False,
+                                 "msg": f"فشل النسخ الاحتياطي: {path}"},
+                                status_code=500)
+        clear_yearly_data(reset_type="term")
+        global STUDENTS_STORE
+        STUDENTS_STORE = None
+        load_students(force_reload=True)
+        return JSONResponse({"ok": True, "backup": os.path.basename(str(path)),
+                             "msg": "أُنهي الفصل الدراسي وصُفِّرت سجلاته."})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+@router.post("/web/api/end-year", response_class=JSONResponse)
+async def web_end_year(request: Request):
+    user = _get_current_user(request)
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    err = _verify_admin_pw(user, (data.get("password") or "").strip())
+    if err:
+        return JSONResponse({"ok": False, "msg": err}, status_code=403)
+
+    try:
+        from database import (create_backup, clear_yearly_data,
+                              build_promotion_plan, apply_promotion_plan)
+        ok, path, _ = create_backup()
+        if not ok:
+            return JSONResponse({"ok": False,
+                                 "msg": f"فشل النسخ الاحتياطي: {path}"},
+                                status_code=500)
+        plan = build_promotion_plan()
+        res = apply_promotion_plan(
+            plan, graduate_top=bool(data.get("graduate_top", True)))
+        clear_yearly_data(reset_type="year")
+        global STUDENTS_STORE
+        STUDENTS_STORE = None
+        load_students(force_reload=True)
+        return JSONResponse({"ok": True, "backup": os.path.basename(str(path)),
+                             **res})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
