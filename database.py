@@ -4169,6 +4169,44 @@ def _class_suffix(cid) -> str:
     return parts[1] if len(parts) > 1 else ""
 
 
+_AR_DIGITS = "٠١٢٣٤٥٦٧٨٩"
+
+
+def _derive_target_name(src_name: str, lvl: int, to_suffix: str) -> str:
+    """
+    يشتقّ اسم الفصل الهدف من اسم الفصل المصدر، حفاظاً على تسمية المدرسة.
+
+    المدرسة قد تُسمّي فصولها «الصف 1 - فصل 2» لا «أول ثانوي / ب». لو بنينا
+    اسم الفصل الجديد بالمخطط المدمج لظهر اسم دخيل بين إخوته — وهو ما حدث
+    فعلاً في المدرسة الافتراضية: «الصف 1 - فصل 2» رُحِّل إلى «ثاني ثانوي / ب».
+
+    الترتيب: اسم المستوى العربي إن ورد، ثم أول رقم مستوى مفرد (عربي أو
+    هندي)، وإلا المخطط المدمج.
+    """
+    src_name = (src_name or "").strip()
+    if not src_name:
+        return _noor_build_class_name(
+            stage_level_name(str(lvl + 1)),
+            section_label_from_value(to_suffix, stage_level_name(str(lvl + 1))))
+
+    # «أول ثانوي / ب»  ->  «ثاني ثانوي / ب»
+    cur, nxt = stage_level_name(str(lvl)), stage_level_name(str(lvl + 1))
+    if cur and cur in src_name:
+        return src_name.replace(cur, nxt, 1)
+
+    # «الصف 1 - فصل 2»  ->  «الصف 2 - فصل 2»  (أول رقم مستوى مفرد فقط)
+    import re as _re
+    if 0 <= lvl and lvl + 1 <= 9:
+        for digits in ("0123456789", _AR_DIGITS):
+            a, b = digits[lvl], digits[lvl + 1]
+            m = _re.search(r"(?<!\d)%s(?!\d)" % _re.escape(a), src_name)
+            if m:
+                return src_name[:m.start()] + b + src_name[m.end():]
+
+    return _noor_build_class_name(
+        nxt, section_label_from_value(to_suffix, nxt))
+
+
 def build_promotion_plan(classes=None) -> dict:
     """
     يبني خطة الترحيل من الفصول الموجودة.
@@ -4202,9 +4240,7 @@ def build_promotion_plan(classes=None) -> dict:
         to_id = f"{lvl + 1}-{suffix}"
         tgt = by_id.get(to_id)
         to_name = (tgt.get("name") if tgt else
-                   _noor_build_class_name(stage_level_name(str(lvl + 1)),
-                                          section_label_from_value(
-                                              suffix, stage_level_name(str(lvl + 1)))))
+                   _derive_target_name(c.get("name", ""), lvl, suffix))
         moves.append({"from_id": c["id"], "from_name": c.get("name", ""),
                       "to_id": to_id, "to_name": to_name, "count": n,
                       "target_exists": tgt is not None})
