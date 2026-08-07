@@ -373,7 +373,9 @@ def send_alert_for_student(student: Dict, cfg: Dict = None) -> Dict:
     result     = {"parent": False, "admin": False, "errors": []}
 
     # ─ رسالة ولي الأمر
-    if cfg.get("alert_notify_parent") and phone:
+    # المفتاح الرئيسي يوقف ما يخرج للأهالي فقط؛ شقّ الإدارة أدناه يستمر.
+    from config_manager import parent_sending_on
+    if cfg.get("alert_notify_parent") and phone and parent_sending_on():
         tpl = cfg.get("alert_template_parent", "")
         try:
             from config_manager import render_template

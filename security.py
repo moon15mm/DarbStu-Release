@@ -14,6 +14,7 @@ import os
 import sys
 import json
 import hmac
+import datetime
 import base64
 import hashlib
 import secrets
@@ -86,6 +87,52 @@ def get_secret(name: str) -> str:
 def get_jwt_secret() -> str:
     """سر توقيع جلسات لوحة الويب."""
     return get_secret('jwt')
+
+
+def get_link_secret() -> str:
+    """سر اشتقاق رموز روابط الفصول — فريد لكل مدرسة."""
+    return get_secret('links')
+
+
+# ══════════════════════════════════════════════════════════════════
+#  رموز روابط الفصول — تتجدّد كل يوم
+# ══════════════════════════════════════════════════════════════════
+# `/c/1-1` معرّف يُخمَّن: من يعرف نطاق المدرسة يصل لكل فصولها ويُسجّل
+# غياباً كاذباً يُشغّل رسائل واتساب لأولياء الأمور. الرمز يمنع ذلك.
+#
+# يُشتقّ حسابياً من (سرّ المدرسة + الفصل + التاريخ) ولا يُخزَّن: لا جدول
+# ينمو، ولا تنظيف، ورمز الأمس يبطل وحده لأنه ببساطة لا يُطابق حساب اليوم.
+# ولأنه HMAC، لا يمكن استنتاج رمز الغد من رمز اليوم.
+
+def class_link_token(class_id: str, day: str = '') -> str:
+    """رمز اليوم لفصل — ٣٢ حرفاً ست عشرياً."""
+    if not day:
+        day = _riyadh_day()
+    msg = '{}|{}'.format(class_id, day).encode('utf-8')
+    return hmac.new(get_link_secret().encode('utf-8'),
+                    msg, hashlib.sha256).hexdigest()[:32]
+
+
+def verify_class_link_token(class_id: str, token: str) -> bool:
+    """
+    يقبل رمز اليوم ورمز أمس.
+
+    مهلة الأمس ليست تساهلاً: المعلم قد يفتح رابطاً وصله ليلاً بعد منتصف
+    الليل، أو يعود لرسالة أمس ليُكمل تسجيلاً. رفضه حينها يُنتج شكوى
+    لا أماناً — النافذة تبقى يوماً واحداً على أي حال.
+    """
+    if not token:
+        return False
+    today = _riyadh_day()
+    yday = (datetime.datetime.strptime(today, '%Y-%m-%d')
+            - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+    return any(hmac.compare_digest(token, class_link_token(class_id, d))
+               for d in (today, yday))
+
+
+def _riyadh_day() -> str:
+    tz = datetime.timezone(datetime.timedelta(hours=3))
+    return datetime.datetime.now(datetime.timezone.utc).astimezone(tz).strftime('%Y-%m-%d')
 
 
 # ══════════════════════════════════════════════════════════════════

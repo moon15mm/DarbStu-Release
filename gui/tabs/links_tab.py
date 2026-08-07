@@ -56,8 +56,10 @@ class LinksTabMixin:
                 base_url = self.public_url or f"http://{self.ip}:{PORT}"
         except Exception:
             base_url = self.public_url or f"http://{self.ip}:{PORT}"
+        # الرمز يتجدّد كل يوم — ما يُنسخ من هنا صالح اليوم وغداً فقط
+        import security as _sec
         for c in self.store["list"]:
-            link = f"{base_url}/c/{c['id']}"
+            link = f"{base_url}/c/{c['id']}?k={_sec.class_link_token(str(c['id']))}"
             self.tree_links.insert("", "end", values=(c["id"], c["name"], len(c["students"] ), link))
         self.teachers_data = load_teachers()
         teacher_names = [t.get("اسم المعلم", "") for t in self.teachers_data.get("teachers", [])]

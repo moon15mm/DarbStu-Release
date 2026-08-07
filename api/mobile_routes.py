@@ -3,6 +3,7 @@
 api/mobile_routes.py — مسارات الواجهة المتنقلة والفصول الدراسية
 """
 import datetime, json, base64, os, re, io, socket, sqlite3, subprocess, threading
+import security as _sec
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -553,9 +554,10 @@ async function submitAbsences(){
   btn.disabled=true;btn.textContent='جارٍ التسجيل...';
   const absentList=STUDENTS.filter(s=>absent.has(s.id));
   try{
+    const K=new URLSearchParams(location.search).get('k')||'';
     const r=await fetch(BASE+'/api/submit/'+CLASS_ID,{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({date,students:absentList,teacher_name:teacher,period:parseInt(period)})
+      body:JSON.stringify({date,students:absentList,teacher_name:teacher,period:parseInt(period),k:K})
     });
     const d=await r.json();
     if(r.ok){
@@ -606,9 +608,41 @@ buildList();updateCounter();
     return html
 
 
+def _link_expired_html() -> str:
+    """
+    يُعرض حين يُفتح رابط فصل قديم أو بلا رمز.
+
+    الرابط يتجدّد كل يوم، فالمعلم الذي يعود لرسالة الأسبوع الماضي سيصل
+    هنا. رسالة تشرح وتدلّ على البديل تُوفّر مكالمة على إدارة المدرسة —
+    و٤٠٣ صامتة تُنتجها.
+    """
+    return """<!DOCTYPE html><html lang="ar" dir="rtl"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>رابط منتهي</title></head>
+<body style="font-family:Tahoma,Arial,sans-serif;background:#f8fafc;margin:0;
+             display:flex;align-items:center;justify-content:center;min-height:100vh">
+  <div style="background:#fff;border-radius:16px;padding:34px 28px;max-width:420px;
+              text-align:center;box-shadow:0 6px 28px rgba(0,0,0,.08)">
+    <div style="font-size:44px;margin-bottom:10px">🔗</div>
+    <h2 style="margin:0 0 10px;color:#b45309;font-size:19px">انتهت صلاحية هذا الرابط</h2>
+    <p style="color:#475569;font-size:14.5px;line-height:1.9;margin:0">
+      روابط تسجيل الغياب تتجدّد كل يوم حمايةً لبيانات الطلاب.<br>
+      استخدم <b>رابط اليوم</b> الذي يصلك مع بداية كل حصة.
+    </p>
+    <p style="color:#94a3b8;font-size:12.5px;margin:18px 0 0">
+      لم يصلك رابط اليوم؟ راجع إدارة المدرسة.
+    </p>
+  </div>
+</body></html>"""
+
+
 @router.get("/c/{class_id:path}", response_class=HTMLResponse)
-def get_class_page(class_id: str):
-    """صفحة تسجيل الغياب لفصل محدد."""
+def get_class_page(class_id: str, request: Request, k: str = ""):
+    """
+    صفحة تسجيل الغياب لفصل محدد — تتطلب رمز اليوم عند القدوم من الإنترنت.
+
+    داخل شبكة المدرسة تُفتح بلا رمز، فروابط الشبكة المحلية تبقى كما هي.
+    """
     try:
         # فك تشفير URL (مثل %D8%A3 → أ) لدعم المعرّفات التي تحتوي على حروف عربية
         from urllib.parse import unquote
@@ -626,17 +660,23 @@ def get_class_page(class_id: str):
                     break
 
         if not cls:
-            # عرض قائمة الفصول المتاحة لتسهيل التشخيص
-            available = ", ".join(str(k) for k in store["by_id"].keys())
+            # لا تُعرض قائمة الفصول: كانت تُعطي زائراً مجهولاً معرّفات
+            # كل فصول المدرسة، وهو أول ما يحتاجه من يريد تسجيل غياب كاذب.
             return HTMLResponse(
                 content=(
                     "<div style='text-align:center;font-family:Cairo,Arial;direction:rtl;padding:30px'>"
-                    f"<h2 style='color:red'>الفصل غير موجود: <code>{class_id}</code></h2>"
-                    f"<p style='color:#555'>الفصول المتاحة: {available}</p>"
+                    "<h2 style='color:#b45309'>الفصل غير موجود</h2>"
+                    "<p style='color:#555'>تأكد من الرابط أو راجع إدارة المدرسة.</p>"
                     "</div>"
                 ),
                 status_code=404
             )
+
+        # ── رمز اليوم — للقادم من خارج شبكة المدرسة فقط ──
+        if _is_external(request) and not _sec.verify_class_link_token(class_id, k):
+            from api.web_routes import _get_current_user
+            if not _get_current_user(request):
+                return HTMLResponse(content=_link_expired_html(), status_code=403)
         try:
             if os.path.exists(TEACHERS_JSON):
                 with open(TEACHERS_JSON, "r", encoding="utf-8-sig") as f:
@@ -658,6 +698,17 @@ async def api_submit(class_id: str, req: Request):
     from urllib.parse import unquote
     class_id = unquote(class_id)
     payload = await req.json()
+
+    # حماية الصفحة وحدها لا تكفي: هذا المسار هو ما يكتب الغياب فعلاً،
+    # ويُشغّل رسائل واتساب لأولياء الأمور. طلب مباشر إليه يتخطّى الصفحة.
+    if _is_external(req):
+        k = payload.get("k") or req.query_params.get("k") or ""
+        if not _sec.verify_class_link_token(class_id, k):
+            from api.web_routes import _get_current_user
+            if not _get_current_user(req):
+                return JSONResponse(
+                    {"detail": "انتهت صلاحية الرابط — استخدم رابط اليوم"},
+                    status_code=403)
     date_str, students, teacher_name, period = payload.get("date"), payload.get("students", []), payload.get("teacher_name"), payload.get("period")
     if not isinstance(students, list) or not teacher_name: return JSONResponse({"detail": "بيانات غير مكتملة."}, status_code=400)
     store = load_students(); cls = store["by_id"].get(class_id)
@@ -1026,8 +1077,15 @@ loadToday();
 
 
 @router.get("/tardiness", response_class=HTMLResponse)
-def tardiness_all_page():
-    """صفحة التأخر — جميع طلاب المدرسة مرتبين أبجدياً."""
+def tardiness_all_page(request: Request):
+    """
+    صفحة التأخر — جميع طلاب المدرسة مرتبين أبجدياً.
+
+    مفتوحة عمداً بلا تسجيل دخول: رابطها يُرسل عبر واتساب لمستلمين قد لا
+    تكون لهم حسابات. الثمن أن أسماء طلاب المدرسة تظهر لمن يعرف النطاق،
+    وأن /api/tardiness/add يقبل من الإنترنت. الحل المؤجَّل هو رمز في
+    الرابط كبوابة أولياء الأمور، ويُبنى مع رمز رابط الفصل.
+    """
     store   = load_students()
     base    = STATIC_DOMAIN if STATIC_DOMAIN and not debug_on() else f"http://{local_ip()}:{PORT}"
     all_stu = []
@@ -1044,8 +1102,8 @@ def tardiness_all_page():
 
 
 @router.get("/tardiness/{class_id}", response_class=HTMLResponse)
-def tardiness_class_page(class_id: str):
-    """صفحة التأخر — طلاب فصل محدد."""
+def tardiness_class_page(class_id: str, request: Request):
+    """صفحة التأخر — طلاب فصل محدد. مفتوحة عمداً — انظر tardiness_all_page."""
     store = load_students()
     cls   = store["by_id"].get(class_id)
     if not cls:
@@ -1063,7 +1121,13 @@ def tardiness_class_page(class_id: str):
 
 @router.post("/api/tardiness/add")
 async def api_tardiness_add(req: Request):
-    """يُسجّل تأخر طالب ويحسب الدقائق تلقائياً."""
+    """
+    يُسجّل تأخر طالب ويحسب الدقائق تلقائياً.
+
+    مفتوح عمداً بلا مصادقة لأن صفحة /tardiness التي تستدعيه مفتوحة —
+    إغلاقه وحده يجعل الصفحة تُحمَّل ثم لا تفعل شيئاً. يعني هذا أن أي
+    زائر على الإنترنت يستطيع كتابة سجل تأخر. يُغلق مع رمز الرابط.
+    """
     data = await req.json()
     cfg  = load_config()
 
@@ -1133,8 +1197,8 @@ def api_tardiness_delete(record_id: int, request: Request):
 
 
 @router.get("/api/tardiness/today")
-def api_tardiness_today(date: str = ""):
-    """يُرجع سجلات التأخر لليوم مع وقت التسجيل."""
+def api_tardiness_today(request: Request, date: str = ""):
+    """سجلات تأخر اليوم. مفتوح عمداً — تستدعيه صفحة /tardiness المفتوحة."""
     date_str = date or now_riyadh_date()
     con = get_db(); con.row_factory = sqlite3.Row; cur = con.cursor()
     # نستخدم created_at لاستخراج وقت التسجيل الفعلي
@@ -1302,6 +1366,7 @@ def mobile_portal_html() -> str:
                     // عرض جميع الخدمات (القديمة + الجديدة)
                     const allServices = [
                         { title: "تسجيل الغياب", url: data.class_links_page_url, icon: "📝" },
+                        { title: "طلب استئذان", url: data.permission_url, icon: "🚪" },
                         { title: "إرسال رسائل الغياب", url: data.send_messages_url, icon: "✉️" },
                         { title: "تعديل جدول الحصص", url: data.schedule_edit_url, icon: "🗓️" },
                         { title: "إضافة طالب جديد", url: data.add_student_url, icon: "➕" },
@@ -1311,7 +1376,7 @@ def mobile_portal_html() -> str:
 
                     let menuHtml = '';
                     allServices.forEach(item => {
-                        menuHtml += `<a href="${{item.url}}" class="menu-item"><span class="icon">${{item.icon}}</span><span>${{item.title}}</span></a>`;
+                        menuHtml += `<a href="${item.url}" class="menu-item"><span class="icon">${item.icon}</span><span>${item.title}</span></a>`;
                     });
                     mainMenuEl.innerHTML = menuHtml;
 
@@ -1328,12 +1393,12 @@ def mobile_portal_html() -> str:
                         if(currentHour >= 12) currentPeriod = 6;
                         if(currentHour >= 13) currentPeriod = 7;
                         const periodData = data.live_status.find(p => p.period === currentPeriod) || data.live_status[0];
-                        monitorHtml += `<h3>الحصة ${{periodData.period}}</h3>`;
+                        monitorHtml += `<h3>الحصة ${periodData.period}</h3>`;
                         periodData.classes.forEach(c => {
                             monitorHtml += `
-                                <div class="monitor-cell ${{c.status}}">
-                                    <div class="class-name">${{c.class_name}}</div>
-                                    <div class="status-icon">${{c.status === 'done' ? '✔️ تم' : '❌ بانتظار'}}</div>
+                                <div class="monitor-cell ${c.status}">
+                                    <div class="class-name">${c.class_name}</div>
+                                    <div class="status-icon">${c.status === 'done' ? '✔️ تم' : '❌ بانتظار'}</div>
                                 </div>
                             `;
                         });
@@ -1526,8 +1591,199 @@ def get_mobile_portal_data():
         "tardiness_all_url": f"{base_url}/tardiness",
         "add_student_url": f"{base_url}/add-student-mobile",
         "manage_students_url": f"{base_url}/manage-students",
-        "monitor_url": f"{base_url}/monitor"
+        "monitor_url": f"{base_url}/monitor",
+        "permission_url": f"{base_url}/permission",
     }
+
+@router.get("/permission", response_class=HTMLResponse)
+def get_permission_page(request: Request):
+    """
+    طلب استئذان من الجوال.
+
+    الشاشة موجودة في التطبيق المكتبي وفي لوحة الويب، ولم تكن في بوابة
+    الجوال — وهي الواجهة التي يفتحها الوكيل والإداري على هواتفهم فعلاً.
+    """
+    if _deny_external(request):
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse("/web/login")
+
+    store = load_students()
+    cls_opts = "".join(
+        '<option value="{cid}">{nm}</option>'.format(cid=c["id"], nm=c["name"])
+        for c in store["list"])
+    stu_json = json.dumps(
+        {c["id"]: [{"id": s["id"], "name": s["name"], "phone": s.get("phone", "")}
+                   for s in c.get("students", [])] for c in store["list"]},
+        ensure_ascii=False)
+    base = STATIC_DOMAIN if STATIC_DOMAIN and not debug_on() else f"http://{local_ip()}:{PORT}"
+    cfg = load_config()
+    school = _fem(cfg.get("school_name", "المدرسة"))
+
+    return HTMLResponse(content="""<!DOCTYPE html>
+<html lang="ar" dir="rtl"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>طلب استئذان</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:Tahoma,Arial,sans-serif;background:#f1f5f9;margin:0;padding:14px;color:#0f172a}
+.wrap{max-width:520px;margin:0 auto}
+.hd{background:#7c3aed;color:#fff;border-radius:14px;padding:16px;text-align:center;margin-bottom:14px}
+.hd h1{margin:0;font-size:18px}
+.hd p{margin:5px 0 0;font-size:12.5px;opacity:.9}
+.card{background:#fff;border-radius:14px;padding:16px;box-shadow:0 2px 10px rgba(0,0,0,.06);margin-bottom:12px}
+label{display:block;font-size:13px;font-weight:bold;margin:10px 0 5px;color:#334155}
+select,input,textarea{width:100%;padding:12px;font-size:15px;border:1px solid #cbd5e1;border-radius:10px;font-family:inherit;background:#fff}
+textarea{min-height:70px;resize:vertical}
+button{width:100%;padding:14px;font-size:16px;font-weight:bold;border:none;border-radius:11px;cursor:pointer;margin-top:12px}
+.b1{background:#7c3aed;color:#fff}
+.b2{background:#e2e8f0;color:#334155;margin-top:8px}
+#st{margin-top:12px;padding:11px;border-radius:10px;text-align:center;font-size:14px;display:none}
+.ok{background:#dcfce7;color:#166534}.er{background:#fee2e2;color:#991b1b}.in{background:#dbeafe;color:#1e40af}
+.lst{margin-top:6px}
+.it{border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;margin-bottom:7px;font-size:13.5px}
+.it b{display:block;font-size:14px}
+.bg{display:inline-block;border-radius:20px;padding:2px 10px;font-size:11.5px;margin-top:5px}
+.g-wait{background:#fef3c7;color:#92400e}.g-ok{background:#dcfce7;color:#166534}.g-no{background:#fee2e2;color:#991b1b}
+a.back{display:block;text-align:center;color:#64748b;font-size:13px;margin-top:14px;text-decoration:none}
+</style></head><body>
+<div class="wrap">
+  <div class="hd"><h1>&#128682; طلب استئذان</h1><p>__SCHOOL__</p></div>
+  <div class="card">
+    <label>التاريخ</label>
+    <input type="date" id="p-date">
+    <label>الفصل</label>
+    <select id="p-class"><option value="">اختر الفصل</option>__CLS__</select>
+    <label>الطالب</label>
+    <select id="p-stu"><option value="">اختر الطالب</option></select>
+    <label>السبب</label>
+    <select id="p-reason">
+      <option>مراجعة طبية</option><option>ظرف طارئ</option>
+      <option>موعد رسمي</option><option>إجراءات حكومية</option><option>أخرى</option>
+    </select>
+    <label>جوال ولي الأمر</label>
+    <input type="tel" id="p-phone" placeholder="05xxxxxxxx" inputmode="numeric">
+    <button class="b1" onclick="send(true)">&#128242; تسجيل وإرسال واتساب</button>
+    <button class="b2" onclick="send(false)">&#128190; تسجيل بدون إرسال</button>
+    <div id="st"></div>
+  </div>
+  <div class="card">
+    <label style="margin-top:0">استئذانات اليوم</label>
+    <div id="today" class="lst">...</div>
+  </div>
+  <a class="back" href="__BASE__/mobile">&#8592; العودة للبوابة</a>
+</div>
+<script>
+var STU = __STU__;
+var d = new Date(); d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+document.getElementById('p-date').value = d.toISOString().slice(0,10);
+
+document.getElementById('p-class').onchange = function(){
+  var list = STU[this.value] || [];
+  var sel = document.getElementById('p-stu');
+  sel.innerHTML = '<option value="">اختر الطالب</option>' +
+    list.map(function(s){ return '<option value="'+s.id+'" data-ph="'+(s.phone||'')+'">'+s.name+'</option>'; }).join('');
+  document.getElementById('p-phone').value = '';
+};
+document.getElementById('p-stu').onchange = function(){
+  var o = this.options[this.selectedIndex];
+  document.getElementById('p-phone').value = o ? (o.getAttribute('data-ph')||'') : '';
+};
+function msg(t, c){
+  var e = document.getElementById('st');
+  e.className = c; e.textContent = t; e.style.display = 'block';
+}
+async function send(wa){
+  var cs = document.getElementById('p-class'), ss = document.getElementById('p-stu');
+  if(!cs.value || !ss.value){ msg('اختر الفصل والطالب', 'er'); return; }
+  msg('جارٍ التسجيل...', 'in');
+  try{
+    var r = await fetch('/api/permission/add', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        date: document.getElementById('p-date').value,
+        class_id: cs.value,
+        class_name: cs.options[cs.selectedIndex].text,
+        student_id: ss.value,
+        student_name: ss.options[ss.selectedIndex].text,
+        parent_phone: document.getElementById('p-phone').value.trim(),
+        reason: document.getElementById('p-reason').value,
+        send_wa: wa })
+    });
+    var j = await r.json();
+    msg(j.ok ? ('✅ ' + (j.msg||'تم')) : ('❌ ' + (j.msg||'فشل')), j.ok ? 'ok' : 'er');
+    if(j.ok) loadToday();
+  }catch(e){ msg('❌ تعذّر الاتصال', 'er'); }
+}
+async function loadToday(){
+  try{
+    var r = await fetch('/api/permission/today?date=' + document.getElementById('p-date').value);
+    var j = await r.json();
+    var rows = j.rows || [];
+    document.getElementById('today').innerHTML = rows.length
+      ? rows.map(function(x){
+          var g = x.status==='موافق' ? 'g-ok' : (x.status==='مرفوض' ? 'g-no' : 'g-wait');
+          return '<div class="it"><b>'+x.student_name+'</b>'+x.class_name+' — '+(x.reason||'')+
+                 '<span class="bg '+g+'">'+x.status+'</span></div>';
+        }).join('')
+      : '<div style="color:#94a3b8;font-size:13px">لا توجد طلبات اليوم</div>';
+  }catch(e){ document.getElementById('today').innerHTML = '<div style="color:#94a3b8">تعذّر التحميل</div>'; }
+}
+document.getElementById('p-date').onchange = loadToday;
+loadToday();
+</script></body></html>"""
+        .replace("__SCHOOL__", school)
+        .replace("__CLS__", cls_opts)
+        .replace("__STU__", stu_json)
+        .replace("__BASE__", base))
+
+
+@router.post("/api/permission/add", response_class=JSONResponse)
+async def api_permission_add(req: Request):
+    """يسجّل طلب استئذان من بوابة الجوال."""
+    _denied = _deny_external(req)
+    if _denied:
+        return _denied
+    try:
+        d = await req.json()
+        sid = str(d.get("student_id", "")).strip()
+        date = str(d.get("date", "")).strip() or now_riyadh_date()
+        if not sid:
+            return JSONResponse({"ok": False, "msg": "اختر الطالب"})
+        from alerts_service import insert_permission, send_permission_request
+        pid = insert_permission(date, sid, d.get("student_name", ""),
+                                d.get("class_id", ""), d.get("class_name", ""),
+                                d.get("parent_phone", ""),
+                                reason=d.get("reason", ""),
+                                approved_by="الجوال")
+        msg = "تم تسجيل طلب الاستئذان"
+        if d.get("send_wa") and d.get("parent_phone"):
+            ok, status = send_permission_request(pid)
+            msg = "تم التسجيل وإرسال واتساب" if ok else ("تم التسجيل — تعذّر الإرسال: " + str(status))
+        return JSONResponse({"ok": True, "msg": msg, "id": pid})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+@router.get("/api/permission/today", response_class=JSONResponse)
+def api_permission_today(request: Request, date: str = ""):
+    """استئذانات اليوم — لعرضها في بوابة الجوال."""
+    _denied = _deny_external(request)
+    if _denied:
+        return _denied
+    con = get_db()
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            "SELECT student_name, class_name, reason, status FROM permissions "
+            "WHERE date=? ORDER BY id DESC",
+            (date or now_riyadh_date(),)).fetchall()
+        return JSONResponse({"ok": True, "rows": [dict(r) for r in rows]})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e), "rows": []})
+    finally:
+        con.close()
+
 
 @router.get("/classes-list", response_class=HTMLResponse)
 def get_classes_list_page():
@@ -1541,10 +1797,11 @@ def get_classes_list_page():
     for c in sorted(store["list"], key=lambda x: x['id']):
         links_html += (
             '<div class="class-item">'
-            '<a class="class-link" href="{base}/c/{cid}">{name} — غياب</a>'
+            '<a class="class-link" href="{base}/c/{cid}?k={k}">{name} — غياب</a>'
             '<a class="class-link tard-link" href="{base}/tardiness/{cid}">{name} — تأخر</a>'
             '</div>'
-        ).format(base=base_url, cid=c["id"], name=c["name"])
+        ).format(base=base_url, cid=c["id"], name=c["name"],
+                 k=_sec.class_link_token(str(c["id"])))
 
     return HTMLResponse(content=f"""\n<!DOCTYPE html>\n<html lang="ar" dir="rtl">
     <head>
@@ -1652,18 +1909,18 @@ def send_messages_html() -> str:
                     let studentsHtml = '';
                     students.forEach(s => {
                         studentsHtml += `
-                            <li class="student-item" id="student-${{s.student_id}}">
-                                <input type="checkbox" value="${{s.student_id}}" checked>
+                            <li class="student-item" id="student-${s.student_id}">
+                                <input type="checkbox" value="${s.student_id}" checked>
                                 <div class="student-info">
-                                    <div class="name">${{s.student_name}}</div>
-                                    <div class="class">${{s.class_name}} | ${{s.phone || 'لا يوجد رقم'}}</div>
+                                    <div class="name">${s.student_name}</div>
+                                    <div class="class">${s.class_name} | ${s.phone || 'لا يوجد رقم'}</div>
                                 </div>
                                 <div class="status ready">جاهز</div>
                             </li>
                         `;
                     });
                     studentListContainer.innerHTML = studentsHtml;
-                    statusLog.textContent = `تم تحميل ${{students.length}} طالب.`;
+                    statusLog.textContent = `تم تحميل ${students.length} طالب.`;
                 } catch (e) {
                     statusLog.textContent = 'فشل تحميل البيانات.';
                 }
@@ -1677,7 +1934,7 @@ def send_messages_html() -> str:
                 }
 
                 sendBtn.disabled = true;
-                statusLog.textContent = `جاري إرسال ${{selectedIds.length}} رسالة...`;
+                statusLog.textContent = `جاري إرسال ${selectedIds.length} رسالة...`;
 
                 try {
                     const res = await fetch('/api/send-bulk-messages', {
@@ -1688,16 +1945,16 @@ def send_messages_html() -> str:
                     const results = await res.json();
                     
                     results.forEach(result => {
-                        const studentLi = document.getElementById(`student-${{result.student_id}}`);
+                        const studentLi = document.getElementById(`student-${result.student_id}`);
                         if (studentLi) {
                             const statusDiv = studentLi.querySelector('.status');
                             statusDiv.textContent = result.success ? 'تم الإرسال' : 'فشل';
-                            statusDiv.className = `status ${{result.success ? 'sent' : 'failed'}}`;
+                            statusDiv.className = `status ${result.success ? 'sent' : 'failed'}`;
                         }
                     });
                     const successCount = results.filter(r => r.success).length;
                     const failedCount = results.length - successCount;
-                    statusLog.textContent = `اكتمل: نجح ${{successCount}}، فشل ${{failedCount}}.`;
+                    statusLog.textContent = `اكتمل: نجح ${successCount}، فشل ${failedCount}.`;
 
                 } catch (e) {
                     statusLog.textContent = 'حدث خطأ فادح أثناء الإرسال.';
@@ -1909,7 +2166,10 @@ def get_schedule_edit_page(request: Request):
     return HTMLResponse(content=schedule_editor_html())
 
 @router.get("/api/schedule-data/{day_of_week}", response_class=JSONResponse)
-def get_schedule_data_api(day_of_week: int):
+def get_schedule_data_api(day_of_week: int, request: Request):
+    # يُرجع الطلاب بأسمائهم وجوالات أوليائهم وأرقام هوياتهم — لا يخرج للإنترنت
+    _denied = _deny_external(request)
+    if _denied: return _denied
     classes = sorted(load_students()["list"], key=lambda c: c['id'])
     teachers = load_teachers().get("teachers", [])
     schedule_raw = load_schedule(day_of_week)
@@ -1985,8 +2245,18 @@ async def api_bot_permission(req: Request):
 
 
 @router.get("/parent/{student_id}", response_class=HTMLResponse)
-async def parent_portal_page(student_id: str):
-    """لوحة ولي الأمر — رابط شخصي لكل طالب."""
+async def parent_portal_page(student_id: str, request: Request):
+    """
+    لوحة ولي الأمر بالرقم الأكاديمي — مسار قديم.
+
+    الروابط التي تُرسَل لأولياء الأمور فعلاً هي /p/{token} برمز عشوائي من
+    `secrets`. أما هذا المسار فيتخطّى نظام الرموز، والرقم الأكاديمي متسلسل
+    يُخمَّن، فيُصبح سجل أي طالب مكشوفاً لمن يعدّ من ١ إلى ٩٩٩. لا رابط
+    مُرسَل يستعمله، فإغلاقه خارجياً لا يقطع عن أحد شيئاً.
+    """
+    if _deny_external(request):
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse("/web/login")
     try:
         return HTMLResponse(content=parent_portal_html(student_id))
     except Exception as e:

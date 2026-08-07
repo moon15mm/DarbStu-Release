@@ -321,6 +321,36 @@ BOT_FLAGS = (
     "weekly_reward_enabled",
 )
 
+# المفتاح الرئيسي يوقف ما يخرج **لأولياء الأمور** فقط. ما يدور داخل
+# الطاقم الإداري يستمر، لأن سبب الإيقاف عملياً واحد من اثنين: إجازة أو
+# اختبارات (فلا معنى لإزعاج الأهالي)، أو خوف من تجميد رقم الواتساب —
+# والتجميد يأتي من الإرسال الكثيف لأرقام ليست في جهات الاتصال، أي
+# أولياء الأمور. رسالة واحدة لجوال الإدارة لا تُسبّبه، وإيقافها يحرم
+# المدير من تقريره اليومي بلا فائدة.
+PARENT_FLAGS = frozenset((
+    "absence_bot_enabled",
+    "permission_bot_enabled",
+    "tardiness_auto_send_enabled",
+    "weekly_reward_enabled",
+))
+
+# يذهب للإدارة وحدها — لا يتأثر بالمفتاح
+STAFF_FLAGS = frozenset(("daily_report_enabled",))
+
+# مختلط: الإشعارات الذكية تُرسل لولي الأمر وللإدارة معاً. المهمة نفسها
+# تبقى تعمل، ويُكتم شقّها الموجَّه لولي الأمر عبر parent_sending_on().
+MIXED_FLAGS = frozenset(("alert_enabled",))
+
+
+def parent_sending_on() -> bool:
+    """
+    هل يُسمح بإرسال رسائل تلقائية **لأولياء الأمور**؟
+
+    استعملها في كل موضع يُرسل لولي أمر ضمن مهمة مختلطة، وإلا خرجت رسالة
+    للأهالي والمفتاح مُطفأ.
+    """
+    return bots_master_on()
+
 
 def bots_master_on() -> bool:
     """هل المفتاح الرئيسي للبوتات مُشغَّل؟ (الافتراضي: نعم)"""
@@ -330,17 +360,53 @@ def bots_master_on() -> bool:
         return True
 
 
+def set_reply_bot(on: bool, timeout: float = 3.0) -> bool:
+    """
+    يشغّل/يوقف البوت المستقبِل في خادم الواتساب.
+
+    هذا هو البوت الذي يقرأ ردود أولياء الأمور: يسجّل الأعذار ويقيّد
+    موافقات الاستئذان ويردّ عليهم. حالته تعيش في خادم Node لا هنا،
+    فلا بد من مناداته عبر HTTP — ونعيد False عند الفشل بدل ابتلاعه،
+    وإلا ظنّ المدير أنه أوقفه وهو يعمل.
+    """
+    import json as _j
+    import urllib.request as _ur
+    try:
+        port = int(load_config().get("whatsapp_port", 3000) or 3000)
+    except Exception:
+        port = 3000
+    try:
+        req = _ur.Request("http://127.0.0.1:%d/bot-toggle" % port,
+                          data=_j.dumps({"enabled": bool(on)}).encode(),
+                          headers={"Content-Type": "application/json"},
+                          method="POST")
+        with _ur.urlopen(req, timeout=timeout) as r:
+            _j.loads(r.read().decode())
+        return True
+    except Exception as e:
+        print(f"[BOTS] تعذّر بلوغ خادم الواتساب: {e}")
+        return False
+
+
 def set_bots_master(on: bool) -> bool:
-    """يشغّل/يوقف كل البوتات دفعةً واحدة."""
+    """
+    المفتاح الواحد: يوقف كل ما يخصّ أولياء الأمور — الصادر والوارد.
+
+    الصادر: رسائل الغياب والتأخر والاستئذان والتعزيز (عبر PARENT_FLAGS).
+    الوارد: البوت الذي يردّ على أولياء الأمور ويسجّل أعذارهم.
+    ولا يمسّ ما يدور داخل الطاقم الإداري.
+    """
     try:
         cfg = load_config()
         cfg["bots_master_enabled"] = bool(on)
         save_config(cfg)
-        print(f"[BOTS] المفتاح الرئيسي: {'تشغيل' if on else 'إيقاف'}")
-        return True
+        print(f"[BOTS] الإرسال لأولياء الأمور: {'تشغيل' if on else 'إيقاف'}")
     except Exception as e:
         print(f"[BOTS] تعذّر الحفظ: {e}")
         return False
+    # الوارد يعيش في خادم Node — قد يكون مطفأً، ولا يمنع ذلك حفظ الإعداد
+    set_reply_bot(on)
+    return True
 
 
 def bot_enabled(flag: str, default: bool = True) -> bool:
@@ -349,10 +415,13 @@ def bot_enabled(flag: str, default: bool = True) -> bool:
 
     استعملها بدل `cfg.get(flag)` المباشر في كل موضع يُطلق إرسالاً
     تلقائياً — وإلا أفلتت مهمة من المفتاح الرئيسي وأرسلت بلا إذن.
+
+    المفتاح الرئيسي يوقف مهام أولياء الأمور وحدها. مهام الطاقم الإداري
+    تستمر، والمختلطة تعمل ويُكتم شقّها الأبوي عبر `parent_sending_on()`.
     """
     try:
         cfg = load_config()
-        if not cfg.get("bots_master_enabled", True):
+        if flag in PARENT_FLAGS and not cfg.get("bots_master_enabled", True):
             return False
         return bool(cfg.get(flag, default))
     except Exception:

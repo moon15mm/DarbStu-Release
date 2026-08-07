@@ -1418,13 +1418,17 @@ def insert_absences(date_str, class_id, class_name, students, teacher_id, teache
             if s["id"] in exempted_ids:
                 skipped += 1
                 continue
-            try:
-                cur.execute("""INSERT OR IGNORE INTO absences
-                               (date,class_id,class_name,student_id,student_name,teacher_id,teacher_name,period,created_at)
-                               VALUES (?,?,?,?,?,?,?,?,?)""",
-                            (date_str, class_id, class_name, s["id"], s["name"], teacher_id, teacher_name, period, created_at))
+            # ‏INSERT OR IGNORE لا يرفع IntegrityError — يتجاهل بصمت. فكانت
+            # `created` تُحسب لكل طالب حتى لو لم يُكتب سطر واحد، ويرى المعلم
+            # «تم التسجيل» بينما لم يتغيّر شيء (الطالب مُسجَّل في حصة سابقة:
+            # القيد فريد على التاريخ + الفصل + الطالب). rowcount يقول الحقيقة.
+            cur.execute("""INSERT OR IGNORE INTO absences
+                           (date,class_id,class_name,student_id,student_name,teacher_id,teacher_name,period,created_at)
+                           VALUES (?,?,?,?,?,?,?,?,?)""",
+                        (date_str, class_id, class_name, s["id"], s["name"], teacher_id, teacher_name, period, created_at))
+            if cur.rowcount:
                 created += 1
-            except sqlite3.IntegrityError:
+            else:
                 skipped += 1
         con.commit()
         return {"created": created, "skipped": skipped}

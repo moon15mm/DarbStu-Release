@@ -610,7 +610,12 @@ class ScheduleTabMixin:
                 self.log_scheduler_message(f"الحصة {period}: فشل إرسال لـ '{teacher_name}' (لا يوجد رقم جوال).")
                 continue
 
-            links_text = "\n".join([f"- فصل: {c['name']}\n  الرابط: {base_url}/c/{c['id']}" for c in assigned_classes])
+            # رمز اليوم — بدونه يُرفض الرابط عند القدوم من الإنترنت
+            import security as _sec
+            links_text = "\n".join([
+                f"- فصل: {c['name']}\n  الرابط: {base_url}/c/{c['id']}"
+                f"?k={_sec.class_link_token(str(c['id']))}"
+                for c in assigned_classes])
             message_body = (
                 f"السلام عليكم أ. {teacher_name},\n"
                 f"إليك روابط تسجيل الغياب للحصة {period}:\n\n"

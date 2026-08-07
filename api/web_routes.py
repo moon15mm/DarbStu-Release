@@ -651,8 +651,11 @@ async def web_classes(request: Request):
     user = _get_current_user(request)
     if not user: return JSONResponse({"error": "غير مصرح"}, status_code=401)
     store   = load_students()
+    # رمز اليوم يُرفق هنا: الروابط المنسوخة من هذا التبويب تُرسَل للمعلمين
+    # وتُفتح من خارج المدرسة، وبلا رمز تُرفض جميعاً.
     classes = [{"id": c["id"], "name": c["name"],
-                "count": len(c["students"])} for c in store["list"]]
+                "count": len(c["students"]),
+                "k": _sec.class_link_token(str(c["id"]))} for c in store["list"]]
     return JSONResponse({"ok": True, "classes": classes})
 
 @router.get("/web/api/class-students/{class_id}", response_class=JSONResponse)
@@ -1266,18 +1269,60 @@ async def api_save_schedule(req: Request):
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 
+@router.get("/web/api/monitor", response_class=JSONResponse)
+async def api_monitor(request: Request, date: str = ""):
+    """لقطة شاملة لحالة النظام — تُغذّي لوحة المراقبة."""
+    user = _get_current_user(request)
+    if not user:
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=401)
+    try:
+        from monitor_service import build_snapshot
+        snap = build_snapshot(date or "")
+        # الأقسام الإدارية للمدير والوكيل فقط
+        if user.get("role") not in ("admin", "deputy"):
+            for k in ("system", "data", "tasks", "whatsapp"):
+                snap.pop(k, None)
+            snap["alerts"] = [a for a in snap.get("alerts", [])
+                              if a.get("level") == "info"]
+        return JSONResponse(snap)
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
 @router.get("/web/api/schedule", response_class=JSONResponse)
-async def api_get_schedule(request: Request, day_of_week: int):
+async def api_get_schedule(request: Request, day_of_week: int = -1):
+    """
+    الجدول المدرسي — يخدم مستدعيَين بعقدين مختلفين.
+
+    كان المسار مُعرَّفاً مرتين في هذا الملف: نسخة تُلزم `day_of_week`
+    وتُرجع `rows` (يستدعيها alerts_service عبر عميل السحابة)، ونسخة بلا
+    معامل تُرجع `items` (تستدعيها اللوحة). FastAPI يُثبّت أول تعريف،
+    فكانت اللوحة تُرسل طلباً بلا معامل فيردّ ٤٢٢ وتعرض «لا يوجد جدول»
+    مهما كان الجدول مُدخَلاً. النسخة الثانية كانت شيفرةً ميتة.
+
+    الآن المعامل اختياري ويُرجع المفتاحين معاً.
+    """
     user = _get_current_user(request)
     if not user: return JSONResponse({"ok": False}, status_code=401)
     try:
-        # load_schedule returns dict{(cid,period): name}, we need rows for JSON
         con = get_db(); con.row_factory = sqlite3.Row; cur = con.cursor()
-        cur.execute("SELECT class_id, period, teacher_name FROM schedule WHERE day_of_week = ?", (day_of_week,))
+        if day_of_week >= 0:
+            cur.execute("SELECT class_id, period, teacher_name FROM schedule "
+                        "WHERE day_of_week = ?", (day_of_week,))
+        else:
+            cur.execute("SELECT * FROM schedule ORDER BY day_of_week, period")
         rows = [dict(r) for r in cur.fetchall()]; con.close()
-        return JSONResponse({"ok": True, "rows": rows})
+
+        # اللوحة تعرض اسم الفصل، والفصول في students.json لا في قاعدة البيانات
+        if day_of_week < 0:
+            cls_map = {c["id"]: c["name"] for c in load_students()["list"]}
+            for r in rows:
+                r["class_name"] = cls_map.get(r.get("class_id", ""),
+                                              r.get("class_id", ""))
+        return JSONResponse({"ok": True, "rows": rows, "items": rows})
     except Exception as e:
-        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+        return JSONResponse({"ok": False, "msg": str(e),
+                             "rows": [], "items": []}, status_code=500)
 
 # ─── Points & Leaderboard API ────────────────────────────────
 
@@ -1746,6 +1791,33 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
         '.sc:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(0,0,0,.1)}'
         '.sc .v{font-size:26px;font-weight:900;line-height:1.1}'
         '.sc .l{font-size:11px;color:var(--mu);margin-top:5px;font-weight:500}'
+        # ── لوحة المراقبة الشاملة ──
+        '.mon-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;align-items:start}'
+        '.mon-wide{grid-column:1/-1}'
+        '.mon-row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--bd);font-size:13.5px}'
+        '.mon-row:last-child{border-bottom:none}'
+        '.mon-row .k{color:var(--mu)}'
+        '.mon-row .v{font-weight:700;color:var(--tx);font-variant-numeric:tabular-nums}'
+        '.mon-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-left:6px;vertical-align:middle}'
+        '.dot-ok{background:#16a34a}.dot-warn{background:#d97706}.dot-err{background:#dc2626}.dot-off{background:#94a3b8}'
+        '.mon-bar{height:8px;border-radius:5px;background:var(--bd);overflow:hidden;margin-top:6px}'
+        '.mon-bar>i{display:block;height:100%;border-radius:5px}'
+        '.mon-per{display:grid;grid-template-columns:repeat(auto-fit,minmax(88px,1fr));gap:8px}'
+        '.mon-per .p{border:1px solid var(--bd);border-radius:10px;padding:9px 6px;text-align:center;background:var(--cd)}'
+        '.mon-per .p .n{font-size:11px;color:var(--mu)}'
+        '.mon-per .p .f{font-size:18px;font-weight:800;font-variant-numeric:tabular-nums;line-height:1.3}'
+        '.mon-chip{display:inline-flex;align-items:center;gap:5px;border-radius:20px;padding:4px 11px;font-size:12px;margin:0 0 6px 6px;border:1px solid var(--bd)}'
+        '.chip-on{background:#dcfce7;color:#166534;border-color:#bbf7d0}'
+        '.chip-off{background:#f1f5f9;color:#64748b}'
+        '.mon-al{border-radius:10px;padding:10px 14px;margin-bottom:8px;font-size:13.5px;display:flex;gap:9px;align-items:center;border-right:3px solid}'
+        '.al-err{background:#fee2e2;color:#991b1b;border-color:#dc2626}'
+        '.al-warn{background:#fef3c7;color:#92400e;border-color:#d97706}'
+        '.al-info{background:#dbeafe;color:#1e40af;border-color:#2563eb}'
+        '.mon-spark{display:flex;align-items:flex-end;gap:10px;height:110px;padding-top:8px}'
+        '.mon-spark .b{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:4px;height:100%}'
+        '.mon-spark .b>i{width:100%;max-width:46px;background:linear-gradient(180deg,#ef4444,#f87171);border-radius:5px 5px 0 0;min-height:3px}'
+        '.mon-spark .b .lb{font-size:10.5px;color:var(--mu);white-space:nowrap}'
+        '.mon-spark .b .vv{font-size:12px;font-weight:700;font-variant-numeric:tabular-nums}'
         # Section
         '.section{background:var(--cd);border-radius:var(--rd);padding:16px;margin-bottom:16px;box-shadow:var(--sh);border:1px solid var(--bd)}'
         '.st{font-size:14px;font-weight:700;color:var(--pr);margin:0 0 14px;padding-right:10px;border-right:3px solid var(--pr);display:flex;align-items:center;gap:8px}'
@@ -1858,10 +1930,55 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
       {_alert_lab_html}
     </div>
   </div>
+  <div id="mon-alerts"></div>
+
   <div class="stat-cards" id="dash-cards"><div class="loading">⏳ جارٍ التحميل...</div></div>
-  <div class="section"><div class="st">أكثر الفصول غياباً</div>
-    <div class="tw"><table><thead><tr><th>الفصل</th><th>الغائبون</th><th>الحاضرون</th><th>نسبة الغياب</th></tr></thead>
-    <tbody id="dash-classes"></tbody></table></div></div>
+
+  <div class="mon-grid">
+    <div class="section mon-wide">
+      <div class="st">📡 تغطية الحصص اليوم</div>
+      <div style="font-size:12.5px;color:var(--mu);margin:-4px 0 10px">
+        كم فصلاً سُجّل غيابه في كل حصة — والفراغ يعني أن أحداً لم يُسجّل بعد
+      </div>
+      <div id="mon-periods" class="loading">...</div>
+    </div>
+
+    <div class="section">
+      <div class="st">💬 الواتساب</div>
+      <div id="mon-wa" class="loading">...</div>
+    </div>
+
+    <div class="section">
+      <div class="st">🤖 المهام التلقائية</div>
+      <div id="mon-tasks" class="loading">...</div>
+    </div>
+
+    <div class="section">
+      <div class="st">🗂️ البيانات والنسخ</div>
+      <div id="mon-data" class="loading">...</div>
+    </div>
+
+    <div class="section">
+      <div class="st">📋 ينتظر إجراءً</div>
+      <div id="mon-work" class="loading">...</div>
+    </div>
+
+    <div class="section mon-wide">
+      <div class="st">📉 الغياب — آخر ٧ أيام دراسية</div>
+      <div id="mon-trend" class="loading">...</div>
+    </div>
+
+    <div class="section mon-wide">
+      <div class="st">أكثر الفصول غياباً</div>
+      <div class="tw"><table><thead><tr><th>الفصل</th><th>الغائبون</th><th>الحاضرون</th><th>نسبة الغياب</th></tr></thead>
+      <tbody id="dash-classes"></tbody></table></div>
+    </div>
+
+    <div class="section mon-wide">
+      <div class="st">⚙️ النظام</div>
+      <div id="mon-sys" class="loading">...</div>
+    </div>
+  </div>
 </div>
 
 <div id="tab-links">
@@ -3718,9 +3835,20 @@ var today=new Date().toISOString().split('T')[0];
 var _gender='boys', _me=null, _notes=[];
 try{_notes=JSON.parse(localStorage.getItem('darb_notes')||'[]');}catch(e){}
 
+/* التبويب المطلوب من الرابط: /web/dashboard?tab=absences
+   يفتح الشاشة مباشرةً بدل «لوحة المراقبة» دائماً — يفيد في مشاركة رابط
+   شاشة بعينها، وفي بقاء التبويب بعد إعادة تحميل الصفحة. */
+function _wantedTab(){
+  try{
+    var t=new URLSearchParams(location.search).get('tab')||
+          (location.hash||'').replace(/^#/,'');
+    if(t&&document.getElementById('tab-'+t))return t;
+  }catch(e){}
+  return 'dashboard';
+}
 window.onload=function(){
   console.log("🚀 DarbStu Web Dashboard Loaded - Version Update Applied");
-  setDates();loadMe();showTab('dashboard');checkUnreadCirculars();setTimeout(checkUnreadTeacherReports,2000);
+  setDates();loadMe();showTab(_wantedTab());checkUnreadCirculars();setTimeout(checkUnreadTeacherReports,2000);
 };
 
 function setDates(){
@@ -3964,22 +4092,141 @@ function ss(id,msg,type){var el=document.getElementById(id);if(!el)return;
   el.className='sm s'+(type||'in');el.textContent=msg;el.style.display='block';}
 
 /* ── DASHBOARD ── */
+function monEsc(s){
+  return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function monRow(k,v,dot){
+  return '<div class="mon-row"><span class="k">'+monEsc(k)+'</span>'+
+         '<span class="v">'+(dot?'<span class="mon-dot '+dot+'"></span>':'')+monEsc(v)+'</span></div>';
+}
+function monSet(id,html){
+  var e=document.getElementById(id);if(!e)return;
+  /* الحاوية نفسها تبدأ بصنف loading (حشوة ٤٠px ولون باهت) — إزالته
+     بعد وصول البيانات، وإلا بقي المحتوى رمادياً ومزاحاً عن مكانه. */
+  e.classList.remove('loading');
+  e.innerHTML=html;
+}
+
 async function loadDashboard(){
   var date=document.getElementById('dash-date').value||today;
-  var d=await api('/web/api/dashboard-data?date='+date);
-  if(!d||!d.ok){document.getElementById('dash-cards').innerHTML=demoCrd();
-    document.getElementById('dash-classes').innerHTML='<tr><td colspan="4" style="color:#9CA3AF">لا يوجد بيانات</td></tr>';return;}
-  var t=d.metrics.totals;var pct=t.students>0?(t.absent/t.students*100).toFixed(1):0;
-  document.getElementById('dash-cards').innerHTML=
-    crd(t.students,'#1565C0','إجمالي الطلاب','<i class="fas fa-graduation-cap"></i>')+crd(t.present,'#2E7D32','الحضور','<i class="fas fa-check-circle"></i>')+
-    crd(t.absent,'#C62828','الغياب ('+pct+'%)','<i class="fas fa-user-times"></i>')+crd(t.tardiness||0,'#E65100','التأخر','<i class="fas fa-clock"></i>')+
-    crd(t.excused||0,'#0277BD','الأعذار','<i class="fas fa-file-medical"></i>')+crd(t.permissions||0,'#7C3AED','الاستئذان','<i class="fas fa-door-open"></i>');
-  var cls=d.metrics.by_class||[];
-  document.getElementById('dash-classes').innerHTML=
+  var d=await api('/web/api/monitor?date='+date);
+  if(!d||!d.ok){
+    monSet('dash-cards',demoCrd());
+    monSet('dash-classes','<tr><td colspan="4" style="color:#9CA3AF">لا يوجد بيانات</td></tr>');
+    return;
+  }
+
+  var al=d.alerts||[];
+  monSet('mon-alerts', al.length
+    ? al.map(function(a){
+        var ic=a.level==='err'?'\u26d4':(a.level==='warn'?'\u26a0\ufe0f':'\u2139\ufe0f');
+        return '<div class="mon-al al-'+a.level+'">'+ic+' <span>'+monEsc(a.text)+'</span></div>';
+      }).join('')
+    : '<div class="mon-al al-info">\u2705 <span>لا يوجد ما يستدعي الانتباه الآن</span></div>');
+
+  var t=(d.today&&d.today.totals)||{};
+  monSet('dash-cards',
+    crd(t.students||0,'#1565C0','إجمالي الطلاب','<i class="fas fa-graduation-cap"></i>')+
+    crd(t.present||0,'#2E7D32','الحضور ('+(t.attendance_pct||0)+'%)','<i class="fas fa-check-circle"></i>')+
+    crd(t.absent||0,'#C62828','الغياب','<i class="fas fa-user-times"></i>')+
+    crd(t.tardiness||0,'#E65100','التأخر','<i class="fas fa-clock"></i>')+
+    crd(t.excused||0,'#0277BD','الأعذار','<i class="fas fa-file-medical"></i>')+
+    crd(t.permissions||0,'#7C3AED','الاستئذان','<i class="fas fa-door-open"></i>'));
+
+  var lv=d.live||{};var pr=lv.periods||[];
+  monSet('mon-periods', pr.length
+    ? '<div class="mon-per">'+pr.map(function(p){
+        var col=p.done===0?'#94a3b8':(p.done>=p.total?'#16a34a':'#d97706');
+        var ttl=p.missing_count?('لم يُسجَّل: '+p.missing.join('، ')+
+                 (p.missing_count>p.missing.length?' …':'')):'كل الفصول سُجّلت';
+        return '<div class="p" title="'+monEsc(ttl)+'">'+
+               '<div class="n">الحصة '+p.period+'</div>'+
+               '<div class="f" style="color:'+col+'">'+p.done+
+               '<span style="font-size:11px;color:var(--mu)">/'+p.total+'</span></div></div>';
+      }).join('')+'</div>'
+    : '<p style="color:var(--mu)">لا توجد فصول</p>');
+
+  var w=d.whatsapp;
+  if(w){
+    var lim=w.limit||0;var used=w.sent_today||0;
+    var pctu=lim?Math.min(100,Math.round(used/lim*100)):0;
+    var barc=pctu>=100?'#dc2626':(pctu>=80?'#d97706':'#16a34a');
+    var html=monRow('الاتصال', w.connected?'متصل':'غير متصل', w.connected?'dot-ok':'dot-err');
+    html+=monRow('بوت استقبال الأعذار',
+                 (w.reply_bot===null||w.reply_bot===undefined)?'—':(w.reply_bot?'يعمل':'موقوف'),
+                 (w.reply_bot===null||w.reply_bot===undefined)?'dot-off':(w.reply_bot?'dot-ok':'dot-warn'));
+    if(w.pending!==null&&w.pending!==undefined) html+=monRow('ردود منتظَرة', w.pending);
+    html+=monRow('أُرسل اليوم', used+' من '+lim);
+    html+='<div class="mon-bar"><i style="width:'+pctu+'%;background:'+barc+'"></i></div>';
+    if(w.warming_up) html+='<div style="font-size:12px;color:var(--mu);margin-top:7px">الرقم في فترة الإحماء (عمره '+(w.age_days||0)+' يوم) — السقف يرتفع تدريجياً</div>';
+    monSet('mon-wa',html);
+  } else { monSet('mon-wa','<p style="color:var(--mu)">للمدير والوكيل</p>'); }
+
+  var tk=d.tasks;
+  if(tk){
+    var head=tk.master
+      ? '<div style="font-size:13px;margin-bottom:9px"><span class="mon-dot dot-ok"></span> الإرسال لأولياء الأمور مُشغَّل</div>'
+      : '<div style="font-size:13px;margin-bottom:9px"><span class="mon-dot dot-warn"></span> الإرسال لأولياء الأمور موقوف</div>';
+    monSet('mon-tasks', head+(tk.items||[]).map(function(i){
+      return '<span class="mon-chip '+(i.on?'chip-on':'chip-off')+'">'+
+             (i.on?'\u25b6':'\u25a0')+' '+monEsc(i.name)+
+             '<span style="opacity:.6;font-size:10.5px">'+monEsc(i.audience)+'</span></span>';
+    }).join(''));
+  } else { monSet('mon-tasks','<p style="color:var(--mu)">للمدير والوكيل</p>'); }
+
+  var da=d.data;
+  if(da){
+    var age=da.backup_age_days;
+    var noAge=(age===null||age===undefined);
+    var bdot=noAge?'dot-off':(age<=7?'dot-ok':(age<=14?'dot-warn':'dot-err'));
+    monSet('mon-data',
+      monRow('الفصول', da.classes)+monRow('الطلاب', da.students)+
+      monRow('المعلمون', da.teachers)+monRow('المستخدمون', da.users)+
+      monRow('حجم قاعدة البيانات', da.db_mb+' م.ب')+
+      monRow('النسخ الاحتياطية', da.backups)+
+      monRow('آخر نسخة', noAge?'—':(age===0?'اليوم':'قبل '+age+' يوم'), bdot));
+  } else { monSet('mon-data','<p style="color:var(--mu)">للمدير والوكيل</p>'); }
+
+  var wf=d.workflow||{};
+  monSet('mon-work',
+    monRow('استئذانات بانتظار الرد', wf.pending_permissions||0)+
+    monRow('تحويلات مفتوحة', wf.open_referrals||0)+
+    monRow('إحالات الموجّه المفتوحة', wf.counselor_open||0)+
+    monRow('تقارير معلمين لم تُقرأ', wf.unread_reports||0)+
+    monRow('زيارات أولياء أمور اليوم', wf.visits_today||0)+
+    monRow('جلسات إرشاد هذا الأسبوع', wf.sessions_week||0));
+
+  var tr=d.trend||[];
+  var mx=1;tr.forEach(function(x){if(x.absent>mx)mx=x.absent;});
+  monSet('mon-trend', tr.length
+    ? '<div class="mon-spark">'+tr.map(function(x){
+        var h=Math.round(x.absent/mx*100);
+        return '<div class="b"><span class="vv">'+x.absent+'</span>'+
+               '<i style="height:'+Math.max(3,h)+'%"></i>'+
+               '<span class="lb">'+monEsc(x.label)+'</span></div>';
+      }).join('')+'</div>'
+    : '<p style="color:var(--mu)">لا يوجد</p>');
+
+  var sy=d.system;
+  if(sy){
+    var noLic=(sy.license_days===null||sy.license_days===undefined);
+    var lic=noLic?(sy.license_ok?'سارٍ':'غير سارٍ'):(sy.license_days+' يوم متبقٍ');
+    monSet('mon-sys',
+      '<div class="mon-per" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+
+      '<div class="p"><div class="n">الإصدار</div><div class="f" style="font-size:15px">'+monEsc(sy.version)+'</div></div>'+
+      '<div class="p"><div class="n">المرحلة</div><div class="f" style="font-size:15px">'+monEsc(sy.stage||'—')+'</div></div>'+
+      '<div class="p"><div class="n">الاشتراك</div><div class="f" style="font-size:15px;color:'+(sy.license_ok?'#16a34a':'#dc2626')+'">'+monEsc(lic)+'</div></div>'+
+      '<div class="p"><div class="n">الدومين</div><div class="f" style="font-size:13px">'+monEsc(sy.domain||'محلي فقط')+'</div></div>'+
+      '</div><div style="font-size:11.5px;color:var(--mu);margin-top:10px">آخر تحديث للّوحة: '+monEsc(d.generated_at||'')+'</div>');
+  } else { monSet('mon-sys','<p style="color:var(--mu)">للمدير والوكيل</p>'); }
+
+  var cls=(d.today&&d.today.by_class)||[];
+  monSet('dash-classes',
     cls.sort(function(a,b){return b.absent-a.absent;}).slice(0,10).map(function(c){
       var p=c.total>0?(c.absent/c.total*100).toFixed(1):0;
-      return '<tr><td>'+c.class_name+'</td><td><span class="badge br">'+c.absent+'</span></td><td>'+c.present+'</td><td>'+p+'%</td></tr>';
-    }).join('')||'<tr><td colspan="4" style="color:#9CA3AF">لا يوجد</td></tr>';
+      return '<tr><td>'+monEsc(c.class_name)+'</td><td><span class="badge br">'+c.absent+
+             '</span></td><td>'+c.present+'</td><td>'+p+'%</td></tr>';
+    }).join('')||'<tr><td colspan="4" style="color:#9CA3AF">لا يوجد</td></tr>');
 }
 function crd(v,c,l,ic){return '<div class="sc"><div class="v" style="color:'+c+'">'+ic+'<br>'+v+'</div><div class="l">'+l+'</div></div>';}
 function demoCrd(){return crd(0,'#1565C0','إجمالي الطلاب','<i class="fas fa-graduation-cap"></i>')+crd(0,'#2E7D32','الحضور','<i class="fas fa-check-circle"></i>')+crd(0,'#C62828','الغياب','<i class="fas fa-user-times"></i>')+crd(0,'#E65100','التأخر','<i class="fas fa-clock"></i>');}
@@ -3989,7 +4236,7 @@ async function loadLinks(){
   var d=await api('/web/api/classes');if(!d||!d.ok){document.getElementById('links-list').innerHTML='<p style="color:var(--mu)">لا توجد فصول</p>';return;}
   var base=window.location.origin;
   document.getElementById('links-list').innerHTML=d.classes.map(function(c){
-    var url=base+'/c/'+c.id;
+    var url=base+'/c/'+c.id+(c.k?('?k='+c.k):'');
     return '<div class="lc"><div><strong>'+c.name+'</strong><br><span class="badge bb" style="margin-top:5px">'+c.count+' طالب</span></div>'+
       '<div class="lu">'+url+'</div>'+
       '<div style="display:flex;gap:6px"><button class="btn bp1 bsm" onclick="copyL(\''+url+'\')">نسخ</button>'+
@@ -6667,7 +6914,9 @@ async function paMarkPermitted(btn, idx){
     body:JSON.stringify({student_id:row.student_id,student_name:row.student_name,
       class_name:row.class_name,date:_paDate,absent_periods:row.absent_periods})});
   var d=await r.json();
-  if(d&&d.ok){loadPartialAbsences();}
+  /* تقرير الهاربين أسفل الشاشة يقرأ من مصدر آخر — بلا إعادة تحميله
+     تبقى الشاشة كما هي وإن صحّت البيانات، فيظن المستخدم أن شيئاً لم يحدث. */
+  if(d&&d.ok){loadPartialAbsences();loadEscapedReport();}
   else{btn.disabled=false;btn.textContent='📋 مستأذن';alert('❌ '+(d&&d.msg||'خطأ'));}
 }
 async function paReset(sid){
@@ -6675,7 +6924,7 @@ async function paReset(sid){
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({student_id:sid,status:'غير محدد',date:_paDate})});
   var d=await r.json();
-  if(d&&d.ok) loadPartialAbsences();
+  if(d&&d.ok){loadPartialAbsences();loadEscapedReport();}
 }
 async function loadEscapedReport(){
   var month=today.substring(0,7);
@@ -7491,27 +7740,8 @@ async def web_absences_range(request: Request, from_date: str = None,
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 
 
-@router.get("/web/api/schedule", response_class=JSONResponse)
-async def web_get_schedule(request: Request):
-    user = _get_current_user(request)
-    if not user: return JSONResponse({"error": "غير مصرح"}, status_code=401)
-    try:
-        con = get_db(); con.row_factory = sqlite3.Row; cur = con.cursor()
-        cur.execute("SELECT s.*, c.name as class_name FROM schedule s LEFT JOIN (SELECT id, name FROM students_classes) c ON s.class_id=c.id ORDER BY day_of_week, period")
-        rows = [dict(r) for r in cur.fetchall()]; con.close()
-        # Fallback: إذا لم يوجد join
-        if not rows:
-            con = get_db(); con.row_factory = sqlite3.Row; cur = con.cursor()
-            cur.execute("SELECT * FROM schedule ORDER BY day_of_week, period")
-            rows = [dict(r) for r in cur.fetchall()]; con.close()
-            # أضف اسم الفصل من store
-            store = load_students()
-            cls_map = {c["id"]: c["name"] for c in store["list"]}
-            for r in rows:
-                r["class_name"] = cls_map.get(r.get("class_id", ""), r.get("class_id", ""))
-        return JSONResponse({"ok": True, "items": rows})
-    except Exception as e:
-        return JSONResponse({"ok": False, "msg": str(e), "items": []})
+# ملاحظة: كان هنا تعريف ثانٍ لـ /web/api/schedule محجوب بالتعريف الأول
+# ولم يكن يُنفَّذ أبداً. دُمج في api_get_schedule أعلاه (السطر ~1269).
 
 
 @router.post("/web/api/save-schedule", response_class=JSONResponse)
@@ -10346,6 +10576,26 @@ async def web_partial_absences(request: Request, date: str = "", min_period: int
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 
 
+def _clear_escape_referral(date: str, student_id: str) -> int:
+    """
+    يحذف تسجيل الهروب لهذا الطالب في هذا اليوم.
+
+    مصدران لحالة واحدة: الجدول يقرأ من partial_absence_status، وتقرير
+    الهاربين يقرأ من counselor_referrals. من يكتب في الأول وينسى الثاني
+    يترك الطالب هارباً في التقرير ومستأذناً في الجدول — وهذا ما حدث.
+    """
+    try:
+        con = get_db(); cur = con.cursor()
+        cur.execute("DELETE FROM counselor_referrals WHERE student_id=? "
+                    "AND date=? AND referral_type='هروب'", (student_id, date))
+        n = cur.rowcount
+        con.commit(); con.close()
+        return int(n or 0)
+    except Exception as e:
+        print(f"[ESCAPE] تعذّر حذف تسجيل الهروب: {e}")
+        return 0
+
+
 @router.post("/web/api/partial-absences/status", response_class=JSONResponse)
 async def web_set_partial_absence_status(req: Request):
     user = _get_current_user(req)
@@ -10363,6 +10613,11 @@ async def web_set_partial_absence_status(req: Request):
             return JSONResponse({"ok": False, "msg": "student_id و date مطلوبان"})
         from database import set_partial_absence_status
         set_partial_absence_status(date, student_id, status, notes)
+        # تسجيل الطالب هارباً يُنشئ سطراً في counselor_referrals، ومنه
+        # يُبنى «تقرير الهاربين». وكان التراجع يغيّر الحالة في الجدول
+        # ولا يمسّ السطر، فيبقى الطالب في التقرير هارباً إلى الأبد.
+        if status != "هارب":
+            _clear_escape_referral(date, student_id)
         return JSONResponse({"ok": True})
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
@@ -10411,9 +10666,9 @@ async def web_mark_permitted(req: Request):
         ).fetchone()
         con.close()
         if existing:
-            # تحديث الحالة في partial_absence_status فقط
             from database import set_partial_absence_status
             set_partial_absence_status(date, student_id, "مستأذن")
+            _clear_escape_referral(date, student_id)
             return JSONResponse({"ok": True, "msg": "مسجَّل مسبقاً في الاستئذان"})
 
         reason = f"غياب جزئي — الحصص: {periods}"
@@ -10422,6 +10677,8 @@ async def web_mark_permitted(req: Request):
                           parent_phone, reason=reason, approved_by=user.get("sub", "الويب"))
         from database import set_partial_absence_status
         set_partial_absence_status(date, student_id, "مستأذن")
+        # الطالب صار مستأذناً — لم يعد هارباً في التقرير
+        _clear_escape_referral(date, student_id)
         return JSONResponse({"ok": True})
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
@@ -10479,11 +10736,19 @@ async def web_escaped_report(request: Request, month: str = ""):
         if not month:
             month = _dt.datetime.now().strftime("%Y-%m")
         con = get_db(); con.row_factory = sqlite3.Row; cur = con.cursor()
+        # التقرير يُصحّح نفسه: يستبعد من غُيِّرت حالته بعد التسجيل.
+        # الاعتماد على حذف السطر وحده يترك السجلات التي أُنشئت قبل إصلاح
+        # الحذف عالقةً إلى الأبد، ويكفي أن يفشل الحذف مرة ليعود الخلل.
+        # الحالة في partial_absence_status هي المرجع، وغيابها يعني «هارب».
         rows = cur.execute("""
-            SELECT date, student_id, student_name, class_name, notes, status, created_at
-            FROM counselor_referrals
-            WHERE referral_type = 'هروب' AND date LIKE ?
-            ORDER BY date DESC, class_name, student_name
+            SELECT r.date, r.student_id, r.student_name, r.class_name,
+                   r.notes, r.status, r.created_at
+            FROM counselor_referrals r
+            LEFT JOIN partial_absence_status p
+                   ON p.student_id = r.student_id AND p.date = r.date
+            WHERE r.referral_type = 'هروب' AND r.date LIKE ?
+              AND COALESCE(p.status, 'هارب') = 'هارب'
+            ORDER BY r.date DESC, r.class_name, r.student_name
         """, (month + "%",)).fetchall()
         con.close()
         return JSONResponse({"ok": True, "rows": [dict(r) for r in rows], "month": month})

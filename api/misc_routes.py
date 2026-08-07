@@ -8,7 +8,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from constants import (DB_PATH, DATA_DIR, HOST, PORT, now_riyadh_date,
-                       STATIC_DOMAIN, CURRENT_USER)
+                       STATIC_DOMAIN, CURRENT_USER, debug_on)
 from config_manager import load_config, get_terms, render_message
 from database import (get_db, load_students, query_absences,
                       insert_excuse, query_excuses, student_has_excuse)
@@ -338,7 +338,14 @@ async def noor_test_preflight():
 
 @router.get("/web/api/noor-absence-test", response_class=JSONResponse)
 async def noor_absence_test():
-    """بيانات غياب للاختبار — بدون مصادقة — يُستخدم مع /noor-mock فقط."""
+    """
+    بيانات غياب للاختبار — بلا مصادقة ومع CORS مفتوح للجميع.
+
+    كانت تُرجع أسماء غائبي اليوم لأي زائر على الإنترنت. صارت محجوبة إلا
+    في وضع التطوير (ABSENTEE_DEBUG=1) — تبقى أداة اختبار ولا تُشحن مفتوحة.
+    """
+    if not debug_on():
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
     today  = datetime.date.today().isoformat()
     groups = _build_test_groups()
     return JSONResponse(
@@ -350,6 +357,8 @@ async def noor_absence_test():
 @router.get("/noor-mock", response_class=HTMLResponse)
 async def noor_mock_page():
     """صفحة HTML تُحاكي واجهة نور — للاختبار المحلي فقط."""
+    if not debug_on():
+        return HTMLResponse(content="Not Found", status_code=404)
     return HTMLResponse(content=_build_noor_mock_html())
 
 
