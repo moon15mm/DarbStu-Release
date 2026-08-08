@@ -449,6 +449,45 @@ class AppGUI(
         root.after(5000, lambda: check_for_updates(root, silent=True))
         self._build_menu(root)
 
+        # إرشاد المدرسة الجديدة — بعد أن تستقر النافذة
+        root.after(1200, self._first_run_guide)
+
+    def _first_run_guide(self):
+        """
+        يُرشد مدرسة جديدة إلى استيراد ملفَي نور.
+
+        `load_students` فيه سؤال «هل تريد استيراد ملف Excel الآن؟» لكنه
+        لا يظهر إلا إذا غاب ملف الطلاب، ومن خيط رئيسي، ومع وجود النافذة.
+        فكان أي تنصيب جديد يفتح لوحةً فارغة بلا أي إرشاد. هذا الإرشاد
+        لا يعتمد على شيء من ذلك: يفحص العدد الفعلي ويظهر دائماً.
+        """
+        if CURRENT_USER.get("role") not in ("admin", "deputy", "staff"):
+            return
+        try:
+            store = load_students(force_reload=True)
+            n_stu = sum(len(c.get("students") or [])
+                        for c in (store.get("list") or []))
+            n_tch = len(load_teachers().get("teachers") or [])
+        except Exception:
+            return
+        if n_stu:
+            return
+
+        msg = ("لم يُستورد طلاب المدرسة بعد.\n\n"
+               "النظام يحتاج ملفَّين من نظام نور — لا تُدخل أسماءً يدوياً:\n\n"
+               "  ١.  ملف الطلاب\n"
+               "  ٢.  ملف المعلمين")
+        if n_tch:
+            msg = msg.replace("  ٢.  ملف المعلمين",
+                              "  ٢.  ملف المعلمين  (مستورَد ✔)")
+        msg += "\n\nهل تريد استيراد ملف الطلاب الآن؟"
+
+        try:
+            if messagebox.askyesno("تجهيز المدرسة", msg, parent=self.root):
+                self._switch_tab("إدارة الطلاب")
+        except Exception:
+            pass
+
     def _check_unread_circulars(self):
         def _task():
             try:

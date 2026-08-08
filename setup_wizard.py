@@ -104,6 +104,20 @@ class SetupWizard:
         sx, sy = win.winfo_screenwidth(), win.winfo_screenheight()
         win.geometry(f"{W}x{H}+{(sx-W)//2}+{(sy-H)//2}")
 
+        # ── افرض الظهور فوق شاشة البدء ────────────────────────────
+        # شاشة بدء PyInstaller تُنشأ قبل بايثون وتحتفظ بالمقدمة، فتحجب
+        # وسط هذا المعالج (قِيس فعلياً: الشاشة أولى في ترتيب الطبقات
+        # والمعالج خلفها). المدرسة الجديدة كانت سترى شاشة تحميل بلا نموذج.
+        # topmost لحظي ثم يُرفع: يرفع النافذة فوق كل شيء مرة واحدة، ولا
+        # يُبقيها فوق نوافذ المستخدم الأخرى بعد ذلك.
+        try:
+            win.attributes('-topmost', True)
+            win.lift()
+            win.focus_force()
+            win.after(400, lambda: win.attributes('-topmost', False))
+        except Exception:
+            pass
+
         # ── رأس ──────────────────────────────────────────────────
         hdr = tk.Frame(win, bg=self._NAVY, height=100)
         hdr.pack(fill="x"); hdr.pack_propagate(False)

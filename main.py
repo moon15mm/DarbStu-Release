@@ -2,26 +2,174 @@ import os, sys, socket
 import tkinter as tk
 from tkinter import messagebox
 
-# ─── منع ازدواجية التطبيق (Socket-based Single Instance Lock) ───
-def ensure_single_instance():
-    # نختار رقم منفذ عشوائي وغير مستخدم عادةً
-    lock_port = 59124 
+# ─── freeze_support أولاً — قبل أي شيء آخر ───────────────────────
+# على ويندوز تُنشئ multiprocessing عملياتها الفرعية بإعادة تنفيذ هذا
+# الملف من أوّله. فإن لم تُستدعَ هنا، مرّت العملية الفرعية على قفل
+# النسخة الواحدة أسفله، فوجدت قفل أبيها، فعرضت «البرنامج يعمل بالفعل»
+# وأنهت نفسها — بينما المستخدم لم يفتح إلا نسخة واحدة.
+# كانت تُستدعى في نهاية الملف داخل __main__، وهذا متأخّر جداً:
+# العملية الفرعية لا تصل إلى هناك أصلاً.
+if sys.platform == 'win32':
     try:
-        # نحاول إنشاء Socket والارتباط بالمنفذ
-        _lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        _lock_socket.bind(('127.0.0.1', lock_port))
-        # نترك السوكيت مفتوحاً طوال فترة حياة البرنامج لمنع الآخرين من استخدامه
-        return _lock_socket
-    except socket.error:
-        # إذا فشل الارتباط، فهذا يعني أن هناك نسخة أخرى تعمل وتحجز هذا المنفذ
-        root_tmp = tk.Tk()
-        root_tmp.withdraw()
-        messagebox.showwarning("تنبيه", "البرنامج يعمل بالفعل.\nيرجى إغلاق النسخة المفتوحة أولاً من شريط المهام أو إدارة المهام.")
-        root_tmp.destroy()
-        sys.exit(0)
+        import multiprocessing
+        multiprocessing.freeze_support()
+    except Exception:
+        pass
 
-# نقوم بحجز المنفذ فوراً عند بدء التشغيل
-_app_lock_socket = ensure_single_instance()
+# ─── منع ازدواجية التطبيق ────────────────────────────────────────
+# كان القفل يحجز منفذاً ثابتاً (59124) ويعتبر أي فشل في الحجز «نسخة
+# تعمل». وهذا يُنتج إنذاراً كاذباً يمنع تشغيل البرنامج نهائياً كلما:
+#   • حجز تطبيق آخر المنفذ نفسه
+#   • وقع المنفذ في نطاق تحجزه ويندوز لـ Hyper-V أو WSL أو Docker
+#     (netsh int ipv4 show excludedportrange) — يختلف من جهاز لآخر
+#   • بقي سوكيت عالقاً بعد إنهاء غير نظيف
+# المستخدم يرى «أغلق النسخة المفتوحة» ولا يجد نسخةً يُغلقها.
+#
+# المُزامِن المُسمّى هو الآلية الصحيحة في ويندوز: فريد لتطبيقنا، ويحرّره
+# النظام تلقائياً عند موت العملية مهما كانت طريقة الإنهاء.
+
+def _live_sibling_pids():
+    """
+    PIDs لعمليات أخرى تعمل من نفس ملف البرنامج ونفس المجلد.
+
+    المُزامِن وحده لا يكفي دليلاً. هو يقول «مقبض بهذا الاسم مفتوح في
+    مكان ما» — وقد يكون في جلسة مستخدم آخر، أو في عملية معلّقة، أو في
+    عملية فرعية تُعيد تنفيذ الملف. أما وجود عملية حيّة من نفس المجلد
+    فأمرٌ يُرى بالعين ولا يحتمل التأويل: نفس المجلد = نفس قاعدة البيانات
+    = تعارض حقيقي. ومجلد آخر = مدرسة أخرى = لا شأن لنا به.
+    """
+    if not getattr(sys, 'frozen', False):
+        return []                      # وضع التطوير — لا فحص
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        me = os.path.normcase(os.path.abspath(sys.executable))
+        my_dir = os.path.dirname(me)
+        my_name = os.path.basename(me)
+        my_pid = os.getpid()
+
+        class ENTRY(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD),
+                        ("cntUsage", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD),
+                        ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                        ("th32ModuleID", wintypes.DWORD),
+                        ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD),
+                        ("pcPriClassBase", ctypes.c_long),
+                        ("dwFlags", wintypes.DWORD),
+                        ("szExeFile", wintypes.WCHAR * 260)]
+
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        snap = k32.CreateToolhelp32Snapshot(2, 0)   # TH32CS_SNAPPROCESS
+        if snap == -1:
+            return []
+
+        found = []
+        e = ENTRY()
+        e.dwSize = ctypes.sizeof(ENTRY)
+        ok = k32.Process32FirstW(snap, ctypes.byref(e))
+        while ok:
+            pid = e.th32ProcessID
+            if pid != my_pid and e.szExeFile.lower() == my_name.lower():
+                # PROCESS_QUERY_LIMITED_INFORMATION — يعمل بلا صلاحيات مدير
+                h = k32.OpenProcess(0x1000, False, pid)
+                if h:
+                    buf = ctypes.create_unicode_buffer(32768)
+                    n = wintypes.DWORD(32768)
+                    if k32.QueryFullProcessImageNameW(h, 0, buf,
+                                                      ctypes.byref(n)):
+                        p = os.path.normcase(os.path.abspath(buf.value))
+                        if os.path.dirname(p) == my_dir:
+                            found.append(pid)
+                    k32.CloseHandle(h)
+                # تعذّر فتح العملية (جلسة مستخدم آخر مثلاً): لا نحتسبها.
+                # منعُ المستخدم بناءً على شيء لم نتحقّق منه هو بالضبط
+                # العطل الذي نُصلحه.
+            ok = k32.Process32NextW(snap, ctypes.byref(e))
+        k32.CloseHandle(snap)
+        return found
+    except Exception:
+        return []
+
+
+def ensure_single_instance():
+    """
+    يُرجع مقبض القفل، ولا يمنع التشغيل إلا بدليل قاطع.
+
+    القاعدة: لا نُغلق الباب في وجه المستخدم إلا إذا رأينا عمليةً حيّة
+    من نفس المجلد. المُزامِن يكسر تسابُق التشغيل المتزامن فقط.
+    """
+    handle = None
+    running = False
+
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            from ctypes import wintypes
+            ERROR_ALREADY_EXISTS = 183
+            k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            k32.CreateMutexW.argtypes = [wintypes.LPCVOID, wintypes.BOOL,
+                                         wintypes.LPCWSTR]
+            k32.CreateMutexW.restype = wintypes.HANDLE
+            handle = k32.CreateMutexW(None, False, 'Global\\DarbStu_SingleInstance')
+            running = (ctypes.get_last_error() == ERROR_ALREADY_EXISTS)
+        except Exception:
+            # تعذّر المُزامِن — لا نمنع التشغيل بسببه
+            return None
+    else:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(('127.0.0.1', 59124))
+            return s
+        except socket.error:
+            running = True
+
+    if not running:
+        return handle
+
+    # المُزامِن قال «موجود». نتحقّق: هل ثمّة عملية حقيقية فعلاً؟
+    pids = _live_sibling_pids()
+    if not pids:
+        # قفل بلا عملية: بقايا، أو جلسة أخرى، أو عملية فرعية. نُكمل.
+        return handle
+
+    root_tmp = tk.Tk()
+    root_tmp.withdraw()
+    messagebox.showwarning(
+        "البرنامج يعمل بالفعل",
+        "هناك نسخة من البرنامج تعمل الآن (رقم العملية: %s).\n\n"
+        "قد تكون مخفية — جرّب الضغط على  Ctrl + Alt + S  لإظهارها.\n\n"
+        "وإن لم تظهر: افتح إدارة المهام (Ctrl+Shift+Esc) وابحث عن\n"
+        "DarbStu.exe  ثم أنهِ المهمة، وأعد التشغيل."
+        % "، ".join(str(p) for p in pids))
+    root_tmp.destroy()
+    sys.exit(0)
+
+
+def _close_splash(root=None):
+    """
+    يُغلق شاشة البدء التي يعرضها مُحمّل PyInstaller.
+
+    تُستدعى عند جاهزية النافذة، وعند أي خروج أو انهيار — فشاشة عالقة
+    بلا نافذة خلفها أسوأ من لا شاشة: يظنّ المستخدم أن البرنامج معلَّق.
+    آمنة للاستدعاء أكثر من مرة، وفي وضع التطوير حيث لا وجود لـpyi_splash.
+    """
+    if root is not None:
+        try:
+            root.update()      # ارسم النافذة أولاً حتى لا تُخلّف فراغاً
+        except Exception:
+            pass
+    try:
+        import pyi_splash
+        if pyi_splash.is_alive():
+            pyi_splash.close()
+    except Exception:
+        pass
+
+
+_app_lock = ensure_single_instance()
 # ─────────────────────────────────────────────────────────────
 
 # ─── تجاوز الملفات المدمجة في EXE (تفعيل التحديثات الخارجية) ────────
@@ -167,16 +315,15 @@ def _cleanup_environment():
 
 
 def _is_already_running():
-    """التحقق من وجود نسخة تعمل مسبقاً عبر قفل منفذ محدد."""
-    import socket
-    try:
-        # استخدام منفذ ثابت للقفل (PORT + 50) لضمان عدم تكرار التشغيل
-        _lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        _lock_socket.bind(('127.0.0.1', PORT + 50))
-        # نبقي السوكيت مفتوحاً طوال فترة تشغيل البرنامج
-        return False, _lock_socket
-    except socket.error:
-        return True, None
+    """
+    فحص ثانٍ للازدواجية — أُبطل عمداً.
+
+    كان يحجز المنفذ PORT+50 (٨٠٥٠) وله عيب القفل الأول نفسه: أي شيء
+    يحجز المنفذ يمنع تشغيل البرنامج بإنذار كاذب. والقفل الحقيقي صار
+    مُزامِناً مُسمّى يُنفَّذ عند الاستيراد قبل الوصول إلى هنا، فلا حاجة
+    لفحص ثانٍ يُكرّر الخطر نفسه.
+    """
+    return False, None
 
 def _register_global_hotkey(root):
     """تسجيل اختصار لوحة مفاتيح عالمي (Ctrl+Alt+S و Ctrl+Shift+S) لإظهار/إخفاء البرنامج."""
@@ -538,13 +685,22 @@ def main():
         else:
             LoginWindow(root, on_success=launch_main_app)
 
+    # ── أغلق شاشة البدء الآن، وقد صارت النافذة جاهزة فعلاً ──
+    # لا قبل ذلك: إغلاقها مبكراً يُعيد المستخدم إلى شاشة فارغة في آخر
+    # ثانية، وهو ما كانت الشاشة موجودة لمنعه أصلاً.
+    _close_splash(root)
+
     root.mainloop()
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()   # ضروري لـ PyInstaller على Windows
     try: main()
-    except SystemExit: pass
+    except SystemExit:
+        _close_splash()
     except Exception as e:
+        # شاشة البدء «دائماً في المقدمة» — لو بقيت مفتوحة لحجبت رسالة
+        # الخطأ نفسها، فيرى المستخدم شاشة تحميل أبدية بلا سبب ظاهر.
+        _close_splash()
         tb_str = traceback.format_exc()
         _write_log(tb_str)
         try:

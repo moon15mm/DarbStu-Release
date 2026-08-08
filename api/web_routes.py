@@ -4189,7 +4189,11 @@ async function loadDashboard(){
 
   var wf=d.workflow||{};
   monSet('mon-work',
-    monRow('استئذانات بانتظار الرد', wf.pending_permissions||0)+
+    monRow('استئذان بانتظار الرد (اليوم)', (wf.pending_permissions||0)+
+      (wf.pending_wait_min?' — منذ '+wf.pending_wait_min+' د':''),
+      (wf.pending_wait_min>=30?'dot-warn':''))+
+    (wf.stale_permissions?monRow('طلبات أيام سابقة لم تُحسم',
+      wf.stale_permissions):'')+
     monRow('تحويلات مفتوحة', wf.open_referrals||0)+
     monRow('إحالات الموجّه المفتوحة', wf.counselor_open||0)+
     monRow('تقارير معلمين لم تُقرأ', wf.unread_reports||0)+

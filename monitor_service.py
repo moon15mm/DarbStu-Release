@@ -21,6 +21,16 @@ def _safe(fn, default=None):
         return default
 
 
+def _dur_ar(m) -> str:
+    """دقائق ← نصّ عربي مقروء: «٤٠ دقيقة» / «ساعتان و١٥ دقيقة»."""
+    m = int(m or 0)
+    if m < 60:
+        return "%d دقيقة" % m
+    h, r = divmod(m, 60)
+    hs = "ساعة" if h == 1 else ("ساعتين" if h == 2 else "%d ساعات" % h)
+    return hs if not r else "%s و%d دقيقة" % (hs, r)
+
+
 def _today() -> str:
     tz = datetime.timezone(datetime.timedelta(hours=3))
     return datetime.datetime.now(datetime.timezone.utc).astimezone(tz)\
@@ -38,6 +48,11 @@ def _today_block(date_str):
     t = dict(m.get("totals") or {})
     t["tardiness"] = len(_safe(lambda: query_tardiness(date_filter=date_str), []) or [])
     t["excused"] = len(_safe(lambda: query_excuses(date_filter=date_str), []) or [])
+    # بطاقة «الاستئذان» في اللوحة تقرأ t.permissions، والمفتاح لم يكن
+    # يُبنى أصلاً — فكانت تعرض صفراً في كل يوم مهما بلغ عدد الطلبات.
+    from alerts_service import query_permissions
+    t["permissions"] = len(
+        _safe(lambda: query_permissions(date_filter=date_str), []) or [])
     students = int(t.get("students") or 0)
     absent = int(t.get("absent") or 0)
     t["attendance_pct"] = round((students - absent) / students * 100, 1) if students else 0.0
@@ -168,6 +183,26 @@ def _data_block():
             "last_backup": last, "backup_age_days": age}
 
 
+def _oldest_pending_wait(con, date_str):
+    """كم دقيقة انتظر أقدمُ طلب استئذان اليوم — صفر إن لا شيء ينتظر.
+
+    الاستئذان يُطلب والطالب واقف عند الباب، فالمهمّ ليس عدد الطلبات بل
+    كم صار لأقدمها. created_at يُكتب بـ utcnow في insert_permission.
+    """
+    try:
+        row = con.execute(
+            "SELECT MIN(created_at) FROM permissions WHERE date=? AND "
+            "status NOT IN ('موافق','مرفوض')", (date_str,)).fetchone()
+        if not row or not row[0]:
+            return 0
+        t = datetime.datetime.fromisoformat(str(row[0]).replace("Z", ""))
+        m = int((datetime.datetime.utcnow() - t).total_seconds() // 60)
+    except Exception:
+        return 0
+    # ساعة سالبة أو تتجاوز اليوم = ساعة جهاز مغلوطة، لا انتظار حقيقي
+    return m if 0 < m <= 1440 else 0
+
+
 def _workflow_block(date_str):
     """ما ينتظر إجراءً من الإدارة."""
     from constants import DB_PATH
@@ -181,9 +216,19 @@ def _workflow_block(date_str):
 
     try:
         return {
+            # الاستئذان طلبُ خروجٍ فوري: صلاحيته ساعات لا أيام — بخلاف
+            # العذر الذي يُقبل بعد أيام. عدّ المعلّق من كل التواريخ كان
+            # يقول «٧ بانتظار الرد» وأقدمها من ١٧ يوماً، بينما بطاقة
+            # الاستئذان في الشاشة نفسها تقول ٠. رقمان لشيء واحد.
             "pending_permissions": q(
-                "SELECT COUNT(*) FROM permissions WHERE status NOT IN "
-                "('موافق','مرفوض')"),
+                "SELECT COUNT(*) FROM permissions WHERE date=? AND "
+                "status NOT IN ('موافق','مرفوض')", (date_str,)),
+            "pending_wait_min": _oldest_pending_wait(con, date_str),
+            # طلبات أيامٍ مضت لم تُحسم: لم يخرج الطالب ولم يعد للأمر معنى.
+            # تُعرض سطراً في التفاصيل ولا تُنبّه — ولا تُحذف، فهي سجلّ.
+            "stale_permissions": q(
+                "SELECT COUNT(*) FROM permissions WHERE date<? AND "
+                "status NOT IN ('موافق','مرفوض')", (date_str,)),
             "open_referrals": q(
                 "SELECT COUNT(*) FROM student_referrals WHERE "
                 "IFNULL(status,'') NOT IN ('مغلق','منتهي')"),
@@ -265,9 +310,14 @@ def _alerts(snap):
         a.append({"level": "info",
                   "text": "لم يُسجَّل غياب في الحصص: " + "، ".join(str(x) for x in zero)})
 
-    if wf.get("pending_permissions"):
-        a.append({"level": "info", "text": "%d طلب استئذان بانتظار الرد"
-                  % wf["pending_permissions"]})
+    pend = wf.get("pending_permissions") or 0
+    if pend:
+        wait = wf.get("pending_wait_min") or 0
+        # الطالب ينتظر عند الباب: نصف ساعة بلا ردّ ليست «معلومة» بل تقصير
+        a.append({"level": "warn" if wait >= 30 else "info",
+                  "text": ("%d طلب استئذان بانتظار الرد — أقدمها منذ %s"
+                           % (pend, _dur_ar(wait))) if wait
+                  else "%d طلب استئذان بانتظار الرد اليوم" % pend})
     if wf.get("unread_reports"):
         a.append({"level": "info", "text": "%d تقرير معلم لم يُقرأ"
                   % wf["unread_reports"]})
