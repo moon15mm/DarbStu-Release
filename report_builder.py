@@ -43,20 +43,33 @@ def compute_today_metrics(date_str: Optional[str] = None) -> Dict[str, Any]:
         if res.get("ok"):
             return res.get("metrics", {})
 
+    # المصدر الموحّد: الخلطة الذكية تدمج البصمة + روابط المعلمين + اليدوي.
+    # بلا جهاز بصمة مُفعّل تُعطي الأرقام القديمة نفسها تماماً (الغائب = من
+    # له سجل غياب)؛ وبتفعيله يُعاد تصنيف من بصم ثم سُجّل غائباً كـ«هروب» لا
+    # غياباً، وفي الوضع الأساسي يُحسب من لم يبصم غائباً. انظر attendance_blend.
+    try:
+        from attendance_blend import blend_metrics
+        return blend_metrics(date_str)
+    except Exception:
+        # سقوطٌ آمن للحساب المباشر إن تعذّرت الخلطة لأي سبب — لا تُترك
+        # اللوحة فارغة. الغياب = من له سجل غياب اليوم.
+        import traceback
+        traceback.print_exc()
+
     from database import get_exempted_students
     exempted_ids = {str(e["student_id"]) for e in get_exempted_students()}
-    
+
     store = load_students()
     total_students = len({s["id"] for c in store["list"] for s in c["students"] if str(s["id"]) not in exempted_ids})
-    
+
     rows_today = _apply_class_name_fix(query_absences(date_filter=date_str))
     absent_ids_today = {str(r["student_id"]) for r in rows_today}
     total_absent = len(absent_ids_today)
-    
+
     absent_by_class = {}
     for r in rows_today:
         absent_by_class.setdefault(r["class_id"], set()).add(str(r["student_id"]))
-    
+
     by_class = []
     for c in store["list"]:
         cid, cname = c["id"], c["name"]
@@ -68,21 +81,21 @@ def compute_today_metrics(date_str: Optional[str] = None) -> Dict[str, Any]:
 
         class_absent = len(absent_by_class.get(cid, set()))
         by_class.append({
-            "class_id": cid, 
-            "class_name": cname, 
-            "total": class_total, 
-            "absent": class_absent, 
+            "class_id": cid,
+            "class_name": cname,
+            "total": class_total,
+            "absent": class_absent,
             "present": max(class_total - class_absent, 0)
         })
-    
+
     by_class.sort(key=lambda x: x["class_id"])
     return {
-        "date": date_str, 
+        "date": date_str,
         "totals": {
-            "students": total_students, 
-            "absent": total_absent, 
+            "students": total_students,
+            "absent": total_absent,
             "present": max(total_students - total_absent, 0)
-        }, 
+        },
         "by_class": by_class
     }
     

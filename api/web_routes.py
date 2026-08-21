@@ -1650,12 +1650,14 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
         ("الرئيسية", [
             ("لوحة المراقبة",      "dashboard",            "fas fa-chart-line"),
             ("المراقبة الحية",      "live_monitor",         "fas fa-satellite-dish"),
+            ("الحضور الموحّد",      "link:/web/attendance", "fas fa-layer-group"),
             ("روابط الفصول",        "links",                "fas fa-link"),
         ]),
         ("التسجيل اليومي", [
             ("تسجيل الغياب",        "reg_absence",          "fas fa-user-check"),
             ("تسجيل التأخر",        "reg_tardiness",        "fas fa-stopwatch"),
             ("طلب استئذان",         "new_permission",       "fas fa-bell"),
+            ("جهاز البصمة",         "link:/web/biometric",  "fas fa-fingerprint"),
         ]),
         ("المتابعة الانضباطية", [
             ("سجل الغياب",              "absences",             "fas fa-history"),
@@ -1724,6 +1726,14 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
         sidebar_html += '<div class="sb-group">' + grp_title + '</div>'
         for name, key, icon in visible:
             badge = ''
+            # مفتاح يبدأ بـ«link:» صفحةٌ مستقلّة لا تبويب SPA — كصفحة البصمة.
+            if key.startswith("link:"):
+                sidebar_html += (
+                    '<a class="tab-btn" href="' + key[5:] + '" '
+                    'style="text-decoration:none">'
+                    '<i class="ti ' + icon + '"></i>' + name + '</a>'
+                )
+                continue
             sidebar_html += (
                 '<button class="tab-btn" data-key="' + key + '" onclick="showTab(\'' + key + '\')">'
                 '<i class="ti ' + icon + '"></i>' + name + badge + '</button>'

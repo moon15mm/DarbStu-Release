@@ -26,6 +26,17 @@ DEFAULT_CONFIG = {
     "period_times": ["07:00", "07:50", "08:40", "09:50", "10:40", "11:30", "12:20"],
     "school_start_time": "07:00",
     "tardiness_recipients": [],
+    # ── جهاز البصمة عند البوابة ──────────────────────────────────
+    # biometric_devices: قائمة أجهزة، كل عنصر:
+    #   {"device_id":"gate1","protocol":"zk","ip":"192.168.1.201",
+    #    "port":4370,"comm_key":0,"enabled":true}
+    # mode: 'tardiness' يسجّل المتأخرين فقط · 'attendance' يسجّل الحضور كله.
+    # grace: دقائق سماح بعد بداية الدوام قبل احتساب التأخر.
+    "biometric_enabled": False,
+    "biometric_devices": [],
+    "biometric_mode": "tardiness",
+    "biometric_grace_min": 0,
+    "biometric_notify_parent": True,
     "tardiness_message_template": (
         "⏱ تنبيه تأخر من {school_name}\n"
         "{guardian}/ {student_name}\n"

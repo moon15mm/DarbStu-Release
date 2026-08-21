@@ -634,6 +634,13 @@ def main():
         # جدول روابط الباصات التلقائية
         from bus_scheduler import schedule_bus_checkin
         schedule_bus_checkin(root)
+        # خيط سحب بصمات جهاز الحضور — يبدأ فقط إن فُعّل الربط
+        try:
+            if load_config().get("biometric_enabled"):
+                from biometric import poller as _bio_poller
+                _bio_poller.start()
+        except Exception as _e:
+            print(f"[BIOMETRIC] تعذّر بدء خيط البصمة: {_e}")
         # جدول تعزيز الحضور الأسبوعي
         schedule_weekly_rewards(root)
         # جدولة التحديث التلقائي

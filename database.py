@@ -799,7 +799,345 @@ def init_db():
         UNIQUE(trip_id, student_id)
     )""")
 
+    # ─── بصمات جهاز الحضور — الخام ────────────────────────────────
+    # نخزّن كل بصمة كما وردت من الجهاز، لا التأخر المُستنتَج منها. السبب:
+    # لو تغيّر وقت بداية الدوام، أو اكتُشف أن ساعة الجهاز متأخرة، أُعيد
+    # حساب التأخر من الأصل. تخزين النتيجة وحدها يمحو ما لا يُسترجَع.
+    # device_uid = الرقم المسجّل داخل الجهاز (قد يساوي رقم الطالب أو لا).
+    # punch_utc  = وقت البصمة بتوقيت UTC، لتفادي التباس المناطق الزمنية.
+    # processed  = هل حُوّلت إلى حضور/تأخر بعد؟ (يمنع المعالجة المزدوجة)
+    cur.execute("""CREATE TABLE IF NOT EXISTS biometric_punches (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id   TEXT NOT NULL DEFAULT '',
+        device_uid  TEXT NOT NULL,
+        punch_utc   TEXT NOT NULL,
+        punch_local TEXT NOT NULL DEFAULT '',
+        date        TEXT NOT NULL DEFAULT '',
+        student_id  TEXT NOT NULL DEFAULT '',
+        matched     INTEGER NOT NULL DEFAULT 0,
+        processed   INTEGER NOT NULL DEFAULT 0,
+        outcome     TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL,
+        UNIQUE(device_id, device_uid, punch_utc)
+    )""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_punch_date "
+                "ON biometric_punches(date)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_punch_unprocessed "
+                "ON biometric_punches(processed)")
+
+    # ─── ربط رقم الجهاز برقم الطالب ───────────────────────────────
+    # الأصل أن يُسجَّل الطالب في الجهاز برقمه الأكاديمي نفسه، فلا حاجة
+    # لهذا الجدول. لكن أجهزةً كثيرة تُرقّم تسلسلياً (1،2،3)، فنحتاج جسراً.
+    cur.execute("""CREATE TABLE IF NOT EXISTS biometric_enrollments (
+        device_uid   TEXT PRIMARY KEY,
+        student_id   TEXT NOT NULL,
+        student_name TEXT NOT NULL DEFAULT '',
+        class_name   TEXT NOT NULL DEFAULT '',
+        created_at   TEXT NOT NULL
+    )""")
+
+    # ─── من سُجّلت بصمته فعلاً ─────────────────────────────────────
+    # علامةٌ محلّية بأن التقاط بصمة هذا الطالب تمّ بنجاح على الجهاز.
+    # الجهاز هو مصدر الحقيقة النهائي، لكن هذه العلامة تقود واجهة التسجيل
+    # (من بُصم ومن لم يُبصم) بلا الاعتماد على قراءة قائمة مستخدمي الجهاز،
+    # وهي قراءةٌ تختلف صيغتها بين إصدارات العتاد.
+    cur.execute("""CREATE TABLE IF NOT EXISTS biometric_fp_enrolled (
+        student_id   TEXT PRIMARY KEY,
+        device_id    TEXT NOT NULL DEFAULT '',
+        finger       INTEGER NOT NULL DEFAULT 0,
+        enrolled_at  TEXT NOT NULL
+    )""")
+
     con.commit(); con.close()
+
+# ══════════════════════════════════════════════════════════════
+#  بصمات جهاز الحضور
+# ══════════════════════════════════════════════════════════════
+def insert_biometric_punch(device_id, device_uid, punch_utc, punch_local,
+                           date, student_id="", matched=0):
+    """
+    يخزّن بصمة خام. يُرجع rowid الجديد، أو 0 إن كانت مكرّرة.
+
+    التكرار متوقّع وطبيعي: الجهاز يحتفظ بالبصمة في ذاكرته، ونحن نسحب
+    نافذةً متداخلة في كل دورة كي لا نفقد شيئاً عند تقطّع الاتصال. قيد
+    UNIQUE يمتصّ التكرار، و rowcount يميّز الجديد من المُتجاهَل بلا خطأ.
+    """
+    con = get_db()
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """INSERT OR IGNORE INTO biometric_punches
+               (device_id, device_uid, punch_utc, punch_local, date,
+                student_id, matched, created_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (str(device_id), str(device_uid), punch_utc, punch_local, date,
+             str(student_id), 1 if matched else 0,
+             datetime.datetime.utcnow().isoformat()))
+        rid = cur.lastrowid if cur.rowcount else 0
+        con.commit()
+        return rid
+    finally:
+        con.close()
+
+
+def get_unprocessed_punches(limit=500):
+    """البصمات التي لم تُحوّل بعد إلى حضور/تأخر — الأقدم أولاً."""
+    con = get_db(); con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            "SELECT * FROM biometric_punches WHERE processed=0 "
+            "ORDER BY punch_utc ASC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        con.close()
+
+
+def mark_punch_processed(punch_id, outcome, student_id="", matched=None):
+    """يعلّم بصمةً بأنها عولجت، ويسجّل النتيجة (سجّل تأخر / حاضر / لا مطابقة)."""
+    con = get_db()
+    try:
+        cur = con.cursor()
+        if matched is None:
+            cur.execute(
+                "UPDATE biometric_punches SET processed=1, outcome=?, "
+                "student_id=? WHERE id=?",
+                (outcome, str(student_id), punch_id))
+        else:
+            cur.execute(
+                "UPDATE biometric_punches SET processed=1, outcome=?, "
+                "student_id=?, matched=? WHERE id=?",
+                (outcome, str(student_id), 1 if matched else 0, punch_id))
+        con.commit()
+    finally:
+        con.close()
+
+
+def query_biometric_punches(date_filter=None, limit=200):
+    """بصمات يوم (أو الأحدث) لعرضها في السجل الحيّ باللوحة."""
+    con = get_db(); con.row_factory = sqlite3.Row
+    try:
+        if date_filter:
+            rows = con.execute(
+                "SELECT * FROM biometric_punches WHERE date=? "
+                "ORDER BY punch_utc DESC LIMIT ?",
+                (date_filter, limit)).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT * FROM biometric_punches "
+                "ORDER BY punch_utc DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        con.close()
+
+
+def get_last_punch_utc(device_id):
+    """أحدث وقت بصمة خزّنّاه من هذا الجهاز — نقطة استئناف السحب."""
+    con = get_db()
+    try:
+        row = con.execute(
+            "SELECT MAX(punch_utc) FROM biometric_punches WHERE device_id=?",
+            (str(device_id),)).fetchone()
+        return row[0] if row and row[0] else None
+    finally:
+        con.close()
+
+
+def set_biometric_enrollment(device_uid, student_id, student_name="",
+                             class_name=""):
+    """يربط رقم جهازٍ برقم طالب (أو يحدّث الربط)."""
+    con = get_db()
+    try:
+        con.execute(
+            """INSERT OR REPLACE INTO biometric_enrollments
+               (device_uid, student_id, student_name, class_name, created_at)
+               VALUES (?,?,?,?,?)""",
+            (str(device_uid), str(student_id), student_name, class_name,
+             datetime.datetime.utcnow().isoformat()))
+        con.commit()
+    finally:
+        con.close()
+
+
+def delete_biometric_enrollment(device_uid):
+    con = get_db()
+    try:
+        con.execute("DELETE FROM biometric_enrollments WHERE device_uid=?",
+                    (str(device_uid),))
+        con.commit()
+    finally:
+        con.close()
+
+
+def get_biometric_enrollments():
+    """قاموس {رقم الجهاز: بيانات الطالب} — للمطابقة السريعة."""
+    con = get_db(); con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute("SELECT * FROM biometric_enrollments").fetchall()
+        return {r["device_uid"]: dict(r) for r in rows}
+    finally:
+        con.close()
+
+
+def assign_academic_numbers(force=False, year=2027):
+    """
+    يولّد رقماً أكاديمياً مُهيكلاً بالسنة الميلادية لكل طالب لا يملكه.
+
+    المعادلة: (آخر خانتين من السنة) × ١٠٠٠٠ + تسلسل عام.
+    مثال: أول طالب في ٢٠٢٧ يصير 270001 — ثابت معه حتى التخرج.
+
+    لماذا: رقم الهوية ١٠ خانات، وجهاز البصمة يقبل ٩ فقط — فلا يُكتب في
+    الجهاز. نُسند رقماً مبنياً على السنة (٦ خانات ≤ ٩) يبقى ثابتاً مع
+    الطالب مهما انتقل بين الفصول أو ارتقى للمستوى التالي.
+
+    idempotent: لا يمسّ رقماً موجوداً أبداً (البصمات على الأجهزة مربوطة
+    به). يملأ الناقص فقط. force=True يُعيد توليد الكل (للطوارئ فقط —
+    يُبطل كل تسجيلات الأجهزة القائمة). يُخزَّن الرقم في سجلّ الطالب نفسه
+    فيبقى ثابتاً عبر السنوات ويصلح للطباعة على البطاقات.
+    """
+    store = load_students(force_reload=True)
+    classes = store.get("list", [])
+    used = set()
+    if not force:
+        for c in classes:
+            for s in c.get("students", []):
+                an = str(s.get("academic_no") or "").strip()
+                if an:
+                    used.add(an)
+
+    assigned = 0
+    if year is not None:
+        year_short = int(year) % 100
+    else:
+        year_short = datetime.datetime.now().year % 100
+    base = year_short * 10000                         # مثال: 270000
+    k = 1
+    for c in classes:
+        for s in c.get("students", []):
+            if not force and str(s.get("academic_no") or "").strip():
+                continue
+            # أوّل رقم حرّ في مدى هذه السنة
+            while str(base + k) in used:
+                k += 1
+            an = str(base + k)
+            s["academic_no"] = an
+            used.add(an)
+            assigned += 1
+            k += 1
+
+    if assigned:
+        save_students(classes)
+        try:
+            constants.STUDENTS_STORE = None
+        except Exception:
+            pass
+    total = sum(len(c.get("students", [])) for c in classes)
+    return {"assigned": assigned, "total": total,
+            "already": total - assigned}
+
+
+def get_academic_map():
+    """قاموس {الرقم الأكاديمي: بيانات الطالب} — لمطابقة بصمات الجهاز."""
+    store = load_students()
+    m = {}
+    for c in store.get("list", []):
+        for s in c.get("students", []):
+            an = str(s.get("academic_no") or "").strip()
+            if an:
+                m[an] = {"student_id": str(s.get("id")),
+                         "name": s.get("name", ""),
+                         "class_name": c.get("name", "")}
+    return m
+
+
+def mark_fp_enrolled(student_id, device_id="", finger=0):
+    """يعلّم طالباً بأن بصمته سُجّلت على الجهاز."""
+    con = get_db()
+    try:
+        con.execute(
+            """INSERT OR REPLACE INTO biometric_fp_enrolled
+               (student_id, device_id, finger, enrolled_at)
+               VALUES (?,?,?,?)""",
+            (str(student_id), str(device_id), int(finger or 0),
+             datetime.datetime.utcnow().isoformat()))
+        con.commit()
+    finally:
+        con.close()
+
+
+def unmark_fp_enrolled(student_id):
+    con = get_db()
+    try:
+        con.execute("DELETE FROM biometric_fp_enrolled WHERE student_id=?",
+                    (str(student_id),))
+        con.commit()
+    finally:
+        con.close()
+
+
+def get_fp_enrolled_ids():
+    """مجموعة أرقام الطلاب الذين سُجّلت بصماتهم."""
+    con = get_db()
+    try:
+        rows = con.execute(
+            "SELECT student_id FROM biometric_fp_enrolled").fetchall()
+        return set(r[0] for r in rows)
+    finally:
+        con.close()
+
+
+def sync_fp_enrollments_from_device(fp_user_ids: set, device_id: str = ""):
+    """
+    يُزامن حالة بصمات الطلاب مع البيانات الحية من جهاز البصمة.
+    fp_user_ids: قائمة/مجموعة المعرفات (الأرقام الأكاديمية أو أرقام الهويات) المسجلة على الجهاز.
+    """
+    academic_map = get_academic_map()  # {academic_no: {"student_id": ..., "name": ...}}
+    student_map = get_student_map()    # {student_id: {...}}
+
+    matched_student_ids = set()
+    for uid_str in fp_user_ids:
+        uid_clean = str(uid_str).strip()
+        if uid_clean in academic_map:
+            matched_student_ids.add(academic_map[uid_clean]["student_id"])
+        elif uid_clean in student_map:
+            matched_student_ids.add(uid_clean)
+        else:
+            matched_student_ids.add(uid_clean)
+
+    con = get_db()
+    try:
+        cur = con.cursor()
+        cur.execute("DELETE FROM biometric_fp_enrolled")
+        now = datetime.datetime.utcnow().isoformat()
+        for sid in matched_student_ids:
+            cur.execute(
+                """INSERT OR REPLACE INTO biometric_fp_enrolled (student_id, device_id, finger, enrolled_at)
+                   VALUES (?, ?, 0, ?)""",
+                (str(sid), str(device_id), now)
+            )
+        con.commit()
+        return len(matched_student_ids)
+    finally:
+        con.close()
+
+
+def get_biometric_daily_summary(date_str):
+    """عدّادات اليوم للوحة: بصمات، مطابَقة، تأخر، بلا مطابقة."""
+    con = get_db()
+    try:
+        def n(where, args=()):
+            return con.execute(
+                "SELECT COUNT(*) FROM biometric_punches WHERE date=? " + where,
+                (date_str,) + args).fetchone()[0]
+        return {
+            "punches": n(""),
+            "matched": n("AND matched=1"),
+            "unmatched": n("AND matched=0"),
+            "tardy": n("AND outcome LIKE 'تأخر%'"),
+            "present": n("AND outcome LIKE 'حاضر%'"),
+        }
+    finally:
+        con.close()
+
 
 # --- Helper functions for Exempted Students ---
 def add_exempted_student(student_id, student_name, class_name, reason=""):
