@@ -1652,6 +1652,7 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
             ("المراقبة الحية",      "live_monitor",         "fas fa-satellite-dish"),
             ("الحضور الموحّد",      "link:/web/attendance", "fas fa-layer-group"),
             ("روابط الفصول",        "links",                "fas fa-link"),
+            ("جدولة الروابط",       "link:/web/schedule",   "fas fa-calendar-alt"),
         ]),
         ("التسجيل اليومي", [
             ("تسجيل الغياب",        "reg_absence",          "fas fa-user-check"),

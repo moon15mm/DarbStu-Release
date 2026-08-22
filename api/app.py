@@ -45,6 +45,7 @@ from api.points_api       import router as _points_router
 from api.bus_routes       import router as _bus_router
 from api.biometric_routes import router as _biometric_router
 from api.attendance_routes import router as _attendance_router
+from api.schedule_routes   import router as _schedule_router
 app.include_router(_mobile_router)
 app.include_router(_misc_router)
 app.include_router(_web_router)
@@ -52,6 +53,7 @@ app.include_router(_points_router)
 app.include_router(_bus_router)
 app.include_router(_biometric_router)
 app.include_router(_attendance_router)
+app.include_router(_schedule_router)
 
 # ── خدمة الملفات الثابتة ──
 # لا يُخدَم مجلد data كاملاً: فهو يحوي config.json (وفيه cloud_token وأرقام
