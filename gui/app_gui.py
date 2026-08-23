@@ -591,11 +591,36 @@ class AppGUI(
         hdr = tk.Frame(win, bg="#1565C0", height=46); hdr.pack(fill="x"); hdr.pack_propagate(False)
         tk.Label(hdr, text="معاينة الاستيراد", bg="#1565C0", fg="white", font=("Tahoma",11,"bold")).pack(side="right", padx=12, pady=12)
         btns = tk.Frame(win, bg="white"); btns.pack(side="bottom", fill="x", padx=10, pady=8)
-        ttk.Button(btns, text="✅ تأكيد الاستيراد", command=lambda: (win.destroy(), self._do_reimport_students(xlsx_path))).pack(side="right", padx=4)
+        # «إضافة فقط»: يضيف غير الموجودين بالهوية (للأول ثانوي الجدد) دون
+        # استبدال الموجودين ولا لمس بياناتهم أو أرقامهم الأكاديمية.
+        merge_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            btns, variable=merge_var,
+            text="إضافة فقط (للأول ثانوي الجدد — لا يستبدل الموجودين ولا يمسّ بياناتهم)"
+        ).pack(side="left", padx=10)
+        ttk.Button(btns, text="✅ تأكيد الاستيراد",
+                   command=lambda: (win.destroy(),
+                                    self._do_reimport_students(xlsx_path, add_only=merge_var.get()))
+                   ).pack(side="right", padx=4)
         ttk.Button(btns, text="❌ إلغاء", command=win.destroy).pack(side="right", padx=4)
 
-    def _do_reimport_students(self, path: str, _retry: bool = False):
+    def _do_reimport_students(self, path: str, _retry: bool = False,
+                              add_only: bool = False):
         try:
+            # وضع «إضافة فقط»: يدمج الجدد بالهوية دون استبدال الموجودين،
+            # ثم يولّد أرقاماً أكاديمية للجدد فقط. مسارٌ مستقلّ عن الاستبدال.
+            if add_only:
+                from database import import_noor_add_only
+                mres = import_noor_add_only(path)
+                messagebox.showinfo(
+                    "تم (إضافة فقط)",
+                    "أُضيف %d طالباً جديداً.\n"
+                    "الموجودون (%d) بلا مساس — بياناتهم وأرقامهم الأكاديمية محفوظة.\n"
+                    "وُلّدت أرقام أكاديمية للجدد فقط." % (mres.get("added", 0),
+                                                          mres.get("kept", 0)))
+                self.update_all_tabs_after_data_change()
+                return
+
             res = import_students_from_excel_sheet2_format(path)
 
             # لبس في الصفوف؟ نعود بالمستخدم إلى ترميزها يدوياً ثم نستورد

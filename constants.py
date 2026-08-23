@@ -70,7 +70,7 @@ MY_STATIC_DOMAIN  = _saved_domain
 ngrok = None
 
 APP_TITLE           = 'تسجيل غياب الطلاب'
-APP_VERSION         = '3.6.26'
+APP_VERSION         = '3.6.27'
 UPDATE_URL          = 'https://raw.githubusercontent.com/moon15mm/DarbStu-Release/main/version.json'
 UPDATE_DOWNLOAD_URL = 'https://github.com/moon15mm/DarbStu-Release/archive/refs/heads/main.zip'
 
@@ -163,3 +163,28 @@ def navbar_html(base_url: str) -> str:
 
 def debug_on() -> bool:
     return os.environ.get("ABSENTEE_DEBUG", "0") == "1"
+
+
+def public_base_url() -> str:
+    """
+    النطاق العام محلولاً **وقت التشغيل** — لا وقت الاستيراد كـSTATIC_DOMAIN.
+
+    المشكلة: STATIC_DOMAIN يُحسب مرة عند استيراد الوحدة من cloudflare_domain
+    فقط. فلو جُهّز النفق بعد الإقلاع، أو خُزّن النطاق في إعدادات النفق دون
+    cloudflare_domain، بقيت الروابط محليّةً حتى إعادة التشغيل. هذه الدالة
+    تقرأ النطاق الآن من مصدرين: cloudflare_domain ثم نطاق النفق، فيعمل
+    الرابط متى توفّر أيٌّ منهما. وضع التطوير يُبقي المحلي (للاختبار).
+    """
+    if debug_on():
+        return "http://%s:%d" % (local_ip(), PORT)
+    dom = _read_saved_domain()                      # cloudflare_domain الآن
+    if not dom:
+        try:
+            from provisioning import get_public_domain
+            dom = get_public_domain()               # نطاق النفق
+        except Exception:
+            dom = ""
+    dom = (dom or "").replace("https://", "").replace("http://", "").strip("/")
+    if dom:
+        return "https://" + dom
+    return "http://%s:%d" % (local_ip(), PORT)

@@ -35,9 +35,8 @@ def _logmsg(m):
 
 
 def _base_url():
-    from constants import STATIC_DOMAIN, PORT, local_ip, debug_on
-    return (STATIC_DOMAIN if STATIC_DOMAIN and not debug_on()
-            else "http://%s:%d" % (local_ip(), PORT))
+    from constants import public_base_url
+    return public_base_url()   # يحلّ النطاق العام وقت التشغيل من كل المصادر
 
 
 def status():

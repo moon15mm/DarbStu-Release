@@ -11,7 +11,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from constants import (DB_PATH, DATA_DIR, TEACHERS_JSON, HOST, PORT, TZ_OFFSET,
                        STATIC_DOMAIN, STUDENTS_STORE, BASE_DIR,
                        now_riyadh_date, local_ip, navbar_html, debug_on,
-                       CURRENT_USER, ROLES)
+                       public_base_url, CURRENT_USER, ROLES)
 from config_manager import (load_config, get_terms, logo_img_tag_from_config,
                             ar, feminize as _fem, bot_enabled)
 from database import (get_db, load_students, load_teachers,
@@ -90,7 +90,7 @@ def manage_students_web_page(request: Request):
     if _denied:
         from fastapi.responses import RedirectResponse
         return RedirectResponse("/web/login")
-    base_url = STATIC_DOMAIN if STATIC_DOMAIN and not debug_on() else f"http://{local_ip()}:{PORT}"
+    base_url = public_base_url()
     nav = navbar_html(base_url)
     store = load_students()
     student_options = ""
@@ -274,7 +274,7 @@ async def api_delete_class(request: Request):
         return JSONResponse({"detail": f"فشل الحفظ: {str(e)}"}, status_code=500)
 
 def live_monitor_html_page() -> str:
-    base_url = STATIC_DOMAIN if STATIC_DOMAIN and not debug_on() else f"http://{local_ip()}:{PORT}"
+    base_url = public_base_url()
     nav = navbar_html(base_url)
     style_css = """
         body { font-family: 'Segoe UI', Tahoma, sans-serif; background-color: #f4f7f6; margin: 0; padding: 10px; }
@@ -351,8 +351,7 @@ def class_html(class_id: str, class_name: str,
     school       = cfg.get("school_name", "المدرسة")
     period_times = cfg.get("period_times",
         ["07:00","07:50","08:40","09:50","10:40","11:30","12:20"])
-    base_url     = (STATIC_DOMAIN if STATIC_DOMAIN and not debug_on()
-                    else "http://{}:{}".format(local_ip(), PORT))
+    base_url     = public_base_url()
 
     tch_opts = '<option value="">— المعلم —</option>' + "".join(
         '<option value="{n}">{n}</option>'.format(n=t.get("اسم المعلم",""))
@@ -756,8 +755,7 @@ def send_tardiness_link_to_all():
     يُرجع: (عدد_النجاح, عدد_الفشل, تفاصيل)
     """
     cfg        = load_config()
-    base       = (STATIC_DOMAIN if STATIC_DOMAIN and not debug_on()
-                  else "http://{}:{}".format(local_ip(), PORT))
+    base       = public_base_url()
     url        = "{}/tardiness".format(base)
     recipients = get_tardiness_recipients()
     today      = now_riyadh_date()
@@ -1087,7 +1085,7 @@ def tardiness_all_page(request: Request):
     الرابط كبوابة أولياء الأمور، ويُبنى مع رمز رابط الفصل.
     """
     store   = load_students()
-    base    = STATIC_DOMAIN if STATIC_DOMAIN and not debug_on() else f"http://{local_ip()}:{PORT}"
+    base    = public_base_url()
     all_stu = []
     for cls in store["list"]:
         for s in cls["students"]:
@@ -1108,7 +1106,7 @@ def tardiness_class_page(class_id: str, request: Request):
     cls   = store["by_id"].get(class_id)
     if not cls:
         return HTMLResponse("<h3>الفصل غير موجود</h3>", status_code=404)
-    base  = STATIC_DOMAIN if STATIC_DOMAIN and not debug_on() else f"http://{local_ip()}:{PORT}"
+    base  = public_base_url()
     students = [{**s, "class_name": cls["name"]} for s in cls["students"]]
     html = _tardiness_page_html(
         students_list=students,
@@ -1580,7 +1578,7 @@ self.addEventListener('notificationclick', e => {
 @router.get("/api/mobile-portal-data", response_class=JSONResponse)
 def get_mobile_portal_data():
     cfg = load_config()
-    base_url = STATIC_DOMAIN if STATIC_DOMAIN and not debug_on() else f"http://{local_ip()}:{PORT}"
+    base_url = public_base_url()
     return {
         "school_name": cfg.get("school_name"),
         "live_status": get_live_monitor_status(now_riyadh_date()),
@@ -1615,7 +1613,7 @@ def get_permission_page(request: Request):
         {c["id"]: [{"id": s["id"], "name": s["name"], "phone": s.get("phone", "")}
                    for s in c.get("students", [])] for c in store["list"]},
         ensure_ascii=False)
-    base = STATIC_DOMAIN if STATIC_DOMAIN and not debug_on() else f"http://{local_ip()}:{PORT}"
+    base = public_base_url()
     cfg = load_config()
     school = _fem(cfg.get("school_name", "المدرسة"))
 
@@ -1787,11 +1785,11 @@ def api_permission_today(request: Request, date: str = ""):
 
 @router.get("/classes-list", response_class=HTMLResponse)
 def get_classes_list_page():
-    base_url = STATIC_DOMAIN if STATIC_DOMAIN and not debug_on() else f"http://{local_ip()}:{PORT}"
+    base_url = public_base_url()
     nav = navbar_html(base_url)
     """A simple HTML page that lists all classes with links to their absence forms."""
     store = load_students()
-    base_url = STATIC_DOMAIN if STATIC_DOMAIN and not debug_on() else f"http://{local_ip( )}:{PORT}"
+    base_url = public_base_url()
     
     links_html = ""
     for c in sorted(store["list"], key=lambda x: x['id']):
@@ -1843,7 +1841,7 @@ def get_classes_list_page():
 # ===================== NEW: Mobile Send Messages =====================
 
 def send_messages_html() -> str:
-    base_url = STATIC_DOMAIN if STATIC_DOMAIN and not debug_on() else f"http://{local_ip()}:{PORT}"
+    base_url = public_base_url()
     nav = navbar_html(base_url)
     """Generates the HTML page for sending absence messages from mobile."""
     return """
@@ -2018,7 +2016,7 @@ def get_status_api(request: Request):
     return JSONResponse(content=status_data)
 
 def schedule_editor_html() -> str:
-    base_url = STATIC_DOMAIN if STATIC_DOMAIN and not debug_on() else f"http://{local_ip()}:{PORT}"
+    base_url = public_base_url()
     nav = navbar_html(base_url)
     style_css = """
         body { font-family: 'Cairo', 'Segoe UI', sans-serif; background-color: #f5f5f5; margin: 0; padding: 20px; }

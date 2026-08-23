@@ -128,6 +128,35 @@ async def sender_status(request: Request):
     return JSONResponse({"ok": True, "sender": schedule_sender.status()})
 
 
+# ── رابط تسجيل التأخر (كل المدرسة) — عرضٌ وإرسالٌ للمستلمين ────────
+@router.get("/web/api/tardiness/link-info", response_class=JSONResponse)
+async def tardiness_link_info(request: Request):
+    if not _admin(request):
+        return _unauth()
+    from constants import public_base_url
+    from api.mobile_routes import get_tardiness_recipients
+    return JSONResponse({"ok": True,
+                         "url": public_base_url() + "/tardiness",
+                         "recipients": len(get_tardiness_recipients())})
+
+
+@router.post("/web/api/tardiness/send-link", response_class=JSONResponse)
+async def tardiness_send_link(request: Request):
+    if not _admin(request):
+        return _unauth()
+    import threading
+    from api.mobile_routes import (send_tardiness_link_to_all,
+                                   get_tardiness_recipients)
+    n = len(get_tardiness_recipients())
+    if n == 0:
+        return JSONResponse({"ok": False,
+                             "error": "لا مستلمين مسجّلين لرابط التأخر"})
+    # الإرسال يتباطأ بين الرسائل (تفادي حظر واتساب)، فنشغّله في خيط
+    # ونعود فوراً كي لا يتجمّد الطلب.
+    threading.Thread(target=send_tardiness_link_to_all, daemon=True).start()
+    return JSONResponse({"ok": True, "recipients": n})
+
+
 _PAGE = r"""<!doctype html>
 <html lang="ar" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -205,6 +234,17 @@ _PAGE = r"""<!doctype html>
   <div class="row" style="justify-content:space-between"><b style="color:var(--navy)">سجل الإرسال الآلي</b>
     <span class="muted" id="sched-info"></span></div>
   <div class="log" id="log">—</div>
+</div>
+
+<div class="card">
+  <b style="color:var(--navy)">رابط تسجيل التأخر (كل المدرسة)</b>
+  <p class="muted" style="margin:6px 0 10px">رابطٌ عامٌّ لتسجيل المتأخرين — يُرسَل لمستلمي التأخر المسجّلين عبر واتساب. إن ظهر الرابط محليّاً (بادئة IP) فالنطاق العام غير مُهيّأ على هذا الجهاز.</p>
+  <div class="row">
+    <input type="text" id="tard-url" readonly style="flex:1;min-width:220px;font-family:Consolas,monospace;direction:ltr;text-align:left">
+    <button class="btn gh sm" onclick="copyTardUrl()">📋 نسخ</button>
+    <button class="btn o" onclick="sendTard()">📤 إرسال للمستلمين الآن (<span id="tard-n">0</span>)</button>
+  </div>
+  <div id="tard-msg" class="msg"></div>
 </div>
 
 <script>
@@ -287,8 +327,27 @@ function renderSender(s){
 function pollStatus(){
   fetch('/web/api/schedule/sender/status').then(function(r){return r.json()}).then(function(j){if(j.ok)renderSender(j.sender);}).catch(function(){});
 }
+// رابط التأخر
+function loadTard(){
+  fetch('/web/api/tardiness/link-info').then(function(r){return r.json()}).then(function(j){
+    if(j.ok){el('tard-url').value=j.url; el('tard-n').textContent=j.recipients;}
+  }).catch(function(){});
+}
+function copyTardUrl(){
+  var i=el('tard-url'); i.select();
+  try{document.execCommand('copy'); var m=el('tard-msg'); m.textContent='نُسخ الرابط ✓'; m.className='msg ok'; setTimeout(function(){m.className='msg';},2500);}catch(e){}
+}
+function sendTard(){
+  if(!confirm('إرسال رابط التأخر لكل المستلمين المسجّلين الآن؟')) return;
+  var m=el('tard-msg'); m.textContent='⏳ جارٍ الإرسال...'; m.className='msg ok';
+  fetch('/web/api/tardiness/send-link',{method:'POST'}).then(function(r){return r.json()}).then(function(j){
+    m.textContent=j.ok?('بدأ إرسال الرابط إلى '+j.recipients+' مستلماً (يتم تباعاً)'):('تعذّر: '+(j.error||''));
+    m.className='msg '+(j.ok?'ok':'er');
+  }).catch(function(){m.textContent='خطأ في الاتصال';m.className='msg er';});
+}
 // إقلاع
 setDay(0);
+loadTard();
 setInterval(pollStatus, 7000);
 </script>
 </body></html>"""
