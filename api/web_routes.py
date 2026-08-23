@@ -2706,6 +2706,10 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
     <div class="section">
       <div class="ab ai">📌 صدّر ملف الطلاب من نظام نور ثم ارفعه هنا</div>
       <input type="file" id="as-noor-file" accept=".xlsx,.xls">
+      <label style="display:block;margin-top:9px;font-size:13px;color:#33475F">
+        <input type="checkbox" id="as-noor-merge" style="vertical-align:middle">
+        إضافة فقط (للأول ثانوي الجدد) — يضيف غير الموجودين بالهوية، ولا يستبدل الموجودين ولا يمسّ بياناتهم أو أرقامهم الأكاديمية
+      </label>
       <button class="btn bp1" style="margin-top:12px" onclick="importNoor()">📥 استيراد من نور</button>
       <div id="as-noor-st" style="margin-top:10px"></div>
     </div>
@@ -6584,12 +6588,17 @@ async function importExcel(){
 async function importNoor(){
   var f=document.getElementById('as-noor-file').files[0];
   if(!f){ss('as-noor-st','اختر ملف نور','er');return;}
-  ss('as-noor-st','⏳ جارٍ استيراد ملف نور...','ai');
-  var fd=new FormData();fd.append('file',f);fd.append('mode','noor');
+  var mc=document.getElementById('as-noor-merge');
+  var merge=mc&&mc.checked;
+  if(merge&&!confirm('إضافة فقط: سيُضاف الطلاب الجدد (بالهوية) دون لمس الموجودين ولا بياناتهم. متابعة؟'))return;
+  ss('as-noor-st',merge?'⏳ جارٍ الدمج (إضافة فقط)...':'⏳ جارٍ استيراد ملف نور...','ai');
+  var fd=new FormData();fd.append('file',f);fd.append('mode',merge?'noor_merge':'noor');
   try{
     var r=await fetch('/web/api/import-students',{method:'POST',body:fd});
     var d=await r.json();
-    ss('as-noor-st',d.ok?('✅ تم استيراد '+(d.count||0)+' طالباً من نور'):('❌ '+(d.msg||'فشل')),d.ok?'ok':'er');
+    var msg=merge?('✅ أُضيف '+(d.added||0)+' طالباً جديداً (الموجودون '+(d.kept||0)+' بلا مساس)')
+                 :('✅ تم استيراد '+(d.count||0)+' طالباً من نور');
+    ss('as-noor-st',d.ok?msg:('❌ '+(d.msg||'فشل')),d.ok?'ok':'er');
     if(d.ok)document.getElementById('as-noor-file').value='';
   }catch(e){ss('as-noor-st','❌ خطأ في الاتصال','er');}
 }
@@ -8509,6 +8518,21 @@ async def web_import_students(request: Request):
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix, prefix="stu_import_")
         content = await upload.read()
         tmp.write(content); tmp.close()
+
+        # وضع «إضافة فقط»: يدمج الجدد بالهوية دون لمس الموجودين — للأول
+        # ثانوي الجدد. مستقلٌّ عن الاستبدال المعتاد.
+        if mode == "noor_merge":
+            from database import import_noor_add_only
+            mres = import_noor_add_only(tmp.name)
+            try: os.unlink(tmp.name)
+            except Exception: pass
+            load_students(force_reload=True)   # الذاكرة صُفّرت داخل الدالة
+            return JSONResponse({
+                "ok": True, "merge": True,
+                "added": mres.get("added", 0),
+                "kept": mres.get("kept", 0),
+                "notes": mres.get("notes") or [],
+            })
 
         if mode == "noor":
             result = import_students_from_excel_sheet2_format(tmp.name)

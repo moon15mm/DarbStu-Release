@@ -2545,6 +2545,71 @@ def import_students_from_excel_sheet2_format(xlsx_path: str) -> Dict[str, Any]:
             "_notes": _notes}
 
 
+def merge_students_add_only(current_classes, new_classes):
+    """
+    دمجٌ بالإضافة فقط، مفتاحه الهوية الوطنية (id). دالة نقيّة (لا تحفظ):
+      • طالبٌ موجود (بالهوية) → يُترك كما هو ببياناته الحالية (جوال/فصل).
+      • طالبٌ جديد → يُضاف لفصله من الملف الجديد (يُنشأ الفصل إن لزم).
+      • لا حذف لأحد، ولا تكرار.
+    يُرجع (merged, added_list, kept).
+    """
+    import copy as _copy
+    existing = {str(s.get("id")) for c in current_classes
+                for s in c.get("students", [])}
+    kept = len(existing)
+    merged = _copy.deepcopy(current_classes)
+    by_id = {str(c.get("id")): c for c in merged}
+    added = []
+    for nc in new_classes:
+        cid = str(nc.get("id"))
+        for s in nc.get("students", []):
+            nid = str(s.get("id"))
+            if not nid or nid in existing:
+                continue
+            tgt = by_id.get(cid)
+            if tgt is None:
+                tgt = {"id": nc.get("id"), "name": nc.get("name", ""),
+                       "students": []}
+                merged.append(tgt)
+                by_id[cid] = tgt
+            tgt["students"].append({"id": s.get("id"),
+                                    "name": s.get("name", ""),
+                                    "phone": s.get("phone", "")})
+            existing.add(nid)
+            added.append({"id": nid, "name": s.get("name", ""),
+                          "class_name": nc.get("name", "")})
+    return merged, added, kept
+
+
+def import_noor_add_only(xlsx_path):
+    """
+    استيراد ملف نور **بالإضافة فقط** — للأول ثانوي الجدد دون لمس الموجودين.
+
+    مستورِد نور المعتاد يستبدل الكشف كاملاً، فهذه الدالة تلتقط الكشف الحالي
+    قبل أن يكتب المستورِد فوقه، ثم تدمج بالإضافة (merge_students_add_only)،
+    تحفظ، وتولّد أرقاماً أكاديمية للجدد فقط (idempotent — لا يمسّ أرقام
+    الموجودين ولا يصطدم بها). يُرجع {added, kept, added_list, notes}.
+    """
+    import json as _j, io as _io
+    current = []
+    if os.path.exists(STUDENTS_JSON):
+        try:
+            current = _j.load(_io.open(STUDENTS_JSON, encoding="utf-8")).get(
+                "classes", [])
+        except Exception:
+            current = []
+
+    parsed = import_students_from_excel_sheet2_format(xlsx_path)   # يستبدل الملف مؤقّتاً
+    new_classes = (parsed or {}).get("classes", [])
+
+    merged, added, kept = merge_students_add_only(current, new_classes)
+    save_students(merged)                     # يستعيد الملف بالكشف المدموج
+    constants.STUDENTS_STORE = None
+    assign_academic_numbers(force=False, year=2027)   # للجدد فقط
+    return {"added": len(added), "kept": kept, "added_list": added,
+            "notes": (parsed or {}).get("_notes", [])}
+
+
 def set_noor_level_mapping(code: str, digit: str, name: str) -> bool:
     """يثبّت ترميز رمز صف من نور (يستبدل أي قيمة سابقة ويزيل علامة المراجعة)."""
     try:
