@@ -139,6 +139,15 @@ def _inject_pyzk_paths():
         if os.path.isfile(zk_mod) and c not in sys.path:
             sys.path.insert(0, c)
 
+    # ★ النسخة المدمجة biometric/_vendor — تُضاف أخيراً لتتصدّر sys.path.
+    #   تصل عبر قناة التحديث الموقّعة (ملفات .py فقط) فتُصلح الأجهزة التي
+    #   بُني EXE فيها قبل إدراج zk في الـ spec — بلا pip ولا إعادة تثبيت.
+    vendor = os.path.join(app_dir, "_vendor")
+    if os.path.isfile(os.path.join(vendor, "zk", "__init__.py")):
+        if vendor in sys.path:
+            sys.path.remove(vendor)
+        sys.path.insert(0, vendor)
+
     # إذا وُجد _internal/zk ولكن base.py غائب، انسخه من AppData
     internal_zk = os.path.join(_internal, "zk")
     internal_base = os.path.join(internal_zk, "base.py")
@@ -170,15 +179,8 @@ def _ensure_pyzk() -> bool:
     global _HAS_PYZK, _ZK
     if _HAS_PYZK:
         return True
-    try:
-        import subprocess
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "pyzk", "zk", "--user"],
-            capture_output=True, timeout=40
-        )
-    except Exception:
-        pass
-    # إعادة إضافة المسارات بعد التثبيت
+    # النسخة المدمجة (biometric/_vendor/zk) تكفي عادةً — نعيد حقن المسارات
+    # أولاً بلا أي تنزيل، فهذا يلتقطها فوراً.
     _inject_pyzk_paths()
     try:
         from zk import ZK as _ZK_new
@@ -186,7 +188,25 @@ def _ensure_pyzk() -> bool:
         _HAS_PYZK = True
         return True
     except ImportError:
-        return False
+        pass
+    # تشغيل من المصدر فقط: pip كخيار أخير. في EXE المجمّد يكون
+    # sys.executable هو البرنامج نفسه لا مفسّر بايثون، فأمر pip لا ينفّذ
+    # إطلاقاً — لذا نتخطّاه كي لا نَعِد بما لا يحدث.
+    if not getattr(sys, "frozen", False):
+        try:
+            import subprocess
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "pyzk", "--user"],
+                capture_output=True, timeout=40
+            )
+            _inject_pyzk_paths()
+            from zk import ZK as _ZK_new
+            _ZK = _ZK_new
+            _HAS_PYZK = True
+            return True
+        except Exception:
+            pass
+    return False
 
 
 # ── أخطاء ───────────────────────────────────────────────────────────────────
@@ -224,8 +244,8 @@ class ZKDevice:
 
         if not (_HAS_PYZK and _ZK is not None):
             raise ZKError(
-                "مكتبة pyzk غير متاحة — تحقق من التثبيت.\n"
-                "افتح CMD وشغّل: pip install pyzk"
+                "تعذّر تحميل مكوّن جهاز البصمة (pyzk).\n"
+                "حدّث البرنامج إلى أحدث إصدار من زرّ التحديث، ثم أعد المحاولة."
             )
 
         if self.conn:
