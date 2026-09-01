@@ -8634,10 +8634,11 @@ async def web_class_report(request: Request, class_id: str = "", semester: str =
         # نطاق تاريخ الفصل الدراسي
         today = _dt.date.today()
         yr = today.year
-        # السنة الدراسية: إذا الشهر >= 9 → العام الحالي، وإلا العام السابق
-        acad_yr = yr if today.month >= 9 else yr - 1
+        # السنة الدراسية تبدأ في أغسطس (بداية الدوام السعودي غالباً منتصف أغسطس):
+        # الشهر >= 8 → العام الحالي، وإلا العام السابق. فالفصل الأول يشمل أغسطس.
+        acad_yr = yr if today.month >= 8 else yr - 1
         sem_ranges = {
-            "1": (f"{acad_yr}-09-01",    f"{acad_yr+1}-01-31"),
+            "1": (f"{acad_yr}-08-01",    f"{acad_yr+1}-01-31"),
             "2": (f"{acad_yr+1}-02-01",  f"{acad_yr+1}-06-30"),
             "3": (f"{acad_yr+1}-05-01",  f"{acad_yr+1}-08-31"),
         }
@@ -10316,6 +10317,55 @@ async def wa_reset_session(request: Request):
         return JSONResponse({"ok": False, "msg": str(e)})
 
 
+@router.get("/web/api/wa/bots")
+async def wa_bots_status(request: Request):
+    """حالة البوتات الثلاثة: الغياب/الاستئذان من الإعدادات، والأعذار من خادم Node."""
+    user = _get_current_user(request)
+    if not user or user.get("role") not in ("admin", "deputy"):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    cfg = load_config()
+    excuse = False
+    try:
+        import urllib.request as _ur, json as _j
+        r = _ur.urlopen("http://localhost:3000/bot-config", timeout=2)
+        excuse = bool(_j.loads(r.read()).get("bot_enabled", False))
+    except Exception:
+        excuse = False   # الخادم غير متصل — يُعرض موقوفاً
+    return JSONResponse({
+        "ok": True,
+        "absence":    bool(cfg.get("absence_bot_enabled", False)),
+        "permission": bool(cfg.get("permission_bot_enabled", False)),
+        "excuse":     excuse,
+    })
+
+
+@router.post("/web/api/wa/bots/toggle", response_class=JSONResponse)
+async def wa_bots_toggle(request: Request):
+    """تشغيل/إيقاف بوت — الغياب/الاستئذان في الإعدادات، والأعذار عبر خادم Node."""
+    user = _get_current_user(request)
+    if not user or user.get("role") not in ("admin", "deputy"):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        body = await request.json()
+        bot = str(body.get("bot", ""))
+        enabled = bool(body.get("enabled"))
+        if bot in ("absence", "permission"):
+            key = "absence_bot_enabled" if bot == "absence" else "permission_bot_enabled"
+            cfg = load_config(); cfg[key] = enabled; save_config(cfg)
+            invalidate_config_cache()
+        elif bot == "excuse":
+            import urllib.request as _ur, json as _j
+            req = _ur.Request("http://localhost:3000/bot-toggle",
+                              data=_j.dumps({"enabled": enabled}).encode(),
+                              headers={"Content-Type": "application/json"}, method="POST")
+            _ur.urlopen(req, timeout=3)
+        else:
+            return JSONResponse({"ok": False, "msg": "بوت غير معروف"})
+        return JSONResponse({"ok": True, "bot": bot, "enabled": enabled})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)})
+
+
 @router.get("/web/whatsapp-connect", response_class=HTMLResponse)
 async def wa_connect_page(request: Request):
     """صفحة ربط واتساب — للمدير والوكيل فقط."""
@@ -10397,6 +10447,19 @@ async def wa_connect_page(request: Request):
   #spinner{display:none;width:28px;height:28px;border:3px solid #e2e8f0;
            border-top-color:#1565C0;border-radius:50%;animation:spin .7s linear infinite}
   @keyframes spin{to{transform:rotate(360deg)}}
+
+  /* بوتات الواتساب */
+  .bots{text-align:right;margin:14px 0;border-top:1px solid #e2e8f0;padding-top:14px}
+  .bots-h{font-weight:700;color:#1565C0;margin-bottom:10px;font-size:.92rem}
+  .bot-row{display:flex;align-items:center;justify-content:space-between;gap:10px;
+           padding:9px 12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;margin-bottom:8px}
+  .bot-info b{display:block;font-size:.85rem;color:#1f2937}
+  .bot-info small{color:#6b7280;font-size:.72rem}
+  .bot-tgl{padding:7px 14px;border:none;border-radius:8px;cursor:pointer;font-family:Tahoma;
+           font-weight:700;font-size:.8rem;min-width:98px;transition:opacity .2s}
+  .bot-tgl:hover{opacity:.85}.bot-tgl:disabled{opacity:.5;cursor:default}
+  .bot-on{background:#059669;color:#fff}
+  .bot-off{background:#e5e7eb;color:#64748b}
 </style>
 </head>
 <body>
@@ -10431,6 +10494,22 @@ async def wa_connect_page(request: Request):
     ٢- انتظر ظهور رمز QR (قد يستغرق دقيقة)<br>
     ٣- افتح واتساب ← الأجهزة المرتبطة ← ربط جهاز<br>
     ٤- امسح رمز QR الظاهر أعلاه
+  </div>
+
+  <div class="bots" id="bots">
+    <div class="bots-h">🤖 البوتات التلقائية (تعمل عند اتصال الواتساب)</div>
+    <div class="bot-row">
+      <div class="bot-info"><b>بوت رسائل الغياب</b><small>يُرسل رسالة غياب لولي الأمر تلقائياً عند التسجيل</small></div>
+      <button class="bot-tgl bot-off" id="bot-absence" onclick="toggleBot('absence')">—</button>
+    </div>
+    <div class="bot-row">
+      <div class="bot-info"><b>بوت رسائل الاستئذان</b><small>يُرسل طلب موافقة لولي الأمر تلقائياً</small></div>
+      <button class="bot-tgl bot-off" id="bot-permission" onclick="toggleBot('permission')">—</button>
+    </div>
+    <div class="bot-row">
+      <div class="bot-info"><b>بوت ردود الأعذار</b><small>يردّ على أولياء الأمور ويقبل الأعذار عبر واتساب تلقائياً</small></div>
+      <button class="bot-tgl bot-off" id="bot-excuse" onclick="toggleBot('excuse')">—</button>
+    </div>
   </div>
 
   <a class="back" href="/web/dashboard">← العودة للوحة التحكم</a>
@@ -10586,9 +10665,39 @@ async function waReset(){
   schedulePoll(1000);
 }
 
+// ── البوتات التلقائية ──
+var BOTS={absence:false,permission:false,excuse:false};
+var BOT_NAMES={absence:'الغياب',permission:'الاستئذان',excuse:'الأعذار'};
+function renderBot(k){
+  var b=document.getElementById('bot-'+k); if(!b)return;
+  b.className='bot-tgl '+(BOTS[k]?'bot-on':'bot-off');
+  b.textContent=BOTS[k]?'🟢 مُشغّل':'⏸ موقوف';
+}
+async function loadBots(){
+  try{
+    var r=await fetch('/web/api/wa/bots'); var d=await r.json();
+    if(d.ok){ BOTS.absence=!!d.absence; BOTS.permission=!!d.permission; BOTS.excuse=!!d.excuse; }
+  }catch(e){}
+  renderBot('absence'); renderBot('permission'); renderBot('excuse');
+}
+async function toggleBot(k){
+  var b=document.getElementById('bot-'+k); var nv=!BOTS[k];
+  b.disabled=true; b.textContent='⏳...';
+  try{
+    var r=await fetch('/web/api/wa/bots/toggle',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({bot:k,enabled:nv})});
+    var d=await r.json();
+    if(d.ok){ BOTS[k]=nv; }
+    else { setMsg('تعذّر تغيير بوت '+BOT_NAMES[k]+': '+(d.msg||'')); }
+  }catch(e){ setMsg('خطأ في الاتصال ببوت '+BOT_NAMES[k]); }
+  b.disabled=false; renderBot(k);
+}
+
 // ابدأ فور تحميل الصفحة
 showSpinner(true); showQRDiv(false);
 poll();
+loadBots();
 </script>
 </body>
 </html>"""

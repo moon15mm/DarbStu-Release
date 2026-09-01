@@ -345,8 +345,9 @@ function sendTard(){
     m.className='msg '+(j.ok?'ok':'er');
   }).catch(function(){m.textContent='خطأ في الاتصال';m.className='msg er';});
 }
-// إقلاع
-setDay(0);
+// إقلاع — نفتح على اليوم الحالي (getDay: الأحد=0 .. السبت=6، مطابقٌ لترميز الخادم)؛
+// الجمعة/السبت (عطلة) نعرض الأحد. الإرسال الآلي يحسب يومه في الخادم لا من هنا.
+var _td = new Date().getDay(); setDay(_td > 4 ? 0 : _td);
 loadTard();
 setInterval(pollStatus, 7000);
 </script>
