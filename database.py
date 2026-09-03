@@ -393,12 +393,17 @@ def init_db():
         status TEXT NOT NULL,
         template_used TEXT,
         message_type TEXT NOT NULL DEFAULT 'absence',
+        detail TEXT DEFAULT '',
         created_at TEXT NOT NULL
     )""")
     # ترقية: أضف message_type إذا لم يكن موجوداً
     _ml_cols = {r[1] for r in cur.execute("PRAGMA table_info(messages_log)")}
     if "message_type" not in _ml_cols:
         cur.execute("ALTER TABLE messages_log ADD COLUMN message_type TEXT NOT NULL DEFAULT 'absence'")
+    # سبب الفشل. بدونه يعرف المدير أن الرسالة لم تصل ولا يعرف لماذا —
+    # ورقم مفقود يُعالَج بغير ما يُعالَج به انقطاع الواتساب.
+    if "detail" not in _ml_cols:
+        cur.execute("ALTER TABLE messages_log ADD COLUMN detail TEXT DEFAULT ''")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_log_date ON messages_log(date)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_log_student ON messages_log(student_id)")
 
@@ -2279,7 +2284,8 @@ def _detect_school_stage(all_sheets: dict) -> str:
     return get_school_stage()
 
 
-def import_students_from_excel_sheet2_format(xlsx_path: str) -> Dict[str, Any]:
+def import_students_from_excel_sheet2_format(xlsx_path: str,
+                                             dry_run: bool = False) -> Dict[str, Any]:
     """
     يستورد بيانات الطلاب من Excel — يدعم جميع الصيغ:
 
@@ -2523,7 +2529,12 @@ def import_students_from_excel_sheet2_format(xlsx_path: str) -> Dict[str, Any]:
         print("[NOOR-IMPORT] " + _n.replace("\n", " | "))
 
     data = {"classes": list(classes.values())}
-    _safe_write_json(STUDENTS_JSON, data)
+    # dry_run: تحليلٌ للمعاينة فقط — لا يُكتب شيء على القرص.
+    # بدونه كان كل تحليل يستبدل كشف الطلاب فوراً، والكشف المُحلَّل لا يحمل
+    # الأرقام الأكاديمية (الملف لا يعرفها)، فيضيع رقم كل طالب وتنفصل بصمته
+    # على جهاز الحضور. المعاينة تحتاج التحليل بلا كتابة.
+    if not dry_run:
+        _safe_write_json(STUDENTS_JSON, data)
 
     # تفاصيل كل رمز مجهول (العدد والفصول) لتعرضها نافذة الترميز —
     # المزوّد يقرّر بناءً على أعداد حقيقية لا على رمز مجرّد.
@@ -2599,15 +2610,305 @@ def import_noor_add_only(xlsx_path):
         except Exception:
             current = []
 
-    parsed = import_students_from_excel_sheet2_format(xlsx_path)   # يستبدل الملف مؤقّتاً
+    parsed = import_students_from_excel_sheet2_format(xlsx_path, dry_run=True)
     new_classes = (parsed or {}).get("classes", [])
 
     merged, added, kept = merge_students_add_only(current, new_classes)
-    save_students(merged)                     # يستعيد الملف بالكشف المدموج
+    save_students(merged)
     constants.STUDENTS_STORE = None
     assign_academic_numbers(force=False, year=2027)   # للجدد فقط
     return {"added": len(added), "kept": kept, "added_list": added,
             "notes": (parsed or {}).get("_notes", [])}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  استيراد نور بمعاينة — مع صون الأرقام الأكاديمية
+# ═══════════════════════════════════════════════════════════════
+# ملف نور لا يحمل الرقم الأكاديمي إطلاقاً. والمستورِد المعتاد يستبدل
+# الكشف بالكامل، فيمحو رقم كل طالب — وبصمات جهاز الحضور مربوطة بهذه
+# الأرقام، فيفقد الجهاز ارتباطه بالطلاب ويلزم رفعهم من جديد.
+# لذلك: نطابق بالهوية الوطنية، ونحمل سجلّ الطالب القائم كما هو إلى فصله
+# الجديد. لا يُولَّد رقمٌ إلا لمن لا رقم له (الجدد).
+
+def _index_students_by_id(classes):
+    """{الهوية: (سجل الطالب، فصله)} لكل طالب في الكشف."""
+    out = {}
+    for c in classes or []:
+        for s in c.get("students", []):
+            sid = str(s.get("id") or "").strip()
+            if sid:
+                out[sid] = (s, c)
+    return out
+
+
+def _norm_cls(name):
+    """اسم الفصل موحَّد المسافات — هو مفتاح المطابقة لا المعرّف.
+
+    معرّف الفصل قد يختلف بين ملفٍ وآخر (تغيّر ترميز المسار مثلاً) بينما
+    الصف نفسه لم يتغيّر، فالمقارنة بالمعرّف تُظهر المدرسة كلها «منقولة»
+    وتُنشئ فصلين بالاسم ذاته. الاسم هو ما تراه المدرسة وما تقصده بالصف.
+    """
+    return " ".join(str(name or "").split())
+
+
+def _read_current_classes():
+    if not os.path.exists(STUDENTS_JSON):
+        return []
+    try:
+        with open(STUDENTS_JSON, "r", encoding="utf-8-sig") as f:
+            return json.load(f).get("classes", []) or []
+    except Exception:
+        return []
+
+
+def plan_students_import(xlsx_path: str) -> Dict[str, Any]:
+    """
+    يقارن ملف نور بالكشف الحالي ويُرجع خطة التغييرات **دون كتابة شيء**.
+
+    يُرجع: moved (نُقلوا لصف آخر)، added (جدد)، removed (في الكشف وليسوا
+    في الملف)، unchanged، مع counts وملاحظات التحليل.
+    """
+    current = _read_current_classes()
+    parsed = import_students_from_excel_sheet2_format(xlsx_path, dry_run=True)
+    new_classes = (parsed or {}).get("classes", []) or []
+
+    cur_map = _index_students_by_id(current)
+    new_map = _index_students_by_id(new_classes)
+
+    moved, added, removed, unchanged = [], [], [], 0
+    for sid, (ns, nc) in new_map.items():
+        if sid in cur_map:
+            cs, cc = cur_map[sid]
+            if _norm_cls(cc.get("name")) != _norm_cls(nc.get("name")):
+                moved.append({
+                    "id": sid,
+                    "name": cs.get("name") or ns.get("name", ""),
+                    "academic_no": str(cs.get("academic_no") or ""),
+                    "from": cc.get("name", ""), "to": nc.get("name", ""),
+                })
+            else:
+                unchanged += 1
+        else:
+            added.append({"id": sid, "name": ns.get("name", ""),
+                          "to": nc.get("name", "")})
+
+    for sid, (cs, cc) in cur_map.items():
+        if sid not in new_map:
+            removed.append({"id": sid, "name": cs.get("name", ""),
+                            "academic_no": str(cs.get("academic_no") or ""),
+                            "from": cc.get("name", "")})
+
+    have_no = sum(1 for (s, _c) in cur_map.values()
+                  if str(s.get("academic_no") or "").strip())
+    return {
+        "moved": moved, "added": added, "removed": removed,
+        "unchanged": unchanged,
+        "counts": {
+            "current": len(cur_map), "in_file": len(new_map),
+            "moved": len(moved), "added": len(added),
+            "removed": len(removed), "unchanged": unchanged,
+            "academic_kept": have_no,
+        },
+        "stage": (parsed or {}).get("_stage", ""),
+        "notes": (parsed or {}).get("_notes") or [],
+        "unknown_levels": (parsed or {}).get("_unknown_levels") or {},
+    }
+
+
+def apply_students_import(xlsx_path: str, apply_moves: bool = True,
+                          add_new: bool = True, remove_missing: bool = False,
+                          generate_numbers: bool = True,
+                          year: int = 2027) -> Dict[str, Any]:
+    """
+    يطبّق خطة الاستيراد. الطالب القائم يُنقل بسجلّه كاملاً (رقمه الأكاديمي
+    وجوّاله) — لا يُعاد توليد رقمٍ لأحد أبداً. الجدد وحدهم يأخذون أرقاماً،
+    وذلك إن طُلب.
+    """
+    current = _read_current_classes()
+    parsed = import_students_from_excel_sheet2_format(xlsx_path, dry_run=True)
+    new_classes = (parsed or {}).get("classes", []) or []
+
+    cur_map = _index_students_by_id(current)
+    new_map = _index_students_by_id(new_classes)
+
+    # الفصول مفهرسة بالاسم لا بالمعرّف — وإلا نشأ فصلان بالاسم نفسه حين
+    # يختلف المعرّف بين الملف والكشف الحالي.
+    out = {}
+    order = []
+
+    def _slot(cid, name):
+        key = _norm_cls(name)
+        c = out.get(key)
+        if c is None:
+            c = {"id": cid, "name": name, "students": []}
+            out[key] = c
+            order.append(key)
+        return c
+
+    moved = added = dropped = 0
+    placed = set()
+
+    for sid, (ns, nc) in new_map.items():
+        if sid in cur_map:
+            cs, cc = cur_map[sid]
+            same = _norm_cls(cc.get("name")) == _norm_cls(nc.get("name"))
+            rec = dict(cs)                      # يحمل academic_no كما هو
+            if not str(rec.get("name") or "").strip():
+                rec["name"] = ns.get("name", "")
+            if not str(rec.get("phone") or "").strip():
+                rec["phone"] = ns.get("phone", "")
+            if same or apply_moves:
+                _slot(nc.get("id"), nc.get("name", ""))["students"].append(rec)
+                if not same:
+                    moved += 1
+            else:
+                _slot(cc.get("id"), cc.get("name", ""))["students"].append(rec)
+            placed.add(sid)
+        elif add_new:
+            _slot(nc.get("id"), nc.get("name", ""))["students"].append({
+                "id": ns.get("id"), "name": ns.get("name", ""),
+                "phone": ns.get("phone", ""),
+            })
+            added += 1
+            placed.add(sid)
+
+    for sid, (cs, cc) in cur_map.items():
+        if sid in placed:
+            continue
+        if remove_missing:
+            dropped += 1
+            continue
+        _slot(cc.get("id"), cc.get("name", ""))["students"].append(dict(cs))
+
+    merged = [out[k] for k in order]
+    if not merged:
+        raise ValueError("الخطة فارغة — أُلغي الاستيراد حفاظاً على الكشف الحالي")
+
+    save_students(merged)
+    constants.STUDENTS_STORE = None
+
+    assigned = 0
+    if generate_numbers:
+        assigned = assign_academic_numbers(force=False, year=year).get("assigned", 0)
+
+    total = sum(len(c.get("students") or []) for c in merged)
+    return {"moved": moved, "added": added, "removed": dropped,
+            "numbers_generated": assigned, "total": total,
+            "notes": (parsed or {}).get("_notes") or []}
+
+
+def move_or_update_student(student_id, new_class_id=None, name=None, phone=None):
+    """
+    يعدّل بيانات طالب و/أو ينقله لفصل آخر.
+
+    السجلّ يُنقل كما هو، فالرقم الأكاديمي يرافق الطالب ولا يُعاد توليده —
+    بصمته على جهاز الحضور مربوطة به.
+    """
+    store = load_students(force_reload=True)
+    classes = store.get("list", []) or []
+    sid = str(student_id).strip()
+
+    src = rec = None
+    for c in classes:
+        for s in c.get("students", []):
+            if str(s.get("id")).strip() == sid:
+                src, rec = c, s
+                break
+        if rec is not None:
+            break
+    if rec is None:
+        return {"ok": False, "msg": "الطالب غير موجود"}
+
+    if name is not None and str(name).strip():
+        rec["name"] = str(name).strip()
+    if phone is not None:
+        rec["phone"] = str(phone).strip()
+
+    moved_to = ""
+    if new_class_id and str(new_class_id) != str(src.get("id")):
+        tgt = next((c for c in classes
+                    if str(c.get("id")) == str(new_class_id)), None)
+        if tgt is None:
+            return {"ok": False, "msg": "الفصل المطلوب غير موجود"}
+        src["students"] = [s for s in src.get("students", [])
+                           if str(s.get("id")).strip() != sid]
+        tgt.setdefault("students", []).append(rec)
+        moved_to = tgt.get("name", "")
+
+    save_students(classes)
+    constants.STUDENTS_STORE = None
+    return {"ok": True, "moved_to": moved_to,
+            "academic_no": str(rec.get("academic_no") or "")}
+
+
+# ── سجلّات المعلمين (teachers.json) ──────────────────────────────
+def _teachers_list():
+    return list((load_teachers() or {}).get("teachers") or [])
+
+
+def _write_teachers(teachers):
+    ensure_dirs()
+    with open(TEACHERS_JSON, "w", encoding="utf-8") as f:
+        json.dump({"teachers": teachers}, f, ensure_ascii=False, indent=2)
+    return True
+
+
+def _teacher_name(t):
+    return str(t.get("اسم المعلم") or t.get("full_name") or "").strip()
+
+
+def save_teacher_record(name, phone="", subject="", national_id="", original=""):
+    """
+    يضيف معلماً أو يعدّل قائماً. المفتاح هو الاسم (أو `original` عند إعادة
+    التسمية)، لأن جدول الحصص وروابط الفصول تُطابِق بالاسم.
+    """
+    name = str(name or "").strip()
+    if not name:
+        return {"ok": False, "msg": "اسم المعلم مطلوب"}
+    original = str(original or "").strip()
+
+    teachers = _teachers_list()
+
+    # التمييز بين الإضافة والتعديل بحقل `original` وحده. لو اعتُبر الاسم
+    # نفسه مفتاحاً للتعديل، لكانت «إضافة» معلمٍ باسمٍ قائم تكتب فوق سجلّه
+    # وتمحو جواله وتخصصه بصمت بدل أن تُرفض.
+    if original:
+        hit = next((t for t in teachers if _teacher_name(t) == original), None)
+        if hit is None:
+            return {"ok": False, "msg": "المعلم غير موجود"}
+        if name != original and any(_teacher_name(t) == name for t in teachers):
+            return {"ok": False, "msg": "يوجد معلم بهذا الاسم بالفعل"}
+        created = False
+    else:
+        # الاسم المكرّر يربك مطابقة الحصص وروابط الفصول — نمنعه
+        if any(_teacher_name(t) == name for t in teachers):
+            return {"ok": False, "msg": "يوجد معلم بهذا الاسم بالفعل"}
+        hit = {}
+        teachers.append(hit)
+        created = True
+
+    hit["اسم المعلم"] = name
+    hit["رقم الجوال"] = str(phone or "").strip()
+    hit["التخصص"] = str(subject or "").strip()
+    if str(national_id or "").strip():
+        hit["رقم الهوية"] = str(national_id).strip()
+    hit["full_name"] = name
+    hit["phone"] = str(phone or "").strip()
+
+    _write_teachers(teachers)
+    return {"ok": True, "created": created, "count": len(teachers)}
+
+
+def delete_teacher_record(name):
+    name = str(name or "").strip()
+    if not name:
+        return {"ok": False, "msg": "الاسم مطلوب"}
+    teachers = _teachers_list()
+    rest = [t for t in teachers if _teacher_name(t) != name]
+    if len(rest) == len(teachers):
+        return {"ok": False, "msg": "المعلم غير موجود"}
+    _write_teachers(rest)
+    return {"ok": True, "count": len(rest)}
 
 
 def set_noor_level_mapping(code: str, digit: str, name: str) -> bool:

@@ -16,6 +16,17 @@ if sys.platform == 'win32':
     except Exception:
         pass
 
+# ─── ترميز المخرجات utf-8 — تفادياً لـ UnicodeEncodeError ─────────
+# stdout/stderr في الـ thread الرئيسي قد يكونان بترميز ويندوز العربي
+# (cp1256) الذي لا يشفّر الإيموجي (⚠️ ✅) ولا بعض المحارف، فتفشل أي
+# طباعة عربية/رمزية (مثلاً رسائل tunnel_manager عند بدء النفق) وتُسجَّل
+# UnicodeEncodeError في error.log. نضبطه مرة واحدة هنا قبل أي طباعة.
+try:
+    if sys.stdout: sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    if sys.stderr: sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 # ─── منع ازدواجية التطبيق ────────────────────────────────────────
 # كان القفل يحجز منفذاً ثابتاً (59124) ويعتبر أي فشل في الحجز «نسخة
 # تعمل». وهذا يُنتج إنذاراً كاذباً يمنع تشغيل البرنامج نهائياً كلما:

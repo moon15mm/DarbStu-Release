@@ -78,25 +78,103 @@ def build_absent_groups(date_str: str) -> Dict[str, Dict[str, Any]]:
         v["students"].sort(key=lambda s: s["name"])
     return grouped
 
-def log_message_status(date_str: str, student_id: str, student_name: str, class_id: str, class_name: str, phone: str, status: str, template_used: str, message_type: str = 'absence'):
+def log_message_status(date_str: str, student_id: str, student_name: str, class_id: str, class_name: str, phone: str, status: str, template_used: str, message_type: str = 'absence', detail: str = ''):
     client = get_cloud_client()
     if client.is_active():
         client.post("/web/api/messages-log/create", {
             "date": date_str, "student_id": student_id, "student_name": student_name,
             "class_id": class_id, "class_name": class_name, "phone": phone, "status": status,
-            "template_used": template_used, "message_type": message_type
+            "template_used": template_used, "message_type": message_type,
+            "detail": detail
         })
         return
 
     con = get_db(); cur = con.cursor()
-    cur.execute("""
-        INSERT INTO messages_log(date, student_id, student_name, class_id, class_name, phone, status, template_used, message_type, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        date_str, student_id, student_name, class_id, class_name, phone, status,
-        template_used, message_type, datetime.datetime.utcnow().isoformat()
-    ))
+    now = datetime.datetime.utcnow().isoformat()
+    full = ("""INSERT INTO messages_log(date, student_id, student_name, class_id, class_name, phone, status, template_used, message_type, detail, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (date_str, student_id, student_name, class_id, class_name, phone,
+             status, template_used, message_type, detail, now))
+    try:
+        cur.execute(*full)
+    except sqlite3.OperationalError as e:
+        # قاعدة لم تمرّ بترقية عمود detail بعد (init_db يُستدعى من main وحده).
+        # لو تركناه يسقط لظلّ التسجيل يفشل صامتاً وبقي التقرير فارغاً أبداً،
+        # فنضيف العمود هنا ونُعيد المحاولة، وإلا سجّلنا بلا تفصيل.
+        if "detail" not in str(e).lower():
+            con.close(); raise
+        try:
+            cur.execute("ALTER TABLE messages_log ADD COLUMN detail TEXT DEFAULT ''")
+            cur.execute(*full)
+        except Exception:
+            cur.execute("""
+                INSERT INTO messages_log(date, student_id, student_name, class_id, class_name, phone, status, template_used, message_type, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (date_str, student_id, student_name, class_id, class_name,
+                  phone, status, template_used, message_type, now))
     con.commit(); con.close()
+
+
+def query_messages_report(date_from: str = None, date_to: str = None,
+                          message_type: str = "", class_id: str = "",
+                          status: str = "", limit: int = 1000):
+    """
+    تقرير الرسائل المُرسَلة خلال مدة — مع ملخّص حسب النوع والحالة واليوم.
+
+    `status` في السجلّات القديمة كان يحمل نصوصاً متفرّقة، فنعتبر كل ما ليس
+    فشلاً صريحاً ناجحاً حتى لا تختفي الرسائل القديمة من التقرير.
+    """
+    if not date_to:
+        date_to = now_riyadh_date()
+    if not date_from:
+        date_from = date_to
+
+    client = get_cloud_client()
+    if client.is_active():
+        res = client.get("/web/api/messages-report", params={
+            "date_from": date_from, "date_to": date_to,
+            "message_type": message_type, "class_id": class_id, "status": status})
+        if res.get("ok"):
+            return res
+
+    con = get_db(); con.row_factory = sqlite3.Row; cur = con.cursor()
+    sql = ["SELECT * FROM messages_log WHERE date BETWEEN ? AND ?"]
+    args = [date_from, date_to]
+    if message_type:
+        sql.append("AND message_type = ?"); args.append(message_type)
+    if class_id:
+        sql.append("AND class_id = ?"); args.append(class_id)
+    sql.append("ORDER BY date DESC, id DESC")
+    rows = [dict(r) for r in cur.execute(" ".join(sql), args).fetchall()]
+    con.close()
+
+    def _ok(r):
+        return str(r.get("status") or "").strip().lower() not in ("failed", "fail", "error", "")
+
+    if status == "success":
+        rows = [r for r in rows if _ok(r)]
+    elif status == "failed":
+        rows = [r for r in rows if not _ok(r)]
+
+    summary = {"total": len(rows), "success": 0, "failed": 0}
+    for key in ("absence", "tardiness", "other"):
+        summary[key] = {"total": 0, "success": 0, "failed": 0}
+    days = {}
+    for r in rows:
+        good = _ok(r)
+        summary["success" if good else "failed"] += 1
+        mt = r.get("message_type") or "absence"
+        key = mt if mt in ("absence", "tardiness") else "other"
+        summary[key]["total"] += 1
+        summary[key]["success" if good else "failed"] += 1
+        d = days.setdefault(r.get("date", ""), {"date": r.get("date", ""),
+                                                "success": 0, "failed": 0})
+        d["success" if good else "failed"] += 1
+
+    return {"ok": True, "summary": summary,
+            "days": sorted(days.values(), key=lambda x: x["date"], reverse=True),
+            "rows": rows[:limit], "truncated": len(rows) > limit,
+            "date_from": date_from, "date_to": date_to}
 
 def query_today_messages(date_str: str = None) -> List[Dict[str, Any]]:
     if not date_str:

@@ -427,6 +427,21 @@ async def web_add_excuse(req: Request):
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 
 
+def _log_msg(date_str, sid, sname, cid, cname, phone, ok, mtype, detail=""):
+    """
+    يسجّل محاولة إرسال في سجلّ الرسائل — ناجحةً كانت أو فاشلة.
+
+    مغلَّفٌ بـ try/except لأن الإرسال هو الأصل: عطبٌ في التسجيل يجب ألا
+    يوقف رسائل بقية أولياء الأمور.
+    """
+    try:
+        log_message_status(date_str, sid, sname, cid, cname, phone,
+                           "Success" if ok else "Failed",
+                           mtype, mtype, detail=str(detail or "")[:300])
+    except Exception as e:
+        print(f"[MSG-LOG] تعذّر تسجيل الرسالة: {e}")
+
+
 @router.post("/web/api/send-absence-messages", response_class=JSONResponse)
 async def web_send_absence_messages(req: Request):
     user = _get_current_user(req)
@@ -465,9 +480,13 @@ async def web_send_absence_messages(req: Request):
             sid   = str(stu.get("student_id", ""))
             sname = stu.get("student_name", "")
             cname = stu.get("class_name", "")
+            cid   = str(stu.get("class_id", "") or "")
             phone = phone_map.get(sid, "")
             if not phone:
-                failed += 1; continue
+                failed += 1
+                _log_msg(date_str, sid, sname, cid, cname, "", False,
+                         "absence", "لا يوجد رقم جوال لولي الأمر")
+                continue
 
             msg = template.format(
                 school_name=school,
@@ -475,11 +494,13 @@ async def web_send_absence_messages(req: Request):
                 class_name=cname,
                 date=date_str)
 
-            ok, _ = send_whatsapp_message(phone, msg, student_data={
+            ok, wstatus = send_whatsapp_message(phone, msg, student_data={
                 "student_id": sid, "student_name": sname,
                 "class_name": cname, "date": date_str}, humanize=True)
             if ok: sent += 1
             else:  failed += 1
+            _log_msg(date_str, sid, sname, cid, cname, phone, ok,
+                     "absence", "" if ok else str(wstatus or ""))
 
         return JSONResponse({"ok": True, "sent": sent, "failed": failed})
     except Exception as e:
@@ -523,19 +544,25 @@ async def web_send_tardiness_messages(req: Request):
             sid   = str(stu.get("student_id", ""))
             sname = stu.get("student_name", "")
             cname = stu.get("class_name", "")
+            cid   = str(stu.get("class_id", "") or "")
             mins  = stu.get("minutes_late", 0)
             phone = phone_map.get(sid, "")
             if not phone:
-                failed += 1; continue
+                failed += 1
+                _log_msg(date_str, sid, sname, cid, cname, "", False,
+                         "tardiness", "لا يوجد رقم جوال لولي الأمر")
+                continue
 
             from config_manager import render_template
             msg = render_template(
                 template, student_name=sname, class_name=cname,
                 date=date_str, minutes_late=mins)
 
-            ok, _ = send_whatsapp_message(phone, msg, humanize=True)
+            ok, wstatus = send_whatsapp_message(phone, msg, humanize=True)
             if ok: sent += 1
             else:  failed += 1
+            _log_msg(date_str, sid, sname, cid, cname, phone, ok,
+                     "tardiness", "" if ok else str(wstatus or ""))
 
         return JSONResponse({"ok": True, "sent": sent, "failed": failed})
     except Exception as e:
@@ -645,6 +672,141 @@ async def web_update_students(req: Request):
         return JSONResponse({"ok": True})
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+@router.post("/web/api/students/update", response_class=JSONResponse)
+async def web_student_update(request: Request):
+    """تعديل بيانات طالب أو نقله لصف/فصل آخر — الرقم الأكاديمي لا يُمَس."""
+    user = _get_current_user(request)
+    if not user or user.get("role") not in ("admin", "deputy"):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        body = await request.json()
+        sid = str(body.get("student_id") or "").strip()
+        if not sid:
+            return JSONResponse({"ok": False, "msg": "رقم الطالب مفقود"})
+        from database import move_or_update_student
+        res = move_or_update_student(
+            sid,
+            new_class_id=body.get("class_id"),
+            name=body.get("name"),
+            phone=body.get("phone"),
+        )
+        if res.get("ok"):
+            load_students(force_reload=True)
+        return JSONResponse(res)
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+@router.post("/web/api/teachers/save", response_class=JSONResponse)
+async def web_teachers_save(request: Request):
+    """إضافة معلم يدوياً أو تعديل بياناته."""
+    user = _get_current_user(request)
+    if not user or user.get("role") not in ("admin", "deputy"):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        body = await request.json()
+        from database import save_teacher_record
+        return JSONResponse(save_teacher_record(
+            name=body.get("name", ""),
+            phone=body.get("phone", ""),
+            subject=body.get("subject", ""),
+            national_id=body.get("national_id", ""),
+            original=body.get("original", ""),
+        ))
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+@router.post("/web/api/teachers/delete", response_class=JSONResponse)
+async def web_teachers_delete(request: Request):
+    user = _get_current_user(request)
+    if not user or user.get("role") not in ("admin", "deputy"):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        body = await request.json()
+        from database import delete_teacher_record
+        return JSONResponse(delete_teacher_record(body.get("name", "")))
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+# ── استيراد نور بمعاينة ──────────────────────────────────────────
+# الملف المرفوع يُحفظ مؤقتاً ويُعطى رمزاً؛ المعاينة لا تكتب شيئاً، والتطبيق
+# يُعيد حساب الخطة من الملف نفسه فلا تتباعد المعاينة عمّا يُنفَّذ فعلاً.
+_IMPORT_PENDING = {}
+
+
+def _clear_pending_imports():
+    for _t, _p in list(_IMPORT_PENDING.items()):
+        try:
+            os.unlink(_p)
+        except Exception:
+            pass
+        _IMPORT_PENDING.pop(_t, None)
+
+
+@router.post("/web/api/import-students/preview", response_class=JSONResponse)
+async def web_import_preview(request: Request):
+    """يحلّل ملف نور ويُرجع التغييرات المتوقّعة — دون كتابة أي شيء."""
+    user = _get_current_user(request)
+    if not user or user.get("role") not in ("admin", "deputy"):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        import tempfile, secrets as _secrets
+        form = await request.form()
+        upload = form.get("file")
+        if not upload:
+            return JSONResponse({"ok": False, "msg": "لم يتم رفع ملف"})
+        fn = getattr(upload, "filename", "") or ""
+        suffix = ".xls" if fn.lower().endswith(".xls") else ".xlsx"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix,
+                                          prefix="stu_prev_")
+        tmp.write(await upload.read())
+        tmp.close()
+
+        from database import plan_students_import
+        plan = plan_students_import(tmp.name)
+
+        _clear_pending_imports()
+        token = _secrets.token_urlsafe(16)
+        _IMPORT_PENDING[token] = tmp.name
+        return JSONResponse({"ok": True, "token": token, **plan})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+@router.post("/web/api/import-students/apply", response_class=JSONResponse)
+async def web_import_apply(request: Request):
+    """يطبّق الخطة المعروضة. الأرقام الأكاديمية القائمة تُصان دائماً."""
+    user = _get_current_user(request)
+    if not user or user.get("role") not in ("admin", "deputy"):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        body = await request.json()
+        token = str(body.get("token") or "")
+        path = _IMPORT_PENDING.get(token)
+        if not path or not os.path.exists(path):
+            return JSONResponse({"ok": False,
+                                 "msg": "انتهت صلاحية المعاينة — أعد رفع الملف"})
+        from database import apply_students_import
+        res = apply_students_import(
+            path,
+            apply_moves=bool(body.get("apply_moves", True)),
+            add_new=bool(body.get("add_new", True)),
+            remove_missing=bool(body.get("remove_missing", False)),
+            generate_numbers=bool(body.get("generate_numbers", True)),
+        )
+        _IMPORT_PENDING.pop(token, None)
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+        load_students(force_reload=True)
+        return JSONResponse({"ok": True, **res})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
 
 @router.get("/web/api/classes", response_class=JSONResponse)
 async def web_classes(request: Request):
@@ -1520,11 +1682,29 @@ async def api_create_msg_log(req: Request):
         log_message_status(
             data["date"], data["student_id"], data["student_name"],
             data["class_id"], data["class_name"], data["phone"],
-            data["status"], data["template_used"], data.get("message_type", "absence")
+            data["status"], data["template_used"], data.get("message_type", "absence"),
+            detail=data.get("detail", "")
         )
         return JSONResponse({"ok": True})
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+@router.get("/web/api/messages-report", response_class=JSONResponse)
+async def api_messages_report(request: Request, date_from: str = None,
+                              date_to: str = None, message_type: str = "",
+                              class_id: str = "", status: str = ""):
+    """تقرير الرسائل المُرسَلة (غياب/تأخر) خلال مدة مع ملخّص."""
+    user = _get_current_user(request)
+    if not user:
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=401)
+    try:
+        from alerts_service import query_messages_report
+        return JSONResponse(query_messages_report(
+            date_from=date_from, date_to=date_to,
+            message_type=message_type, class_id=class_id, status=status))
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
 
 @router.get("/web/api/messages-log", response_class=JSONResponse)
 async def api_get_msg_log(request: Request, date: str):
@@ -1677,6 +1857,7 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
             ("تقرير الإدارة",       "admin_report",         "fas fa-user-tie"),
             ("تحليل طالب",          "student_analysis",     "fas fa-search"),
             ("أكثر الطلاب غياباً", "top_absent",           "fas fa-award"),
+            ("تقرير الرسائل",       "messages_report",      "fas fa-comment-dots"),
             ("الإشعارات الذكية",    "alerts",               "fas fa-exclamation-triangle"),
             ("تقارير المعلمين",     "teacher_reports_admin","fas fa-file-pdf"),
             ("تقارير المدرسة",      "school_reports",       "fas fa-folder-open"),
@@ -1693,6 +1874,7 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
         ]),
         ("إدارة البيانات", [
             ("إدارة الطلاب",        "student_mgmt",         "fas fa-graduation-cap"),
+            ("إدارة المعلمين",      "teachers_mgmt",        "fas fa-chalkboard-teacher"),
             ("إضافة طالب",          "add_student",          "fas fa-user-plus"),
             ("إدارة الفصول",        "class_naming",         "fas fa-school"),
             ("إدارة الجوالات",      "phones",               "fas fa-mobile-alt"),
@@ -2669,8 +2851,60 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
     </div>
     <div id="sm-sum" style="margin-bottom:10px"></div>
     <div class="tw"><table>
-      <thead><tr><th>رقم الهوية</th><th>الاسم</th><th>الصف</th><th>الفصل</th><th>الجوال</th><th>تعديل</th></tr></thead>
+      <thead><tr><th>رقم الهوية</th><th>الرقم الأكاديمي</th><th>الاسم</th><th>الصف / الفصل</th><th>الجوال</th><th>تعديل</th></tr></thead>
       <tbody id="sm-table"></tbody></table></div>
+  </div>
+</div>
+
+<div id="tab-messages_report">
+  <h2 class="pt"><i class="fas fa-comment-dots"></i> تقرير الرسائل المُرسَلة</h2>
+  <div class="section">
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+      <div class="fg"><label class="fl">من تاريخ</label><input type="date" id="mr-from"></div>
+      <div class="fg"><label class="fl">إلى تاريخ</label><input type="date" id="mr-to"></div>
+      <div class="fg"><label class="fl">النوع</label><select id="mr-type">
+        <option value="">الكل</option><option value="absence">الغياب</option>
+        <option value="tardiness">التأخر</option></select></div>
+      <div class="fg"><label class="fl">الحالة</label><select id="mr-status">
+        <option value="">الكل</option><option value="success">ناجحة</option>
+        <option value="failed">فاشلة</option></select></div>
+      <div class="fg"><label class="fl">الفصل</label><select id="mr-cls"><option value="">الكل</option></select></div>
+      <button class="btn bp1" onclick="loadMsgReport()">🔍 عرض</button>
+      <button class="btn bp2" onclick="printMsgReport()">🖨️ طباعة</button>
+    </div>
+    <div style="margin-top:8px;font-size:12px;color:#6B7280">
+      اختصارات: <a href="#" onclick="mrQuick(0);return false">اليوم</a> ·
+      <a href="#" onclick="mrQuick(6);return false">آخر ٧ أيام</a> ·
+      <a href="#" onclick="mrQuick(29);return false">آخر ٣٠ يوماً</a>
+    </div>
+    <div id="mr-st" style="margin-top:10px"></div>
+  </div>
+  <div id="mr-out"></div>
+</div>
+
+<div id="tab-teachers_mgmt">
+  <h2 class="pt"><i class="fas fa-chalkboard-teacher"></i> إدارة المعلمين</h2>
+  <div class="section">
+    <h3 style="margin:0 0 10px;color:#0C2E56;font-size:15px">➕ إضافة معلم / تعديل بياناته</h3>
+    <div class="fg2">
+      <div class="fg"><label class="fl">اسم المعلم</label><input type="text" id="tm-name" placeholder="الاسم الكامل"></div>
+      <div class="fg"><label class="fl">رقم الجوال</label><input type="tel" id="tm-phone" placeholder="05xxxxxxxx"></div>
+      <div class="fg"><label class="fl">التخصص</label><input type="text" id="tm-subject" placeholder="رياضيات"></div>
+      <div class="fg"><label class="fl">رقم الهوية (اختياري)</label><input type="text" id="tm-nid" placeholder="10xxxxxxxx"></div>
+    </div>
+    <input type="hidden" id="tm-orig">
+    <button class="btn bp1" onclick="saveTeacherRec()">💾 حفظ</button>
+    <button class="btn bp2" onclick="resetTeacherForm()">مسح الحقول</button>
+    <div id="tm-st" style="margin-top:10px"></div>
+  </div>
+  <div class="section">
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px">
+      <div class="fg" style="flex:1;min-width:200px"><label class="fl">بحث</label><input type="text" id="tm-q" placeholder="اسم أو تخصص..." oninput="renderTeachersTbl()"></div>
+      <div id="tm-sum"></div>
+    </div>
+    <div class="tw"><table>
+      <thead><tr><th>#</th><th>اسم المعلم</th><th>الجوال</th><th>التخصص</th><th>إجراءات</th></tr></thead>
+      <tbody id="tm-table"></tbody></table></div>
   </div>
 </div>
 
@@ -2706,12 +2940,30 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
     <div class="section">
       <div class="ab ai">📌 صدّر ملف الطلاب من نظام نور ثم ارفعه هنا</div>
       <input type="file" id="as-noor-file" accept=".xlsx,.xls">
-      <label style="display:block;margin-top:9px;font-size:13px;color:#33475F">
-        <input type="checkbox" id="as-noor-merge" style="vertical-align:middle">
-        إضافة فقط (للأول ثانوي الجدد) — يضيف غير الموجودين بالهوية، ولا يستبدل الموجودين ولا يمسّ بياناتهم أو أرقامهم الأكاديمية
-      </label>
-      <button class="btn bp1" style="margin-top:12px" onclick="importNoor()">📥 استيراد من نور</button>
+      <button class="btn bp1" style="margin-top:12px" onclick="previewNoor()">🔍 معاينة التغييرات قبل الاستيراد</button>
       <div id="as-noor-st" style="margin-top:10px"></div>
+    </div>
+    <div id="np-wrap" class="section" style="display:none">
+      <h3 style="margin:0 0 10px;color:#0C2E56;font-size:15px">📋 التغييرات المتوقّعة</h3>
+      <div id="np-sum" style="display:flex;gap:7px;flex-wrap:wrap;margin-bottom:12px"></div>
+      <div class="ab ai" style="margin-bottom:12px">
+        🔒 <b>الأرقام الأكاديمية المولّدة سابقاً لا تُمَس.</b> كل طالب يحتفظ برقمه أينما نُقل،
+        فتبقى بصمات جهاز الحضور مرتبطة به. التوليد يقع على <b>الطلاب الجدد فقط</b>.
+      </div>
+      <div id="np-lists"></div>
+      <div style="margin-top:14px;padding-top:12px;border-top:1px solid #E5E9F0">
+        <label style="display:block;margin-bottom:7px;font-size:13px">
+          <input type="checkbox" id="np-moves" checked style="vertical-align:middle"> نقل الطلاب إلى صفوفهم الجديدة</label>
+        <label style="display:block;margin-bottom:7px;font-size:13px">
+          <input type="checkbox" id="np-add" checked style="vertical-align:middle"> إضافة الطلاب الجدد</label>
+        <label style="display:block;margin-bottom:7px;font-size:13px">
+          <input type="checkbox" id="np-gen" checked style="vertical-align:middle"> توليد أرقام أكاديمية <b>للجدد فقط</b></label>
+        <label style="display:block;margin-bottom:10px;font-size:13px;color:#B91C1C">
+          <input type="checkbox" id="np-rm" style="vertical-align:middle"> حذف من ليسوا في الملف (غير موصى به)</label>
+        <button class="btn bp1" onclick="applyNoorImport()">✅ تطبيق الاستيراد</button>
+        <button class="btn bp2" onclick="cancelNoorImport()">إلغاء</button>
+        <div id="np-st" style="margin-top:10px"></div>
+      </div>
     </div>
   </div>
 </div>
@@ -3938,8 +4190,10 @@ function showTab(key){
     'admin_report':generateAdminReport,
     'student_analysis':function(){fillSel('an-class');},
     'top_absent':loadTopAbsent,'alerts':loadAlerts,
+    'messages_report':function(){fillSel('mr-cls');mrQuick(6);},
     'new_permission':function(){loadClasses();loadTodayPerms();},
     'student_mgmt':function(){loadStudents();fillSel('sm-cls');},
+    'teachers_mgmt':loadTeachersMgmt,
     'add_student':function(){fillSel('as-cls');},
     'class_naming':loadClassList,
     'phones':function(){loadStudents();fillSel('ph-cls');},
@@ -4833,9 +5087,64 @@ function filterStudents(){
 function renderStuTbl(arr){
   var tb=document.getElementById('sm-table');if(!tb)return;
   tb.innerHTML=arr.slice(0,200).map(function(s){
-    return '<tr><td>'+s.id+'</td><td>'+s.name+'</td><td>'+(s.level||'-')+'</td><td>'+s.class_name+'</td>'+
-           '<td>'+(s.phone||'—')+'</td><td><button class="btn bp2 bsm" onclick="editPhone(\''+s.id+'\')">✏️ تعديل</button></td></tr>';
+    var sid=String(s.id).replace(/'/g,"\\'");
+    return '<tr><td>'+s.id+'</td>'+
+           '<td>'+(s.academic_no?('<b>'+s.academic_no+'</b>'):'—')+'</td>'+
+           '<td>'+s.name+'</td><td>'+s.class_name+'</td>'+
+           '<td>'+(s.phone||'—')+'</td>'+
+           '<td><button class="btn bp2 bsm" onclick="editStudent(\''+sid+'\')">✏️ تعديل</button></td></tr>';
   }).join('')||'<tr><td colspan="6" style="color:#9CA3AF">لا يوجد</td></tr>';
+}
+/* تعديل بيانات الطالب ونقله بين الصفوف — الرقم الأكاديمي يرافقه ولا يتغيّر */
+async function editStudent(id){
+  var s=null,all=window._students||[];
+  for(var i=0;i<all.length;i++){if(String(all[i].id)===String(id)){s=all[i];break;}}
+  if(!s){alert('الطالب غير موجود');return;}
+  var d=await api('/web/api/classes');
+  var classes=(d&&d.ok)?(d.classes||[]):[];
+  var opts=classes.map(function(c){
+    return '<option value="'+c.id+'"'+(String(c.id)===String(s.class_id)?' selected':'')+'>'+c.name+'</option>';
+  }).join('');
+  var old=document.getElementById('se-modal');if(old)old.remove();
+  var ov=document.createElement('div');
+  ov.id='se-modal';
+  ov.style.cssText='position:fixed;inset:0;background:rgba(12,46,86,.55);z-index:9999;'+
+    'display:flex;align-items:center;justify-content:center;padding:16px';
+  ov.innerHTML='<div style="background:#fff;border-radius:14px;max-width:440px;width:100%;'+
+    'padding:20px;box-shadow:0 20px 50px rgba(0,0,0,.3);max-height:90vh;overflow:auto">'+
+    '<h3 style="margin:0 0 14px;color:#0C2E56;font-size:16px">✏️ تعديل بيانات الطالب</h3>'+
+    '<div class="fg"><label class="fl">الاسم</label>'+
+      '<input type="text" id="se-name" value="'+String(s.name||'').replace(/"/g,'&quot;')+'"></div>'+
+    '<div class="fg" style="margin-top:9px"><label class="fl">الصف / الفصل</label>'+
+      '<select id="se-cls">'+opts+'</select></div>'+
+    '<div class="fg" style="margin-top:9px"><label class="fl">جوال ولي الأمر</label>'+
+      '<input type="tel" id="se-phone" value="'+String(s.phone||'')+'"></div>'+
+    '<div style="margin-top:12px;font-size:12px;color:#475569;background:#F1F5F9;'+
+      'padding:9px 11px;border-radius:8px">🔒 الرقم الأكاديمي <b>'+(s.academic_no||'—')+
+      '</b> يبقى كما هو ولا يُعاد توليده — بصمة الجهاز مربوطة به.</div>'+
+    '<div id="se-st" style="margin-top:10px;font-size:13px"></div>'+
+    '<div style="display:flex;gap:8px;margin-top:14px">'+
+      '<button class="btn bp1" onclick="saveStudentEdit(\''+String(id).replace(/'/g,"\\'")+'\')">💾 حفظ</button>'+
+      '<button class="btn bp2" onclick="document.getElementById(\'se-modal\').remove()">إلغاء</button>'+
+    '</div></div>';
+  ov.addEventListener('click',function(e){if(e.target===ov)ov.remove();});
+  document.body.appendChild(ov);
+}
+async function saveStudentEdit(id){
+  var st=document.getElementById('se-st');
+  st.textContent='⏳ جارٍ الحفظ...';
+  try{
+    var r=await fetch('/web/api/students/update',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({student_id:id,
+        name:document.getElementById('se-name').value,
+        class_id:document.getElementById('se-cls').value,
+        phone:document.getElementById('se-phone').value})});
+    var d=await r.json();
+    if(!d.ok){st.textContent='❌ '+(d.msg||'خطأ');return;}
+    var m=document.getElementById('se-modal');if(m)m.remove();
+    loadStudents();
+  }catch(e){st.textContent='❌ خطأ في الاتصال';}
 }
 function renderPhoTbl(arr){
   var tb=document.getElementById('ph-table');if(!tb)return;
@@ -4859,9 +5168,9 @@ var _US_ALL_TABS = [
   'لوحة المراقبة','المراقبة الحية','روابط الفصول','تسجيل الغياب','تسجيل التأخر',
   'طلب استئذان','سجل الغياب','سجل التأخر','الأعذار','الاستئذان','إدارة الغياب',
   'الموجّه الطلابي','استلام تحويلات','التقارير / الطباعة','تقرير الفصل','تقرير الإدارة',
-  'تحليل طالب','أكثر الطلاب غياباً','الإشعارات الذكية','إرسال رسائل الغياب',
+  'تحليل طالب','أكثر الطلاب غياباً','تقرير الرسائل','الإشعارات الذكية','إرسال رسائل الغياب',
   'إرسال رسائل التأخر','روابط بوابة أولياء الأمور','التعاميم والنشرات','قصص المدرسة',
-  'تعزيز الحضور الأسبوعي','لوحة الصدارة (النقاط)','إدارة الطلاب','إضافة طالب',
+  'تعزيز الحضور الأسبوعي','لوحة الصدارة (النقاط)','إدارة الطلاب','إدارة المعلمين','إضافة طالب',
   'إدارة الفصول','إدارة الجوالات','الطلاب المستثنون','نشر النتائج','تصدير نور',
   'زيارات أولياء الأمور','تحويل طالب','نماذج المعلم','تحليل النتائج',
   'إعدادات المدرسة','المستخدمون','النسخ الاحتياطية','شواهد الأداء'
@@ -4870,9 +5179,9 @@ var _US_ROLE_DEFAULTS = {
   deputy:['لوحة المراقبة','المراقبة الحية','روابط الفصول','تسجيل الغياب','تسجيل التأخر',
           'طلب استئذان','سجل الغياب','سجل التأخر','الأعذار','الاستئذان','إدارة الغياب',
           'الموجّه الطلابي','استلام تحويلات','التقارير / الطباعة','تقرير الفصل','تقرير الإدارة',
-          'تحليل طالب','أكثر الطلاب غياباً','الإشعارات الذكية','إرسال رسائل الغياب',
+          'تحليل طالب','أكثر الطلاب غياباً','تقرير الرسائل','الإشعارات الذكية','إرسال رسائل الغياب',
           'إرسال رسائل التأخر','روابط بوابة أولياء الأمور','التعاميم والنشرات','قصص المدرسة',
-          'تعزيز الحضور الأسبوعي','لوحة الصدارة (النقاط)','إدارة الطلاب','إضافة طالب',
+          'تعزيز الحضور الأسبوعي','لوحة الصدارة (النقاط)','إدارة الطلاب','إدارة المعلمين','إضافة طالب',
           'إدارة الفصول','إدارة الجوالات','الطلاب المستثنون','نشر النتائج','تصدير نور',
           'زيارات أولياء الأمور'],
   staff:['لوحة المراقبة','المراقبة الحية','روابط الفصول','تسجيل الغياب','تسجيل التأخر',
@@ -6585,22 +6894,245 @@ async function importExcel(){
     if(d.ok)document.getElementById('as-xl-file').value='';
   }catch(e){ss('as-xl-st','❌ خطأ في الاتصال','er');}
 }
-async function importNoor(){
-  var f=document.getElementById('as-noor-file').files[0];
-  if(!f){ss('as-noor-st','اختر ملف نور','er');return;}
-  var mc=document.getElementById('as-noor-merge');
-  var merge=mc&&mc.checked;
-  if(merge&&!confirm('إضافة فقط: سيُضاف الطلاب الجدد (بالهوية) دون لمس الموجودين ولا بياناتهم. متابعة؟'))return;
-  ss('as-noor-st',merge?'⏳ جارٍ الدمج (إضافة فقط)...':'⏳ جارٍ استيراد ملف نور...','ai');
-  var fd=new FormData();fd.append('file',f);fd.append('mode',merge?'noor_merge':'noor');
+/* ── استيراد نور بمعاينة — لا يُكتب شيء قبل موافقتك ── */
+var _npToken=null;
+function _npChip(n,txt,color){
+  return '<span style="display:inline-block;padding:5px 11px;border-radius:20px;font-size:12px;'+
+         'font-weight:700;background:'+color+'22;color:'+color+'">'+txt+': '+n+'</span>';
+}
+function _npTable(title,rows,heads,fn){
+  var h='<div style="margin-bottom:14px"><div style="font-weight:700;margin-bottom:6px">'+title+
+        ' <span style="color:#6B7280;font-weight:400">('+rows.length+')</span></div>'+
+        '<div class="tw"><table><thead><tr>';
+  heads.forEach(function(x){h+='<th>'+x+'</th>';});
+  h+='</tr></thead><tbody>';
+  rows.slice(0,300).forEach(function(x){
+    h+='<tr>'+fn(x).map(function(v){return '<td>'+(v===''||v==null?'—':v)+'</td>';}).join('')+'</tr>';
+  });
+  if(rows.length>300)h+='<tr><td colspan="'+heads.length+'" style="color:#6B7280">…و'+(rows.length-300)+' غيرهم</td></tr>';
+  return h+'</tbody></table></div></div>';
+}
+async function previewNoor(){
+  var fi=document.getElementById('as-noor-file');
+  var f=fi.files[0];
+  if(!f){ss('as-noor-st','اختر ملف نور أولاً','er');return;}
+  ss('as-noor-st','⏳ جارٍ تحليل الملف ومقارنته بالكشف الحالي...','ai');
+  document.getElementById('np-wrap').style.display='none';
+  var fd=new FormData();fd.append('file',f);
   try{
-    var r=await fetch('/web/api/import-students',{method:'POST',body:fd});
+    var r=await fetch('/web/api/import-students/preview',{method:'POST',body:fd});
     var d=await r.json();
-    var msg=merge?('✅ أُضيف '+(d.added||0)+' طالباً جديداً (الموجودون '+(d.kept||0)+' بلا مساس)')
-                 :('✅ تم استيراد '+(d.count||0)+' طالباً من نور');
-    ss('as-noor-st',d.ok?msg:('❌ '+(d.msg||'فشل')),d.ok?'ok':'er');
-    if(d.ok)document.getElementById('as-noor-file').value='';
+    if(!d.ok){ss('as-noor-st','❌ '+(d.msg||'تعذّر التحليل'),'er');return;}
+    _npToken=d.token;
+    ss('as-noor-st','✅ تم التحليل — راجع التغييرات ثم طبّقها','ok');
+    var c=d.counts||{};
+    document.getElementById('np-sum').innerHTML=
+      _npChip(c.current||0,'الكشف الحالي','#1565C0')+
+      _npChip(c.in_file||0,'في الملف','#1565C0')+
+      _npChip(c.moved||0,'سيُنقل لصف آخر','#E06A0C')+
+      _npChip(c.added||0,'جديد','#059669')+
+      _npChip(c.removed||0,'ليس في الملف','#B91C1C')+
+      _npChip(c.academic_kept||0,'رقم أكاديمي محفوظ','#059669');
+    var h='';
+    if((d.moved||[]).length)h+=_npTable('🔄 طلاب سيُنقلون إلى صف/فصل آخر',d.moved,
+      ['الطالب','الرقم الأكاديمي','من','إلى'],
+      function(x){return [x.name,x.academic_no,x.from,x.to];});
+    if((d.added||[]).length)h+=_npTable('➕ طلاب جدد سيُضافون',d.added,
+      ['الطالب','رقم الهوية','الفصل'],
+      function(x){return [x.name,x.id,x.to];});
+    if((d.removed||[]).length)h+=_npTable('⚠️ في الكشف الحالي وليسوا في الملف',d.removed,
+      ['الطالب','الرقم الأكاديمي','الفصل الحالي'],
+      function(x){return [x.name,x.academic_no,x.from];});
+    if(!h)h='<div class="ab ai">لا تغييرات — الملف مطابق للكشف الحالي.</div>';
+    if((d.notes||[]).length)h+='<div class="ab ai" style="margin-top:10px">'+
+      d.notes.map(function(n){return String(n).replace(/\n/g,'<br>');}).join('<br>')+'</div>';
+    document.getElementById('np-lists').innerHTML=h;
+    document.getElementById('np-wrap').style.display='';
   }catch(e){ss('as-noor-st','❌ خطأ في الاتصال','er');}
+}
+function cancelNoorImport(){
+  _npToken=null;
+  document.getElementById('np-wrap').style.display='none';
+  ss('as-noor-st','أُلغيت المعاينة — لم يتغيّر شيء','ai');
+}
+async function applyNoorImport(){
+  if(!_npToken){ss('np-st','لا توجد معاينة سارية — أعد رفع الملف','er');return;}
+  var rm=document.getElementById('np-rm').checked;
+  if(rm&&!confirm('سيُحذف الطلاب غير الموجودين في الملف من الكشف نهائياً. متابعة؟'))return;
+  ss('np-st','⏳ جارٍ التطبيق...','ai');
+  try{
+    var r=await fetch('/web/api/import-students/apply',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({token:_npToken,
+        apply_moves:document.getElementById('np-moves').checked,
+        add_new:document.getElementById('np-add').checked,
+        generate_numbers:document.getElementById('np-gen').checked,
+        remove_missing:rm})});
+    var d=await r.json();
+    if(!d.ok){ss('np-st','❌ '+(d.msg||'فشل التطبيق'),'er');return;}
+    ss('np-st','✅ تم — نُقل '+(d.moved||0)+' · أُضيف '+(d.added||0)+
+       ' · وُلّد '+(d.numbers_generated||0)+' رقماً للجدد'+
+       ((d.removed||0)?(' · حُذف '+d.removed):'')+' · الإجمالي '+(d.total||0),'ok');
+    _npToken=null;
+    document.getElementById('as-noor-file').value='';
+    document.getElementById('np-wrap').style.display='none';
+    if(typeof loadStudents==='function')loadStudents();
+  }catch(e){ss('np-st','❌ خطأ في الاتصال','er');}
+}
+
+/* ── تقرير الرسائل المُرسَلة ── */
+function mrQuick(back){
+  var to=new Date(),fr=new Date();fr.setDate(fr.getDate()-back);
+  var f=function(d){return d.toISOString().slice(0,10);};
+  document.getElementById('mr-from').value=f(fr);
+  document.getElementById('mr-to').value=f(to);
+  loadMsgReport();
+}
+function _mrCard(label,val,color){
+  return '<div style="flex:1;min-width:120px;background:#fff;border:1px solid #E5E9F0;'+
+    'border-radius:12px;padding:12px 14px;text-align:center">'+
+    '<div style="font-size:22px;font-weight:800;color:'+color+'">'+val+'</div>'+
+    '<div style="font-size:12px;color:#6B7280;margin-top:2px">'+label+'</div></div>';
+}
+async function loadMsgReport(){
+  var fr=document.getElementById('mr-from').value,to=document.getElementById('mr-to').value;
+  if(!fr||!to){mrQuick(6);return;}
+  ss('mr-st','⏳ جارٍ التحميل...','ai');
+  var q='/web/api/messages-report?date_from='+fr+'&date_to='+to+
+        '&message_type='+encodeURIComponent(document.getElementById('mr-type').value)+
+        '&status='+encodeURIComponent(document.getElementById('mr-status').value)+
+        '&class_id='+encodeURIComponent(document.getElementById('mr-cls').value);
+  var d=await api(q);
+  if(!d||!d.ok){ss('mr-st','❌ '+((d&&d.msg)||'تعذّر التحميل'),'er');return;}
+  ss('mr-st','','ai');
+  var s=d.summary||{},ab=s.absence||{},td=s.tardiness||{};
+  var h='<div class="section"><div style="display:flex;gap:10px;flex-wrap:wrap">'+
+    _mrCard('إجمالي الرسائل',s.total||0,'#1565C0')+
+    _mrCard('وصلت',s.success||0,'#059669')+
+    _mrCard('فشلت',s.failed||0,'#B91C1C')+
+    _mrCard('رسائل الغياب',ab.total||0,'#7C3AED')+
+    _mrCard('رسائل التأخر',td.total||0,'#E06A0C')+
+    '</div>';
+  if((s.total||0)===0){
+    h+='<div class="ab ai" style="margin-top:12px">لا توجد رسائل مُسجّلة في هذه المدة. '+
+       'التسجيل يبدأ من أول إرسال بعد هذا التحديث.</div></div>';
+    document.getElementById('mr-out').innerHTML=h;return;
+  }
+  h+='<div style="margin-top:10px;font-size:13px;color:#475569">'+
+     'الغياب: وصلت <b>'+(ab.success||0)+'</b> · فشلت <b>'+(ab.failed||0)+'</b> — '+
+     'التأخر: وصلت <b>'+(td.success||0)+'</b> · فشلت <b>'+(td.failed||0)+'</b></div></div>';
+  if((d.days||[]).length>1){
+    h+='<div class="section"><h3 style="margin:0 0 8px;font-size:14px;color:#0C2E56">حسب اليوم</h3>'+
+       '<div class="tw"><table><thead><tr><th>التاريخ</th><th>وصلت</th><th>فشلت</th></tr></thead><tbody>';
+    d.days.forEach(function(x){
+      h+='<tr><td>'+x.date+'</td><td style="color:#059669">'+x.success+'</td>'+
+         '<td style="color:'+(x.failed?'#B91C1C':'#9CA3AF')+'">'+x.failed+'</td></tr>';});
+    h+='</tbody></table></div></div>';
+  }
+  var TY={absence:'غياب',tardiness:'تأخر',reward:'تحفيز'};
+  h+='<div class="section"><h3 style="margin:0 0 8px;font-size:14px;color:#0C2E56">التفاصيل</h3>'+
+     '<div class="tw"><table><thead><tr><th>التاريخ</th><th>الطالب</th><th>الفصل</th>'+
+     '<th>النوع</th><th>الجوال</th><th>الحالة</th><th>السبب</th></tr></thead><tbody>';
+  (d.rows||[]).forEach(function(r){
+    var okv=String(r.status||'').toLowerCase();
+    var bad=(okv==='failed'||okv==='fail'||okv==='error'||okv==='');
+    h+='<tr><td>'+(r.date||'')+'</td><td>'+(r.student_name||'')+'</td>'+
+       '<td>'+(r.class_name||'—')+'</td>'+
+       '<td>'+(TY[r.message_type]||r.message_type||'—')+'</td>'+
+       '<td>'+(r.phone||'—')+'</td>'+
+       '<td style="color:'+(bad?'#B91C1C':'#059669')+';font-weight:700">'+
+         (bad?'فشلت':'وصلت')+'</td>'+
+       '<td style="font-size:12px;color:#6B7280">'+(r.detail||'')+'</td></tr>';
+  });
+  h+='</tbody></table></div>';
+  if(d.truncated)h+='<div style="margin-top:8px;color:#6B7280;font-size:12px">'+
+    'عُرضت أول ١٠٠٠ رسالة فقط — ضيّق المدة لعرض الباقي.</div>';
+  h+='</div>';
+  document.getElementById('mr-out').innerHTML=h;
+}
+function printMsgReport(){
+  var o=document.getElementById('mr-out');
+  if(!o||!o.innerHTML.trim()){alert('اعرض التقرير أولاً');return;}
+  var w=window.open('','_blank');
+  w.document.write('<html dir="rtl"><head><meta charset="utf-8"><title>تقرير الرسائل</title>'+
+    '<style>body{font-family:Tahoma;padding:18px}table{width:100%;border-collapse:collapse;font-size:12px}'+
+    'th,td{border:1px solid #ccc;padding:5px;text-align:right}th{background:#eef3f9}'+
+    'h2{color:#0C2E56}</style></head><body><h2>تقرير الرسائل المُرسَلة</h2>'+
+    '<div>من '+document.getElementById('mr-from').value+' إلى '+
+    document.getElementById('mr-to').value+'</div>'+o.innerHTML+'</body></html>');
+  w.document.close();w.focus();w.print();
+}
+
+/* ── إدارة المعلمين ── */
+var _teachersRec=[];
+async function loadTeachersMgmt(){
+  var d=await api('/web/api/teachers');
+  _teachersRec=(d&&d.ok)?(d.teachers||[]):[];
+  renderTeachersTbl();
+}
+function _tName(t){return String(t['اسم المعلم']||t.full_name||'').trim();}
+function renderTeachersTbl(){
+  var tb=document.getElementById('tm-table');if(!tb)return;
+  var qe=document.getElementById('tm-q');
+  var q=((qe&&qe.value)||'').toLowerCase();
+  var arr=_teachersRec.filter(function(t){
+    if(!q)return true;
+    return _tName(t).toLowerCase().indexOf(q)>=0||
+           String(t['التخصص']||'').toLowerCase().indexOf(q)>=0;
+  });
+  tb.innerHTML=arr.map(function(t,i){
+    var n=_tName(t),p=String(t['رقم الجوال']||t.phone||''),s=String(t['التخصص']||'');
+    var esc=n.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+    return '<tr><td>'+(i+1)+'</td><td>'+n+'</td><td>'+(p||'—')+'</td><td>'+(s||'—')+'</td>'+
+      '<td><button class="btn bp2 bsm" onclick="editTeacherRec(\''+esc+'\')">✏️ تعديل</button> '+
+      '<button class="btn bp2 bsm" style="background:#FEE2E2;color:#B91C1C" onclick="delTeacherRec(\''+esc+'\')">🗑️</button></td></tr>';
+  }).join('')||'<tr><td colspan="5" style="color:#9CA3AF">لا يوجد معلمون — أضفهم يدوياً أعلاه</td></tr>';
+  var sm=document.getElementById('tm-sum');
+  if(sm)sm.innerHTML='<span class="badge bb">'+_teachersRec.length+' معلماً</span>';
+}
+function editTeacherRec(name){
+  var t=null;
+  for(var i=0;i<_teachersRec.length;i++){if(_tName(_teachersRec[i])===name){t=_teachersRec[i];break;}}
+  if(!t)return;
+  document.getElementById('tm-name').value=name;
+  document.getElementById('tm-phone').value=t['رقم الجوال']||t.phone||'';
+  document.getElementById('tm-subject').value=t['التخصص']||'';
+  document.getElementById('tm-nid').value=t['رقم الهوية']||'';
+  document.getElementById('tm-orig').value=name;
+  ss('tm-st','✏️ تعديل: '+name+' — عدّل الحقول ثم احفظ','ai');
+}
+function resetTeacherForm(){
+  ['tm-name','tm-phone','tm-subject','tm-nid','tm-orig'].forEach(function(id){
+    var e=document.getElementById(id);if(e)e.value='';});
+  ss('tm-st','','ai');
+}
+async function saveTeacherRec(){
+  var name=(document.getElementById('tm-name').value||'').trim();
+  if(!name){ss('tm-st','اسم المعلم مطلوب','er');return;}
+  ss('tm-st','⏳ جارٍ الحفظ...','ai');
+  try{
+    var r=await fetch('/web/api/teachers/save',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:name,
+        phone:document.getElementById('tm-phone').value,
+        subject:document.getElementById('tm-subject').value,
+        national_id:document.getElementById('tm-nid').value,
+        original:document.getElementById('tm-orig').value})});
+    var d=await r.json();
+    if(!d.ok){ss('tm-st','❌ '+(d.msg||'خطأ'),'er');return;}
+    ss('tm-st',d.created?'✅ أُضيف المعلم':'✅ حُفظ التعديل','ok');
+    resetTeacherForm();loadTeachersMgmt();
+  }catch(e){ss('tm-st','❌ خطأ في الاتصال','er');}
+}
+async function delTeacherRec(name){
+  if(!confirm('حذف المعلم «'+name+'» من قائمة المعلمين؟'))return;
+  try{
+    var r=await fetch('/web/api/teachers/delete',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name})});
+    var d=await r.json();
+    ss('tm-st',d.ok?'✅ حُذف المعلم':('❌ '+(d.msg||'خطأ')),d.ok?'ok':'er');
+    if(d.ok)loadTeachersMgmt();
+  }catch(e){ss('tm-st','❌ خطأ في الاتصال','er');}
 }
 
 /* ── NOTES ── */
