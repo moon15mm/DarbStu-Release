@@ -624,8 +624,13 @@ def init_db():
         student_name TEXT NOT NULL,
         class_name   TEXT,
         reason       TEXT,
+        added_by     TEXT DEFAULT '',
         created_at   TEXT NOT NULL
     )""")
+    # الاستثناء يُخفي الطالب من كل رصد وتقرير ورسالة — فيُسجَّل من أضافه.
+    _ex_cols = {r[1] for r in cur.execute("PRAGMA table_info(exempted_students)")}
+    if "added_by" not in _ex_cols:
+        cur.execute("ALTER TABLE exempted_students ADD COLUMN added_by TEXT DEFAULT ''")
 
     # ─── جدول نقاط التميز (جديد) ──────────────────────────────────
     cur.execute("""CREATE TABLE IF NOT EXISTS student_points (
@@ -704,6 +709,174 @@ def init_db():
         student_id TEXT NOT NULL UNIQUE,
         token TEXT NOT NULL UNIQUE,
         created_at TEXT NOT NULL
+    )""")
+
+    # ─── مناداة ولي الأمر ─────────────────────────────────────────
+    # ولي الأمر يقف عند البوابة فيضغط زراً في صفحته، فيظهر ابنه في أعلى
+    # شاشة الاستقبال. أول قناة في النظام يبدأ منها الوليّ إجراءً — وكل ما
+    # عداها يسير من المدرسة إليه.
+    cur.execute("""CREATE TABLE IF NOT EXISTS parent_calls (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        date         TEXT NOT NULL,
+        student_id   TEXT NOT NULL,
+        student_name TEXT NOT NULL DEFAULT '',
+        class_id     TEXT NOT NULL DEFAULT '',
+        class_name   TEXT NOT NULL DEFAULT '',
+        called_at    TEXT NOT NULL,
+        note         TEXT NOT NULL DEFAULT '',
+        status       TEXT NOT NULL DEFAULT 'waiting',
+        handled_by   TEXT NOT NULL DEFAULT '',
+        handled_at   TEXT NOT NULL DEFAULT '',
+        source       TEXT NOT NULL DEFAULT 'portal'
+    )""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_parent_calls_day ON parent_calls(date, status)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_parent_calls_student ON parent_calls(student_id, date)")
+
+    # ─── جدول الطلاب المنقولين (لإخفائهم من التقارير) ──────────────
+    cur.execute("""CREATE TABLE IF NOT EXISTS transferred_students (
+        student_id    TEXT PRIMARY KEY,
+        student_name  TEXT,
+        transferred_at TEXT NOT NULL
+    )""")
+
+    # ─── جدول تصنيف الغياب الجزئي (هارب/مستأذن) ─────────────────
+    cur.execute("""CREATE TABLE IF NOT EXISTS partial_absence_status (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        date        TEXT NOT NULL,
+        student_id  TEXT NOT NULL,
+        status      TEXT NOT NULL DEFAULT 'غير محدد',
+        notes       TEXT DEFAULT '',
+        updated_at  TEXT NOT NULL,
+        UNIQUE(date, student_id)
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS inbox_messages (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        from_user        TEXT NOT NULL,
+        to_user          TEXT NOT NULL,
+        subject          TEXT NOT NULL DEFAULT '',
+        body             TEXT NOT NULL,
+        created_at       TEXT NOT NULL,
+        is_read          INTEGER NOT NULL DEFAULT 0,
+        read_at          TEXT,
+        deleted_by_sender   INTEGER NOT NULL DEFAULT 0,
+        deleted_by_receiver INTEGER NOT NULL DEFAULT 0,
+        attachment_path  TEXT,
+        attachment_name  TEXT,
+        attachment_size  INTEGER
+    )""")
+    # ترقية: أضف أعمدة المرفقات إذا لم تكن موجودة
+    _ib_cols = {r[1] for r in cur.execute("PRAGMA table_info(inbox_messages)")}
+    for _col, _def in [("attachment_path","TEXT"), ("attachment_name","TEXT"), ("attachment_size","INTEGER")]:
+        if _col not in _ib_cols:
+            cur.execute(f"ALTER TABLE inbox_messages ADD COLUMN {_col} {_def}")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS school_reports (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        category     TEXT NOT NULL,
+        title        TEXT NOT NULL,
+        description  TEXT NOT NULL DEFAULT '',
+        report_date  TEXT NOT NULL DEFAULT '',
+        file_path    TEXT NOT NULL,
+        file_name    TEXT NOT NULL,
+        file_size    INTEGER NOT NULL DEFAULT 0,
+        uploaded_by  TEXT NOT NULL DEFAULT '',
+        uploaded_at  TEXT NOT NULL
+    )""")
+
+    # ─── جدول الإجازات الرسمية ────────────────────────────────────
+    cur.execute("""CREATE TABLE IF NOT EXISTS holidays (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        date       TEXT NOT NULL UNIQUE,
+        label      TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+    )""")
+
+    # ─── جداول إدارة الباصات ──────────────────────────────────────
+    cur.execute("""CREATE TABLE IF NOT EXISTS buses (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        name         TEXT NOT NULL,
+        driver_name  TEXT NOT NULL,
+        driver_phone TEXT NOT NULL,
+        route        TEXT DEFAULT '',
+        active       INTEGER NOT NULL DEFAULT 1,
+        created_at   TEXT NOT NULL
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS student_buses (
+        student_id   TEXT NOT NULL PRIMARY KEY,
+        bus_id       INTEGER NOT NULL REFERENCES buses(id) ON DELETE CASCADE
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS bus_trips (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        bus_id          INTEGER NOT NULL REFERENCES buses(id) ON DELETE CASCADE,
+        date            TEXT NOT NULL,
+        trip_type       TEXT NOT NULL DEFAULT 'morning',
+        token           TEXT NOT NULL UNIQUE,
+        sent_at         TEXT,
+        driver_ready_at TEXT,
+        created_at      TEXT NOT NULL,
+        UNIQUE(bus_id, date, trip_type)
+    )""")
+    try: cur.execute("ALTER TABLE bus_trips ADD COLUMN driver_ready_at TEXT")
+    except: pass
+    cur.execute("""CREATE TABLE IF NOT EXISTS bus_attendance (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        trip_id      INTEGER NOT NULL REFERENCES bus_trips(id) ON DELETE CASCADE,
+        student_id   TEXT NOT NULL,
+        student_name TEXT NOT NULL,
+        class_name   TEXT NOT NULL DEFAULT '',
+        status       TEXT NOT NULL DEFAULT 'pending',
+        recorded_at  TEXT,
+        UNIQUE(trip_id, student_id)
+    )""")
+
+    # ─── بصمات جهاز الحضور — الخام ────────────────────────────────
+    # نخزّن كل بصمة كما وردت من الجهاز، لا التأخر المُستنتَج منها. السبب:
+    # لو تغيّر وقت بداية الدوام، أو اكتُشف أن ساعة الجهاز متأخرة، أُعيد
+    # حساب التأخر من الأصل. تخزين النتيجة وحدها يمحو ما لا يُسترجَع.
+    # device_uid = الرقم المسجّل داخل الجهاز (قد يساوي رقم الطالب أو لا).
+    # punch_utc  = وقت البصمة بتوقيت UTC، لتفادي التباس المناطق الزمنية.
+    # processed  = هل حُوّلت إلى حضور/تأخر بعد؟ (يمنع المعالجة المزدوجة)
+    cur.execute("""CREATE TABLE IF NOT EXISTS biometric_punches (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id   TEXT NOT NULL DEFAULT '',
+        device_uid  TEXT NOT NULL,
+        punch_utc   TEXT NOT NULL,
+        punch_local TEXT NOT NULL DEFAULT '',
+        date        TEXT NOT NULL DEFAULT '',
+        student_id  TEXT NOT NULL DEFAULT '',
+        matched     INTEGER NOT NULL DEFAULT 0,
+        processed   INTEGER NOT NULL DEFAULT 0,
+        outcome     TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL,
+        UNIQUE(device_id, device_uid, punch_utc)
+    )""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_punch_date "
+                "ON biometric_punches(date)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_punch_unprocessed "
+                "ON biometric_punches(processed)")
+
+    # ─── ربط رقم الجهاز برقم الطالب ───────────────────────────────
+    # الأصل أن يُسجَّل الطالب في الجهاز برقمه الأكاديمي نفسه، فلا حاجة
+    # لهذا الجدول. لكن أجهزةً كثيرة تُرقّم تسلسلياً (1،2،3)، فنحتاج جسراً.
+    cur.execute("""CREATE TABLE IF NOT EXISTS biometric_enrollments (
+        device_uid   TEXT PRIMARY KEY,
+        student_id   TEXT NOT NULL,
+        student_name TEXT NOT NULL DEFAULT '',
+        class_name   TEXT NOT NULL DEFAULT '',
+        created_at   TEXT NOT NULL
+    )""")
+
+    # ─── من سُجّلت بصمته فعلاً ─────────────────────────────────────
+    # علامةٌ محلّية بأن التقاط بصمة هذا الطالب تمّ بنجاح على الجهاز.
+    # الجهاز هو مصدر الحقيقة النهائي، لكن هذه العلامة تقود واجهة التسجيل
+    # (من بُصم ومن لم يُبصم) بلا الاعتماد على قراءة قائمة مستخدمي الجهاز،
+    # وهي قراءةٌ تختلف صيغتها بين إصدارات العتاد.
+    cur.execute("""CREATE TABLE IF NOT EXISTS biometric_fp_enrolled (
+        student_id   TEXT PRIMARY KEY,
+        device_id    TEXT NOT NULL DEFAULT '',
+        finger       INTEGER NOT NULL DEFAULT 0,
+        enrolled_at  TEXT NOT NULL
     )""")
 
     # ─── جدول الطلاب المنقولين (لإخفائهم من التقارير) ──────────────
@@ -1145,13 +1318,13 @@ def get_biometric_daily_summary(date_str):
 
 
 # --- Helper functions for Exempted Students ---
-def add_exempted_student(student_id, student_name, class_name, reason=""):
+def add_exempted_student(student_id, student_name, class_name, reason="", added_by=""):
     con = get_db(); cur = con.cursor()
     created_at = datetime.datetime.now().isoformat()
-    cur.execute("""INSERT OR REPLACE INTO exempted_students 
-                   (student_id, student_name, class_name, reason, created_at)
-                   VALUES (?, ?, ?, ?, ?)""", 
-                (student_id, student_name, class_name, reason, created_at))
+    cur.execute("""INSERT OR REPLACE INTO exempted_students
+                   (student_id, student_name, class_name, reason, added_by, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (student_id, student_name, class_name, reason, added_by, created_at))
     con.commit(); con.close()
 
 def remove_exempted_student(student_id):
@@ -1610,6 +1783,111 @@ def get_or_create_portal_token(student_id) -> str:
         con.commit()
     con.close()
     return new_token
+
+_CALL_COLS = ["id", "date", "student_id", "student_name", "class_id", "class_name",
+              "called_at", "note", "status", "handled_by", "handled_at", "source"]
+
+# مهلة قبل السماح بنداء جديد لنفس الطالب بعد إنهاء السابق — تمنع تكرار
+# الضغط من غير حاجة، ولا تمنع نداءً ثانياً مشروعاً بعد وقت معقول.
+PARENT_CALL_COOLDOWN_MIN = 10
+
+
+def create_parent_call(student_id, student_name="", class_id="", class_name="",
+                       note="", source="portal"):
+    """يُنشئ نداءً، أو يُرجع النداء القائم بدل إنشاء ثانٍ.
+
+    الضغط المتكرر من ولي الأمر متوقَّع (يظن أنها لم تصل)، فلا يجوز أن يُنتج
+    صفوفاً مكررة تُشوّش شاشة الاستقبال وتُفسد إحصاء الاستخدام.
+    """
+    now = datetime.datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    sid = str(student_id)
+    con = get_db(); cur = con.cursor()
+
+    cur.execute("SELECT %s FROM parent_calls WHERE student_id=? AND date=?"
+                " AND status='waiting' ORDER BY id DESC LIMIT 1" % ",".join(_CALL_COLS),
+                (sid, today))
+    row = cur.fetchone()
+    if row:
+        con.close()
+        return {"created": False, "reason": "already_waiting",
+                "call": dict(zip(_CALL_COLS, row))}
+
+    cur.execute("SELECT handled_at FROM parent_calls WHERE student_id=? AND date=?"
+                " AND status='done' ORDER BY id DESC LIMIT 1", (sid, today))
+    last = cur.fetchone()
+    if last and last[0]:
+        try:
+            delta = (now - datetime.datetime.strptime(last[0], "%Y-%m-%d %H:%M:%S"))
+            if delta.total_seconds() < PARENT_CALL_COOLDOWN_MIN * 60:
+                con.close()
+                return {"created": False, "reason": "cooldown",
+                        "wait_seconds": int(PARENT_CALL_COOLDOWN_MIN * 60 - delta.total_seconds())}
+        except ValueError:
+            pass
+
+    cur.execute("""INSERT INTO parent_calls
+        (date, student_id, student_name, class_id, class_name, called_at, note, status, source)
+        VALUES (?,?,?,?,?,?,?,'waiting',?)""",
+        (today, sid, str(student_name), str(class_id), str(class_name),
+         now.strftime("%Y-%m-%d %H:%M:%S"), str(note)[:200], str(source)))
+    cid = cur.lastrowid
+    con.commit()
+    cur.execute("SELECT %s FROM parent_calls WHERE id=?" % ",".join(_CALL_COLS), (cid,))
+    call = dict(zip(_CALL_COLS, cur.fetchone()))
+    con.close()
+    return {"created": True, "call": call}
+
+
+def get_parent_calls(date=None, status=None, student_id=None):
+    con = get_db(); cur = con.cursor()
+    sql = "SELECT %s FROM parent_calls WHERE 1=1" % ",".join(_CALL_COLS)
+    args = []
+    if date:
+        sql += " AND date=?"; args.append(str(date))
+    if status:
+        sql += " AND status=?"; args.append(str(status))
+    if student_id:
+        sql += " AND student_id=?"; args.append(str(student_id))
+    sql += " ORDER BY called_at DESC"
+    cur.execute(sql, args)
+    rows = [dict(zip(_CALL_COLS, r)) for r in cur.fetchall()]
+    con.close()
+    return rows
+
+
+def set_parent_call_status(call_id, status, handled_by=""):
+    if status not in ("waiting", "done", "cancelled"):
+        return 0
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    con = get_db(); cur = con.cursor()
+    cur.execute("UPDATE parent_calls SET status=?, handled_by=?, handled_at=? WHERE id=?",
+                (status, str(handled_by), now if status != "waiting" else "", int(call_id)))
+    n = cur.rowcount
+    con.commit(); con.close()
+    return n
+
+
+def get_parent_call_stats(date_from=None, date_to=None, limit=20):
+    """ترتيب أكثر الطلاب استدعاءً من أوليائهم، مع متوسط زمن الاستجابة."""
+    con = get_db(); cur = con.cursor()
+    sql = ("SELECT student_id, student_name, class_name, COUNT(*) AS n,"
+           " SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done,"
+           " MAX(called_at) AS last_call"
+           " FROM parent_calls WHERE 1=1")
+    args = []
+    if date_from:
+        sql += " AND date>=?"; args.append(str(date_from))
+    if date_to:
+        sql += " AND date<=?"; args.append(str(date_to))
+    sql += " GROUP BY student_id ORDER BY n DESC, last_call DESC LIMIT ?"
+    args.append(int(limit))
+    cur.execute(sql, args)
+    rows = [{"student_id": r[0], "student_name": r[1], "class_name": r[2],
+             "calls": r[3], "done": r[4], "last_call": r[5]} for r in cur.fetchall()]
+    con.close()
+    return rows
+
 
 def get_student_id_by_portal_token(token) -> Optional[str]:
     con = get_db(); cur = con.cursor()

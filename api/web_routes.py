@@ -23,6 +23,8 @@ _JWT_SECRET = _sec.get_jwt_secret()
 _JWT_EXPIRE = 8  # ساعات
 
 from database import (get_db, load_students, load_teachers,
+                      get_student_id_by_portal_token, create_parent_call,
+                      get_parent_calls, set_parent_call_status, get_parent_call_stats,
                       query_absences, query_tardiness, query_excuses,
                       insert_absences, insert_tardiness, delete_tardiness,
                       insert_excuse, delete_excuse,
@@ -1131,10 +1133,13 @@ async def api_add_exempted_student(req: Request):
         return JSONResponse({"ok": False, "msg": "Unauthorized"}, status_code=401)
     try:
         data = await req.json()
+        # التوقيع (student_id, student_name, class_name, reason, added_by) —
+        # بالأسماء لا بالترتيب حتى لا يعود class_id ليحتل مكان class_name.
         add_exempted_student(
             data["student_id"], data["student_name"],
-            data.get("class_id", ""), data.get("class_name", ""),
-            data.get("reason", ""), user["sub"]
+            data.get("class_name", ""),
+            reason=data.get("reason", ""),
+            added_by=user.get("username") or user.get("sub") or ""
         )
         return JSONResponse({"ok": True})
     except Exception as e:
@@ -1149,7 +1154,6 @@ async def api_remove_exempted_student(student_id: str, request: Request):
         remove_exempted_student(student_id)
         return JSONResponse({"ok": True})
     except Exception as e:
-        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 
 @router.delete("/web/api/counselor/contract/{cid}", response_class=JSONResponse)
@@ -1830,6 +1834,7 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
         ("الرئيسية", [
             ("لوحة المراقبة",      "dashboard",            "fas fa-chart-line"),
             ("المراقبة الحية",      "live_monitor",         "fas fa-satellite-dish"),
+            ("مناداة أولياء الأمور", "parent_calls_board",  "fas fa-bell"),
             ("الحضور الموحّد",      "link:/web/attendance", "fas fa-layer-group"),
             ("روابط الفصول",        "links",                "fas fa-link"),
             ("جدولة الروابط",       "link:/web/schedule",   "fas fa-calendar-alt"),
@@ -2983,6 +2988,49 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
     <div class="tw"><table>
       <thead><tr><th>الطالب</th><th>الفصل</th><th>رقم الجوال</th><th>تعديل</th></tr></thead>
       <tbody id="ph-table"></tbody></table></div>
+  </div>
+</div>
+
+<div id="tab-parent_calls_board">
+  <h2 class="pt"><i class="fas fa-bell"></i> مناداة أولياء الأمور</h2>
+
+  <div class="section">
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+      <div class="fg" style="max-width:200px"><label class="fl">التاريخ</label>
+        <input type="date" id="pcb-date"></div>
+      <div class="fg" style="max-width:220px"><label class="fl">الفصل</label>
+        <select id="pcb-cls"><option value="">كل الفصول</option></select></div>
+      <div class="fg" style="max-width:260px"><label class="fl">بحث باسم الطالب</label>
+        <input type="text" id="pcb-q" placeholder="اكتب جزءاً من الاسم" oninput="pcbRender()"></div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn bp4" onclick="pcbLoad()"><i class="fas fa-sync"></i> تحديث</button>
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px">
+          <input type="checkbox" id="pcb-auto" checked> تحديث تلقائي
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px">
+          <input type="checkbox" id="pcb-sound" onchange="pcbSoundToggle()"> تنبيه صوتي
+        </label>
+        <button class="btn bp3" style="padding:4px 10px;font-size:12px" onclick="pcbTestSound()">
+          اختبار الصوت</button>
+        <span id="pcb-sound-hint" style="font-size:11.5px;color:#ef6c00"></span>
+      </div>
+    </div>
+    <div id="pcb-counts" style="margin-top:12px"></div>
+  </div>
+
+  <div class="section">
+    <div id="pcb-orphan"></div>
+    <div id="pcb-table"></div>
+  </div>
+
+  <div class="section">
+    <div class="st">الأكثر استفادة من الخدمة</div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:10px">
+      <div class="fg" style="max-width:180px"><label class="fl">من</label><input type="date" id="pcb-from"></div>
+      <div class="fg" style="max-width:180px"><label class="fl">إلى</label><input type="date" id="pcb-to"></div>
+      <button class="btn bp3" onclick="pcbStats()">عرض</button>
+    </div>
+    <div id="pcb-stats"></div>
   </div>
 </div>
 
@@ -4197,6 +4245,7 @@ function showTab(key){
     'add_student':function(){fillSel('as-cls');},
     'class_naming':loadClassList,
     'phones':function(){loadStudents();fillSel('ph-cls');},
+    'parent_calls_board':pcbInit,
     'noor_export':function(){fillSel('noor-cls');},
     'results':function(){},
     'counselor':function(){fillSel('co-cls');fillSel('coa-cls');loadCoSessions();loadCounselorList();},
@@ -6523,6 +6572,235 @@ async function saveNoorCfg(){
   }catch(e){ss('noor-st','❌ خطأ في الاتصال','er');}
 }
 
+/* ── مناداة أولياء الأمور: من في المدرسة، والمنادَون في المقدمة ── */
+var _pcb = {students:[], orphan:[], counts:{}};
+var _pcbTimer = null;
+
+/* التنبيه الصوتي.
+   الصوت يُولَّد بـWeb Audio لا من ملف: لا أصل يُشحن ولا يُحدَّث، ويعمل
+   بلا إنترنت. والمتصفح يمنع التشغيل قبل تفاعل المستخدم، فنفتح السياق
+   عند أول نقرة ونُظهر تنبيهاً إن لم يُفتح بعد. */
+var _pcbAudio = null;
+var _pcbSeen = null;   /* null = لم نُحمّل بعد؛ أول تحميل لا يرنّ */
+var _pcbTitleBase = null;
+
+function pcbAudioUnlock(){
+  try{
+    if(!_pcbAudio){
+      var C = window.AudioContext || window.webkitAudioContext;
+      if(!C) return;
+      _pcbAudio = new C();
+    }
+    if(_pcbAudio.state === 'suspended') _pcbAudio.resume();
+    pcbSoundHint();
+  }catch(e){}
+}
+document.addEventListener('click', pcbAudioUnlock);
+
+function pcbSoundHint(){
+  var el = document.getElementById('pcb-sound-hint');
+  if(!el) return;
+  var on = document.getElementById('pcb-sound');
+  if(on && on.checked && (!_pcbAudio || _pcbAudio.state !== 'running')){
+    el.textContent = 'اضغط في أي مكان لتفعيل الصوت';
+  } else { el.textContent = ''; }
+}
+
+function pcbChime(times){
+  if(!_pcbAudio || _pcbAudio.state !== 'running') return;
+  var t = _pcbAudio.currentTime;
+  for(var i=0;i<(times||2);i++){
+    var o = _pcbAudio.createOscillator(), g = _pcbAudio.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(880, t);
+    o.frequency.setValueAtTime(1175, t+0.13);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.28, t+0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t+0.38);
+    o.connect(g); g.connect(_pcbAudio.destination);
+    o.start(t); o.stop(t+0.42);
+    t += 0.5;
+  }
+}
+
+function pcbSoundToggle(){
+  var on = document.getElementById('pcb-sound').checked;
+  try{ localStorage.setItem('pcbSound', on ? '1' : '0'); }catch(e){}
+  if(on) pcbAudioUnlock();
+  pcbSoundHint();
+}
+
+function pcbTestSound(){
+  pcbAudioUnlock();
+  pcbChime(1);
+  pcbSoundHint();
+}
+
+/* عنوان التبويب يحمل عدد المنتظرين — يراه الموظف ولو كان في تبويب آخر */
+function pcbSetTitle(n){
+  if(_pcbTitleBase === null) _pcbTitleBase = document.title.replace(/^\(\d+\)\s*/, '');
+  document.title = n > 0 ? '(' + n + ') ' + _pcbTitleBase : _pcbTitleBase;
+}
+
+function pcbEsc(s){
+  return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function pcbTime(t){ return (t && t.length>=16) ? t.slice(11,16) : ''; }
+
+async function pcbLoad(){
+  var date = document.getElementById('pcb-date').value || today;
+  var d = await api('/web/api/parent-calls?date='+encodeURIComponent(date));
+  if(!d || !d.ok){ document.getElementById('pcb-counts').innerHTML =
+      '<span style="color:#c62828">تعذّر التحميل</span>'; return; }
+  _pcb = {students:d.students||[], orphan:d.calls_not_inside||[], counts:d.counts||{}};
+  pcbDetectNew();
+  pcbRender();
+}
+
+/* يرنّ للنداء الجديد وحده. أول تحميل يبني القائمة بلا رنين، وإلا رنّ
+   لكل منتظر قائم كلما فُتحت الشاشة. */
+function pcbDetectNew(){
+  var now = {}, fresh = 0;
+  _pcb.students.forEach(function(s){ if(s.called && s.call_id) now[s.call_id]=1; });
+  _pcb.orphan.forEach(function(o){ if(o.call_id) now[o.call_id]=1; });
+
+  if(_pcbSeen === null){ _pcbSeen = now; pcbSetTitle(_pcb.counts.waiting||0); return; }
+  for(var k in now){ if(!_pcbSeen[k]) fresh++; }
+  _pcbSeen = now;
+
+  var on = document.getElementById('pcb-sound');
+  if(fresh > 0 && on && on.checked) pcbChime(fresh > 1 ? 2 : 1);
+  pcbSetTitle(_pcb.counts.waiting||0);
+  pcbSoundHint();
+}
+
+function pcbRender(){
+  var c = _pcb.counts;
+  document.getElementById('pcb-counts').innerHTML =
+      '<div style="display:flex;gap:14px;flex-wrap:wrap;font-size:14px">'
+    + '<b>داخل المدرسة: '+(c.inside||0)+'</b>'
+    + '<span style="color:#c62828">ينتظر ولي أمره: '+(c.waiting||0)+'</span>'
+    + '<span style="color:#2e7d32">تم تسليمه اليوم: '+(c.done||0)+'</span></div>';
+
+  var orph = _pcb.orphan;
+  document.getElementById('pcb-orphan').innerHTML = orph.length
+    ? '<div style="background:#fff3e0;border-right:4px solid #ef6c00;padding:10px;'
+      + 'border-radius:6px;margin-bottom:12px;font-size:13px">'
+      + '<b>نداءات لطلاب غير مسجَّلين داخل المدرسة اليوم ('+orph.length+')</b> — '
+      + 'قد لا يكون الحضور سُجّل بعد، أو الطالب غائب وولي أمره لا يعلم:<br>'
+      + orph.map(function(o){
+          return '<span style="display:inline-block;margin:4px 0 0 10px">'
+               + pcbEsc(o.student_name)+' <span style="color:#888">('+pcbEsc(o.class_name)+' — '
+               + pcbTime(o.called_at)+')</span> '
+               + '<button class="btn bp2" style="padding:2px 8px;font-size:11px" '
+               + 'onclick="pcbDone('+o.call_id+')">إنهاء</button></span>';
+        }).join('')
+      + '</div>'
+    : '';
+
+  var q = (document.getElementById('pcb-q').value||'').trim();
+  var cls = document.getElementById('pcb-cls').value;
+  var rows = _pcb.students.filter(function(s){
+    if(cls && String(s.class_id)!==String(cls)) return false;
+    if(q && s.student_name.indexOf(q)===-1) return false;
+    return true;
+  });
+
+  if(!rows.length){
+    document.getElementById('pcb-table').innerHTML =
+      '<div style="color:#666">لا يوجد طلاب مطابقون.</div>';
+    return;
+  }
+
+  document.getElementById('pcb-table').innerHTML =
+      '<div class="tw"><table><thead><tr>'
+    + '<th style="width:6px"></th><th>الطالب</th><th>الفصل</th><th>الحالة</th>'
+    + '<th>وقت النداء</th><th style="width:150px">الإجراء</th></tr></thead><tbody>'
+    + rows.map(function(s){
+        var bar = s.called ? 'background:#E11D48' : 'background:transparent';
+        var bg  = s.called ? 'background:#FFF1F2' : '';
+        var name = pcbEsc(s.student_name)
+                 + (s.called ? ' <span style="color:#E11D48;font-weight:700">• ولي أمره ينتظر</span>' : '')
+                 + (s.handled_today && !s.called ? ' <span style="color:#2e7d32;font-size:11px">(سُلّم اليوم)</span>' : '');
+        var act = s.called
+          ? '<button class="btn bp1" onclick="pcbDone('+s.call_id+')">تم التسليم</button> '
+            + '<button class="btn bp2" style="padding:4px 8px" onclick="pcbCancel('+s.call_id+')">إلغاء</button>'
+          : '';
+        var note = s.note ? '<div style="font-size:11px;color:#888">'+pcbEsc(s.note)+'</div>' : '';
+        return '<tr style="'+bg+'"><td style="padding:0;'+bar+'"></td>'
+             + '<td>'+name+note+'</td>'
+             + '<td>'+pcbEsc(s.class_name)+'</td>'
+             + '<td style="font-size:12px;color:#666">'+pcbEsc(s.status)+'</td>'
+             + '<td>'+pcbTime(s.called_at)+'</td>'
+             + '<td>'+act+'</td></tr>';
+      }).join('')
+    + '</tbody></table></div>';
+}
+
+async function pcbSetStatus(id, st){
+  try{
+    var r = await fetch('/web/api/parent-calls/'+id+'/status',{method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify({status:st})});
+    var d = await r.json();
+    if(d.ok) pcbLoad();
+  }catch(e){}
+}
+function pcbDone(id){ pcbSetStatus(id,'done'); }
+function pcbCancel(id){ if(confirm('إلغاء هذا النداء؟')) pcbSetStatus(id,'cancelled'); }
+
+async function pcbStats(){
+  var f = document.getElementById('pcb-from').value;
+  var t = document.getElementById('pcb-to').value;
+  var u = '/web/api/parent-calls/stats?limit=20'
+        + (f?'&date_from='+encodeURIComponent(f):'')
+        + (t?'&date_to='+encodeURIComponent(t):'');
+  var d = await api(u);
+  if(!d || !d.ok){ document.getElementById('pcb-stats').innerHTML='تعذّر التحميل'; return; }
+  if(!d.rows.length){ document.getElementById('pcb-stats').innerHTML =
+      '<div style="color:#666">لا توجد نداءات في هذه الفترة.</div>'; return; }
+  var max = d.rows[0].calls || 1;
+  document.getElementById('pcb-stats').innerHTML =
+      '<div class="tw"><table><thead><tr><th>#</th><th>الطالب</th><th>الفصل</th>'
+    + '<th>عدد النداءات</th><th>آخر نداء</th></tr></thead><tbody>'
+    + d.rows.map(function(r,i){
+        var w = Math.round((r.calls/max)*100);
+        return '<tr><td>'+(i+1)+'</td><td>'+pcbEsc(r.student_name)+'</td>'
+             + '<td>'+pcbEsc(r.class_name)+'</td>'
+             + '<td><div style="display:flex;align-items:center;gap:8px">'
+             + '<div style="height:8px;width:'+w+'%;min-width:6px;background:#E11D48;border-radius:4px"></div>'
+             + '<b>'+r.calls+'</b></div></td>'
+             + '<td style="font-size:12px;color:#666">'+pcbEsc((r.last_call||'').slice(0,16))+'</td></tr>';
+      }).join('')
+    + '</tbody></table></div>';
+}
+
+function pcbInit(){
+  fillSel('pcb-cls');
+  var d=document.getElementById('pcb-date'); if(d&&!d.value)d.value=today;
+  var f=document.getElementById('pcb-from'); if(f&&!f.value)f.value=today;
+  var t=document.getElementById('pcb-to');   if(t&&!t.value)t.value=today;
+
+  var snd=document.getElementById('pcb-sound');
+  var pref='1';
+  try{ var v=localStorage.getItem('pcbSound'); if(v!==null) pref=v; }catch(e){}
+  if(snd) snd.checked = (pref==='1');
+  pcbAudioUnlock(); pcbSoundHint();
+
+  _pcbSeen = null;   /* فتحُ الشاشة ليس نداءً جديداً */
+  pcbLoad(); pcbStats();
+  if(_pcbTimer) clearInterval(_pcbTimer);
+  _pcbTimer = setInterval(function(){
+    var tab=document.getElementById('tab-parent_calls_board');
+    var on=document.getElementById('pcb-auto');
+    if(tab && tab.classList.contains('active')){
+      if(on && on.checked) pcbLoad();
+    } else {
+      pcbSetTitle(0);   /* لا نُبقي العدّاد في العنوان خارج الشاشة */
+    }
+  }, 15000);
+}
+
 /* ── GRADE ANALYSIS — يستخدم نفس محرّك التطبيق المكتبي ── */
 async function analyzeStudent(forcedSid){
   var sid = forcedSid || document.getElementById('an-student').value;
@@ -7793,7 +8071,8 @@ async function getPortalLink(sid){
 async function loadExemptedStudents(){
   var d=await api('/web/api/exempted-students');if(!d||!d.ok)return;
   document.getElementById('ex-table').innerHTML=(d.rows||[]).map(function(r){
-    return '<tr><td>'+r.student_name+'</td><td>'+r.class_name+'</td><td>'+(r.reason||'-')+'</td><td>'+(r.exempted_at?r.exempted_at.split('T')[0]:'-')+'</td>'+
+    var _dt = r.created_at || '';
+    return '<tr><td>'+r.student_name+'</td><td>'+(r.class_name||'-')+'</td><td>'+(r.reason||'-')+'</td><td>'+(_dt?_dt.split('T')[0]:'-')+'</td>'+
       '<td><button class="btn bp3 bsm" onclick="removeExemptedStudent(\''+r.student_id+'\')"><i class="fas fa-trash"></i></button></td></tr>';
   }).join('')||'<tr><td colspan="5" style="color:#9CA3AF;text-align:center">لا يوجد طلاب مستثنون</td></tr>';
 }
@@ -10498,6 +10777,167 @@ async def api_send_portal_link(request: Request):
 
 # ─── PARENT PORTAL (SNAP-VIEW) ───────────────────────────────────
 
+# ═══════════════════════════════════════════════════════════════
+#  مناداة ولي الأمر
+# ═══════════════════════════════════════════════════════════════
+# ولي الأمر يقف عند البوابة فيضغط زراً في صفحته الثابتة، فيظهر ابنه في
+# أعلى شاشة الاستقبال بشريط أحمر. الرمز في الرابط هو الهوية — لا حساب
+# ولا كلمة مرور، وهو ثابت لكل طالب فلا يتغير الرابط أبداً.
+
+def _call_student_context(student_id):
+    """اسم الطالب وفصله وحالته اليوم — للعرض في شاشة الاستقبال."""
+    ctx = {"name": "", "class_id": "", "class_name": "", "status": ""}
+    try:
+        store = load_students() or {}
+        for c in (store.get("list") or []):
+            for s in (c.get("students") or []):
+                if str(s.get("id")) == str(student_id):
+                    ctx["name"] = s.get("name", "")
+                    ctx["class_id"] = c.get("id", "")
+                    ctx["class_name"] = c.get("name", "")
+                    return ctx
+    except Exception:
+        pass
+    return ctx
+
+
+@router.post("/p/{token}/call", response_class=JSONResponse)
+async def parent_portal_call(token: str, request: Request):
+    """يبدأ ولي الأمر النداء. بلا مصادقة — الرمز نفسه هو الإذن."""
+    student_id = get_student_id_by_portal_token(token)
+    if not student_id:
+        return JSONResponse({"ok": False, "error": "الرابط غير صالح"}, status_code=404)
+
+    note = ""
+    try:
+        body = await request.json()
+        note = str((body or {}).get("note", ""))[:200]
+    except Exception:
+        pass
+
+    ctx = _call_student_context(student_id)
+    res = create_parent_call(student_id, ctx["name"], ctx["class_id"], ctx["class_name"],
+                             note=note, source="portal")
+    if not res.get("created"):
+        if res.get("reason") == "already_waiting":
+            return JSONResponse({"ok": True, "already": True,
+                                 "msg": "نداؤك مُسجَّل والمدرسة تراه الآن",
+                                 "call": res.get("call")})
+        if res.get("reason") == "cooldown":
+            mins = max(1, int(res.get("wait_seconds", 0) / 60) + 1)
+            return JSONResponse({"ok": False, "cooldown": True,
+                                 "error": f"تم استلام ابنك للتو. يمكنك النداء مجدداً بعد {mins} دقيقة."},
+                                status_code=429)
+        return JSONResponse({"ok": False, "error": "تعذّر تسجيل النداء"}, status_code=400)
+
+    return JSONResponse({"ok": True, "created": True,
+                         "msg": "وصل نداؤك — سيخرج ابنك بعد قليل بإذن الله",
+                         "call": res["call"]})
+
+
+@router.get("/p/{token}/call-status", response_class=JSONResponse)
+async def parent_portal_call_status(token: str):
+    """يتابع ولي الأمر حالة ندائه دون تكرار الضغط."""
+    student_id = get_student_id_by_portal_token(token)
+    if not student_id:
+        return JSONResponse({"ok": False, "error": "الرابط غير صالح"}, status_code=404)
+    calls = get_parent_calls(date=now_riyadh_date(), student_id=student_id)
+    waiting = next((c for c in calls if c["status"] == "waiting"), None)
+    last_done = next((c for c in calls if c["status"] == "done"), None)
+    return JSONResponse({"ok": True,
+                         "waiting": bool(waiting),
+                         "called_at": (waiting or {}).get("called_at", ""),
+                         "last_done_at": (last_done or {}).get("handled_at", "")})
+
+
+@router.get("/web/api/parent-calls", response_class=JSONResponse)
+async def web_parent_calls(request: Request, date: str = None):
+    """شاشة الاستقبال: من في المدرسة الآن، والمنادَون في المقدمة.
+
+    الحضور من الخلطة الموحّدة لا من جدول الغياب وحده، فالطالب قد يكون
+    حاضراً ببصمة ولم يسجّله معلم بعد.
+    """
+    user = _get_current_user(request)
+    if not user:
+        return JSONResponse({"ok": False, "error": "غير مصرح"}, status_code=401)
+
+    target = (date or "").strip() or now_riyadh_date()
+    try:
+        from attendance_blend import reconcile_daily_attendance
+        blend = reconcile_daily_attendance(target)
+        roster = blend.get("students") or []
+    except Exception:
+        roster = []
+
+    calls = get_parent_calls(date=target)
+    waiting = {c["student_id"]: c for c in calls if c["status"] == "waiting"}
+    done_ids = {c["student_id"] for c in calls if c["status"] == "done"}
+
+    # داخل المدرسة = حاضر أو متأخر. الغائب والهارب ليسا فيها.
+    inside = []
+    for s in roster:
+        if s.get("status") not in ("حاضر", "متأخر"):
+            continue
+        sid = str(s.get("id"))
+        w = waiting.get(sid)
+        inside.append({
+            "student_id": sid, "student_name": s.get("name", ""),
+            "class_id": s.get("class_id", ""), "class_name": s.get("class_name", ""),
+            "status": s.get("status", ""), "source": s.get("source", ""),
+            "called": bool(w),
+            "call_id": (w or {}).get("id"),
+            "called_at": (w or {}).get("called_at", ""),
+            "note": (w or {}).get("note", ""),
+            "handled_today": sid in done_ids,
+        })
+
+    # المنادَون أولاً، والأقدم نداءً قبل الأحدث — من انتظر أطول يُخدم أولاً
+    inside.sort(key=lambda r: (0 if r["called"] else 1,
+                               r["called_at"] if r["called"] else "",
+                               r["class_name"], r["student_name"]))
+
+    # نداءات لطلاب ليسوا ضمن الحاضرين — تُعرض ولا تُخفى، فقد يكون
+    # الحضور لم يُسجَّل بعد أو الطالب غائب وولي أمره لا يعلم.
+    inside_ids = {r["student_id"] for r in inside}
+    orphan = [{"student_id": c["student_id"], "student_name": c["student_name"],
+               "class_name": c["class_name"], "call_id": c["id"],
+               "called_at": c["called_at"], "note": c["note"]}
+              for c in calls if c["status"] == "waiting" and c["student_id"] not in inside_ids]
+
+    return JSONResponse({
+        "ok": True, "date": target,
+        "counts": {"inside": len(inside), "waiting": len(waiting),
+                   "done": len(done_ids), "not_inside": len(orphan)},
+        "students": inside, "calls_not_inside": orphan,
+    })
+
+
+@router.post("/web/api/parent-calls/{call_id}/status", response_class=JSONResponse)
+async def web_parent_call_status(call_id: int, request: Request):
+    user = _get_current_user(request)
+    if not user:
+        return JSONResponse({"ok": False, "error": "غير مصرح"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    st = str((body or {}).get("status", "done")).strip()
+    if st not in ("done", "cancelled", "waiting"):
+        return JSONResponse({"ok": False, "error": "حالة غير معروفة"}, status_code=400)
+    n = set_parent_call_status(call_id, st, user.get("username", ""))
+    return JSONResponse({"ok": bool(n), "updated": n})
+
+
+@router.get("/web/api/parent-calls/stats", response_class=JSONResponse)
+async def web_parent_call_stats(request: Request, date_from: str = None,
+                                date_to: str = None, limit: int = 20):
+    user = _get_current_user(request)
+    if not user:
+        return JSONResponse({"ok": False, "error": "غير مصرح"}, status_code=401)
+    rows = get_parent_call_stats(date_from, date_to, limit)
+    return JSONResponse({"ok": True, "count": len(rows), "rows": rows})
+
+
 @router.get("/p/{token}", response_class=HTMLResponse)
 async def web_parent_portal(token: str):
     from database import (get_student_id_by_portal_token, get_student_total_points,
@@ -10535,6 +10975,62 @@ async def web_parent_portal(token: str):
             </div>
         </div>
         """
+
+    # بطاقة المناداة تُبنى خارج الـ f-string عمداً: الصفحة كلها f-string،
+    # وأي قوس في JS بداخلها يلزمه تضعيف، وهو مصدر أخطاء صامتة.
+    call_card = """
+        <div class="card" id="callCard" style="border:2px solid #E11D48;background:#FFF1F2">
+            <div style="font-weight:700;color:#9F1239;margin-bottom:6px">
+                <i class="fas fa-bell"></i> وصلت إلى المدرسة؟
+            </div>
+            <p style="margin:0 0 12px;font-size:13px;color:#7F1D1D;line-height:1.7">
+                اضغط الزر ليظهر اسم ابنك أمام موظف الاستقبال فوراً، فيُرسَل إليك دون انتظار.
+            </p>
+            <button id="callBtn" onclick="sendCall()" style="width:100%;padding:16px;border:0;
+                border-radius:12px;background:#E11D48;color:#fff;font-size:17px;font-weight:700;
+                cursor:pointer;font-family:inherit">
+                أنا في الخارج — نادِ ابني
+            </button>
+            <div id="callMsg" style="margin-top:10px;font-size:13px;text-align:center;color:#7F1D1D"></div>
+        </div>
+        <script>
+        var CALL_TOKEN = "__TOKEN__";
+        function setMsg(t, color){
+            var el = document.getElementById("callMsg");
+            el.textContent = t; el.style.color = color || "#7F1D1D";
+        }
+        function markWaiting(at){
+            var b = document.getElementById("callBtn");
+            b.disabled = true; b.style.background = "#9CA3AF"; b.style.cursor = "default";
+            b.textContent = "نداؤك مُسجَّل";
+            setMsg("المدرسة ترى نداءك الآن" + (at ? " (" + at.slice(11,16) + ")" : ""), "#065F46");
+        }
+        async function sendCall(){
+            var b = document.getElementById("callBtn");
+            b.disabled = true; setMsg("جارٍ الإرسال...");
+            try{
+                var r = await fetch("/p/" + CALL_TOKEN + "/call", {
+                    method: "POST", headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({})
+                });
+                var d = await r.json();
+                if(d.ok){ markWaiting((d.call || {}).called_at || ""); }
+                else { setMsg(d.error || "تعذّر الإرسال", "#B91C1C"); b.disabled = false; }
+            }catch(e){
+                setMsg("تعذّر الاتصال — تحقق من الشبكة", "#B91C1C"); b.disabled = false;
+            }
+        }
+        async function checkCall(){
+            try{
+                var r = await fetch("/p/" + CALL_TOKEN + "/call-status");
+                var d = await r.json();
+                if(d.ok && d.waiting){ markWaiting(d.called_at); }
+            }catch(e){}
+        }
+        checkCall();
+        setInterval(checkCall, 20000);
+        </script>
+""".replace("__TOKEN__", token)
 
     # تحويل البيانات لعرضها بشكل جذاب
     html = f"""<!DOCTYPE html>
@@ -10596,6 +11092,8 @@ async def web_parent_portal(token: str):
                 </div>
             </div>
         </div>
+
+{call_card}
 
         <div class="stats-grid">
             <div class="stat-item stat-blue">
