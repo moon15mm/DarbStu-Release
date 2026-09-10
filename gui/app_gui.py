@@ -569,6 +569,15 @@ class AppGUI(
         import threading as _th
         win = tk.Toplevel(self.root); win.title("معاينة الاستيراد"); win.geometry("860x560")
         loading = ttk.Label(win, text="⏳ جارٍ قراءة الملف...", font=("Tahoma",12)); loading.pack(expand=True)
+        def _fail(msg):
+            """لا موت صامت. اختفاءُ النافذة بلا كلمة كان يبدو للمدرسة
+            كأن البرنامج تجاهل الضغطة، فتُعيد المحاولة بلا فائدة."""
+            def _show():
+                try: win.destroy()
+                except Exception: pass
+                messagebox.showerror("تعذّر قراءة ملف الطلاب", msg, parent=self.root)
+            win.after(0, _show)
+
         def _load():
             try:
                 import pandas as pd
@@ -576,15 +585,77 @@ class AppGUI(
                 for sname in xls.sheet_names:
                     df_try = pd.read_excel(xlsx_path, sheet_name=sname, dtype=str)
                     if REQUIRED <= set(str(c).strip() for c in df_try.columns): df = df_try; break
-                if df is None: win.after(0, win.destroy); return
+                if df is None:
+                    # الأعمدة الكلاسيكية غير موجودة — وهذا حال أغلب ملفات
+                    # نور الحديثة. المحلّل الشامل (نفسه الذي تستعمله لوحة
+                    # الويب) يتعرّف على الصيغ الثلاث، فنُحوّل إليه بدل
+                    # الاستسلام: كان يُغلق النافذة بلا رسالة فيبدو معطّلاً.
+                    win.after(0, lambda: self._import_via_full_parser(win, xlsx_path))
+                    return
                 df.columns = [str(c).strip() for c in df.columns]
                 df = df.dropna(subset=["رقم الطالب","اسم الطالب"])
                 store = load_students(); current_ids = set(s["id"] for cls in store["list"] for s in cls["students"])
                 new_ids = set(str(r["رقم الطالب"]).strip() for _,r in df.iterrows())
                 added = new_ids - current_ids; removed = current_ids - new_ids; same = new_ids & current_ids
                 win.after(0, lambda: self._show_import_preview(win, loading, df, added, removed, same, store, xlsx_path))
-            except Exception as e: win.after(0, win.destroy)
+            except Exception as e:
+                _fail("تعذّرت قراءة الملف:\n\n%s\n\nتأكد أنه ملف Excel من نور "
+                      "وأنه غير مفتوح في برنامج آخر." % e)
         _th.Thread(target=_load, daemon=True).start()
+
+    def _import_via_full_parser(self, win, xlsx_path: str):
+        """
+        استيراد بالمحلّل الشامل مع معاينة — للملفات التي لا تحمل الأعمدة
+        الكلاسيكية (صيغ نور الحديثة). يعرض ما سيحدث قبل الكتابة.
+        """
+        try: win.destroy()
+        except Exception: pass
+        try:
+            from database import plan_students_import, apply_students_import
+            plan = plan_students_import(xlsx_path)
+        except Exception as e:
+            messagebox.showerror(
+                "تعذّر التعرّف على الملف",
+                "لم أتعرّف على صيغة هذا الملف:\n\n%s\n\n"
+                "صدّر كشف الطلاب من نور دون تعديل الأعمدة." % e,
+                parent=self.root)
+            return
+        c = (plan or {}).get("counts") or {}
+        if not c.get("in_file"):
+            messagebox.showerror(
+                "الملف لا يحوي طلاباً",
+                "قرأتُ الملف لكني لم أجد فيه أي طالب.\n\n"
+                "تأكد أنك اخترت كشف الطلاب من نور لا ملفاً آخر.",
+                parent=self.root)
+            return
+        msg = ("الملف: %d طالباً\n"
+               "الكشف الحالي: %d\n\n"
+               "  • جديد سيُضاف        : %d\n"
+               "  • سيُنقل لصف آخر     : %d\n"
+               "  • ليس في الملف       : %d\n"
+               "  • رقم أكاديمي محفوظ  : %d\n\n"
+               "الأرقام الأكاديمية المولَّدة سابقاً لا تتغيّر.\n\n"
+               "هل أطبّق الاستيراد؟"
+               % (c.get("in_file", 0), c.get("current", 0), c.get("added", 0),
+                  c.get("moved", 0), c.get("removed", 0), c.get("academic_kept", 0)))
+        if not messagebox.askyesno("معاينة الاستيراد", msg, parent=self.root):
+            return
+        try:
+            res = apply_students_import(xlsx_path, apply_moves=True, add_new=True,
+                                        remove_missing=False, generate_numbers=True)
+        except Exception as e:
+            messagebox.showerror("فشل الاستيراد", str(e), parent=self.root)
+            return
+        try:
+            self.update_all_tabs_after_data_change()
+        except Exception:
+            self.store = load_students(force_reload=True)
+        messagebox.showinfo(
+            "تم الاستيراد",
+            "أُضيف %d، ونُقل %d، وأرقام أكاديمية جديدة %d."
+            % (res.get("added", 0), res.get("moved", 0),
+               res.get("numbers_generated", 0)),
+            parent=self.root)
 
     def _show_import_preview(self, win, loading, df, added, removed, same, store, xlsx_path):
         loading.destroy()

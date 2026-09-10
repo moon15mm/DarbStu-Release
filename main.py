@@ -235,17 +235,83 @@ def ensure_single_instance():
         # قفل بلا عملية: بقايا، أو جلسة أخرى، أو عملية فرعية. نُكمل.
         return handle
 
+    # نسخة تعمل فعلاً. لا نطرد المستخدم إلى مدير المهام — نُعيد له نافذته.
+    if _restore_windows_of(pids):
+        print("[LOCK] النسخة العاملة أُعيدت إلى الواجهة — تُغلق هذه")
+        sys.exit(0)
+
+    # لا نافذة لها: جذر Tk يتيم يُبقي العملية حيّة بعد اختفاء الواجهة،
+    # فكان المستخدم يُطالَب بإنهائها من مدير المهام قبل كل تشغيل.
+    # نعرض الإنهاء نيابةً عنه.
     root_tmp = tk.Tk()
     root_tmp.withdraw()
-    messagebox.showwarning(
-        "البرنامج يعمل بالفعل",
-        "هناك نسخة من البرنامج تعمل الآن (رقم العملية: %s).\n\n"
-        "قد تكون مخفية — جرّب الضغط على  Ctrl + Alt + S  لإظهارها.\n\n"
-        "وإن لم تظهر: افتح إدارة المهام (Ctrl+Shift+Esc) وابحث عن\n"
-        "DarbStu.exe  ثم أنهِ المهمة، وأعد التشغيل."
+    kill = messagebox.askyesno(
+        "البرنامج يعمل في الخلفية",
+        "هناك نسخة من البرنامج تعمل بلا نافذة (رقم العملية: %s).\n\n"
+        "هل أُغلقها وأُشغّل البرنامج من جديد؟"
         % "، ".join(str(p) for p in pids))
     root_tmp.destroy()
+    if not kill:
+        sys.exit(0)
+    if _terminate_pids(pids):
+        print("[LOCK] أُنهيت النسخة العالقة — نُكمل التشغيل")
+        return handle
+    root_tmp2 = tk.Tk(); root_tmp2.withdraw()
+    messagebox.showerror(
+        "تعذّر الإغلاق",
+        "لم أتمكّن من إغلاق النسخة العاملة.\n\n"
+        "افتح إدارة المهام (Ctrl+Shift+Esc) وأنهِ DarbStu.exe ثم أعد التشغيل.")
+    root_tmp2.destroy()
     sys.exit(0)
+
+
+def _restore_windows_of(pids) -> bool:
+    """يُظهر نافذة نسخة عاملة ويجلبها للمقدمة. True إن وُجدت نافذة."""
+    if sys.platform != 'win32':
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32 = ctypes.WinDLL('user32', use_last_error=True)
+        found = []
+
+        CB = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _cb(hwnd, _l):
+            pid = wintypes.DWORD()
+            u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            # نافذة عليا فقط — لا نوافذ الأدوات والقوائم
+            if pid.value in pids and not u32.GetWindow(hwnd, 4):
+                found.append(hwnd)
+            return True
+
+        u32.EnumWindows(CB(_cb), 0)
+        shown = False
+        for h in found:
+            u32.ShowWindow(h, 9)          # SW_RESTORE
+            u32.SetForegroundWindow(h)
+            shown = True
+        return shown
+    except Exception:
+        return False
+
+
+def _terminate_pids(pids) -> bool:
+    """يُنهي عمليات محددة بأرقامها. True إن لم يبقَ منها شيء."""
+    if sys.platform != 'win32':
+        return False
+    try:
+        import ctypes, time as _t
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        for pid in pids:
+            h = k32.OpenProcess(0x0001, False, int(pid))   # PROCESS_TERMINATE
+            if h:
+                k32.TerminateProcess(h, 0)
+                k32.CloseHandle(h)
+        _t.sleep(1.5)
+        return not _live_sibling_pids()
+    except Exception:
+        return False
 
 
 def _close_splash(root=None):
