@@ -287,7 +287,9 @@ def _early_setup():
     except Exception as _e:
         print(f"[SETUP] تعذّر تطبيق ملف التجهيز: {_e}")
 
-    _flag = os.path.join(_BASE, 'data', '.setup_done')
+    # علامة اكتمال الإعداد لكل مرحلة على حدة — مشتركةً كانت تُسقط
+    # معالجَ المرحلة الثانية فتبقى بلا اسم مدرسة ولا كلمة مرور مدير.
+    _flag = os.path.join(_STAGE_ROOT_DIR or _BASE, 'data', '.setup_done')
     if os.path.exists(_flag):
         return True
     _r = tk.Tk(); _r.withdraw()

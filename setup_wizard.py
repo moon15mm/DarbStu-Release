@@ -14,7 +14,12 @@ import provisioning as _prov   # كذلك
 _BASE_DIR   = (os.path.dirname(sys.executable)
                if getattr(sys, 'frozen', False)
                else os.path.dirname(os.path.abspath(__file__)))
-_DATA_DIR   = os.path.join(_BASE_DIR, 'data')
+# ⚠️ من جذر المرحلة لا من جذر البرنامج — وهو الجذر نفسه بلا مراحل.
+# بدونه في كيان بمرحلتين: المعالج يكتب config.json في مكانٍ لا يقرؤه
+# البرنامج (constants.CONFIG_JSON داخل مجلد المرحلة)، وعلامةُ الاكتمال
+# مشتركة فتُحرم المرحلة الثانية من معالجها فتبقى بلا اسم ولا كلمة مرور.
+# ‏provisioning يحسب الجذر نفسه ولا يستورد شيئاً من المشروع.
+_DATA_DIR   = os.path.join(_prov.STAGE_ROOT, 'data')
 _CONFIG_JSON = os.path.join(_DATA_DIR, 'config.json')
 _SETUP_FLAG  = os.path.join(_DATA_DIR, '.setup_done')
 

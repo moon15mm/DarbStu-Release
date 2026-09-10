@@ -624,7 +624,11 @@ class ActivationWindow:
             return
         try:
             import provisioning
-            dest = os.path.join(provisioning.BASE_DIR, "provision.json")
+            # الاسم الذي تبحث عنه هذه المرحلة بالذات — المجرّد في مدرسة
+            # بمرحلة واحدة، والموسوم بالمرحلة في كيان بمرحلتين. نسخُه
+            # بالاسم المجرّد هناك يعني ملفاً لا يقرؤه أحد وإصلاحاً يفشل بصمت.
+            dest = os.path.join(provisioning.STAGE_ROOT,
+                                provisioning._provision_names()[0])
             if os.path.abspath(path) != os.path.abspath(dest):
                 shutil.copyfile(path, dest)
             info = provisioning.apply_provision_file()
