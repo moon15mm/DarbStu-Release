@@ -16,6 +16,7 @@ provisioning.py — تجهيز جهاز المدرسة قبل التسليم
    قبل الاستيرادات الثقيلة.
 """
 import os
+import re
 import sys
 import json
 import subprocess
@@ -24,15 +25,33 @@ BASE_DIR = (os.path.dirname(sys.executable)
             if getattr(sys, 'frozen', False)
             else os.path.dirname(os.path.abspath(__file__)))
 
-DATA_DIR    = os.path.join(BASE_DIR, 'data')
+
+def _stage_root() -> str:
+    """
+    جذر بيانات المرحلة النشطة — نسخة مطابقة لما في constants._stage_root.
+
+    مكرّرة عمداً: هذا الملف لا يستورد أي وحدة من المشروع (انظر ترويسته)،
+    ولو استورد constants لانكسر ترتيب الإقلاع. النسختان يحرس تطابقهما
+    tools/check_stage_isolation.py.
+    """
+    _sid = os.environ.get('DARB_STAGE', '').strip().lower()
+    if not _sid or not re.match(r'^[a-z0-9_-]{1,32}$', _sid):
+        return BASE_DIR
+    return os.path.join(BASE_DIR, 'stages', _sid)
+
+
+STAGE_ROOT  = _stage_root()
+
+DATA_DIR    = os.path.join(STAGE_ROOT, 'data')
 CONFIG_JSON = os.path.join(DATA_DIR, 'config.json')
 
 _PROVISION_NAMES = ('provision.json', 'darbstu-provision.json')
 
-# ملفات النفق — خارج data حتى لا يخدمها الخادم بأي حال
-TUNNEL_FILE      = os.path.join(BASE_DIR, '.darb_tunnel.json')
-KEY_FILE         = os.path.join(BASE_DIR, '.darb_tunnel_key')
-KNOWN_HOSTS_FILE = os.path.join(BASE_DIR, '.darb_known_hosts')
+# ملفات النفق — خارج data حتى لا يخدمها الخادم بأي حال، ومع المرحلة
+# لا مع البرنامج: لكل مرحلة نفقها ونطاقها ومفتاحها.
+TUNNEL_FILE      = os.path.join(STAGE_ROOT, '.darb_tunnel.json')
+KEY_FILE         = os.path.join(STAGE_ROOT, '.darb_tunnel_key')
+KNOWN_HOSTS_FILE = os.path.join(STAGE_ROOT, '.darb_known_hosts')
 
 _NO_WINDOW = dict(creationflags=subprocess.CREATE_NO_WINDOW) if os.name == 'nt' else {}
 
@@ -77,7 +96,7 @@ def _search_dirs():
     الاسم نفسه (Roaming\\...\\Start Menu\\Programs\\DarbStu) فيقع فيه الالتباس
     كثيراً. نبحث في الأماكن الشائعة كلها بدل أن يفشل التجهيز بصمت.
     """
-    dirs = [BASE_DIR, DATA_DIR]
+    dirs = [STAGE_ROOT, BASE_DIR, DATA_DIR]
     home = os.path.expanduser("~")
     appdata = os.environ.get("APPDATA", "")
     for d in (
@@ -91,9 +110,27 @@ def _search_dirs():
     return dirs
 
 
+def _provision_names() -> tuple:
+    """
+    أسماء ملف التجهيز، الأخصّ أولاً.
+
+    مدرسة بمرحلتين تحمل ملفَي تجهيز — نطاقاً ومفتاحاً لكل مرحلة، فيُوسَم
+    كل ملف بمرحلته.
+
+    ومقصودٌ ألا تقبل المرحلةُ الاسمَ المجرّد إطلاقاً: قبولُه يعني أن أول
+    مرحلة تُقلع تلتهم ملفاً قد يكون للأخرى، فيرتبط الجهاز بنطاق واحد
+    **بلا رسالة خطأ** — وهذا أسوأ من ألا يُقرأ الملف فيظهر تنبيه الإعداد.
+    """
+    sid = os.environ.get('DARB_STAGE', '').strip().lower()
+    if sid and re.match(r'^[a-z0-9_-]{1,32}$', sid):
+        return ('provision-%s.json' % sid, 'darbstu-provision-%s.json' % sid)
+    return _PROVISION_NAMES
+
+
 def _find_provision_file() -> str:
+    names = _provision_names()
     for d in _search_dirs():
-        for n in _PROVISION_NAMES:
+        for n in names:
             try:
                 p = os.path.join(d, n)
                 if os.path.isfile(p):

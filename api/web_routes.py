@@ -1145,6 +1145,48 @@ async def api_add_exempted_student(req: Request):
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 
+# --- مراحل المدرسة (كيان بمرحلتين على جهاز واحد) ---
+
+@router.get("/web/api/stages", response_class=JSONResponse)
+async def api_get_stages(request: Request):
+    """
+    وصف مراحل هذا الجهاز والمرحلة التي تخدمها هذه اللوحة.
+
+    مدرسة بمرحلة واحدة ترجع stages فارغة — فتُخفي الواجهة القسم كلّه
+    ولا يرى مديرها شيئاً عن ميزة لا تخصّه.
+    """
+    user = _get_current_user(request)
+    if not user:
+        return JSONResponse({"ok": False}, status_code=401)
+    try:
+        import json as _j
+        from constants import BASE_DIR as _BD, STAGE_ID as _SID
+        rows = []
+        try:
+            import stage_manager
+            items = stage_manager.load_stages()
+        except Exception:
+            items = []
+        for s in items:
+            d = os.path.join(_BD, "stages", s["id"])
+            url = ""
+            try:
+                with open(os.path.join(d, ".darb_tunnel.json"), encoding="utf-8") as f:
+                    url = _j.load(f).get("public_url", "")
+            except Exception:
+                pass
+            rows.append({
+                "id": s["id"], "name": s["name"],
+                "school_name": s.get("school_name", ""),
+                "port": s.get("port", 0), "url": url,
+                "current": (s["id"] == _SID),
+                "ready": os.path.isfile(os.path.join(d, "absences.db")),
+            })
+        return JSONResponse({"ok": True, "current": _SID, "stages": rows})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
 @router.delete("/web/api/exempted-students/{student_id}", response_class=JSONResponse)
 async def api_remove_exempted_student(student_id: str, request: Request):
     user = _get_current_user(request)
@@ -3189,6 +3231,12 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
       </div>
       <button class="btn bp1" onclick="saveSchoolSettings()">💾 حفظ</button>
       <div id="ss-st" style="margin-top:10px"></div>
+    </div>
+    <!-- ── مراحل الجهاز — يظهر فقط في كيان بمرحلتين ── -->
+    <div class="section" id="ss-stages-box" style="display:none">
+      <div class="st">🏫 مراحل هذا الجهاز</div>
+      <div class="ab ai">📌 لكل مرحلة بياناتها ورابطها ومستخدموها — معزولة تماماً عن الأخرى.</div>
+      <div id="ss-stages"></div>
     </div>
   </div>
   <div id="ss-msg" class="ip">
@@ -5391,7 +5439,32 @@ async function createBackup(){
 }
 
 /* ── SETTINGS ── */
+/* مراحل الجهاز — القسم كلّه مخفيّ في مدرسة بمرحلة واحدة */
+async function loadStages(){
+  var box=document.getElementById('ss-stages-box');
+  if(!box)return;
+  var d=await api('/web/api/stages');
+  if(!d||!d.ok||!(d.stages||[]).length){box.style.display='none';return;}
+  box.style.display='';
+  document.getElementById('ss-stages').innerHTML=d.stages.map(function(s){
+    var cur=s.current;
+    var link=s.url?('<a href="'+s.url+'" target="_blank">'+s.url+'</a>')
+                   :'<span style="color:#B91C1C">لم يُربط بعد</span>';
+    return '<div style="border:1px solid '+(cur?'#059669':'#E5E7EB')+';border-radius:9px;'+
+      'padding:12px 15px;margin-bottom:9px;background:'+(cur?'#F0FDF4':'#fff')+'">'+
+      '<div style="font-weight:700;color:#0C2E56">'+s.name+
+      (cur?' <span style="color:#059669;font-size:12px">● المعروضة الآن</span>':'')+'</div>'+
+      '<div style="color:#4B5563;font-size:13px;margin-top:3px">'+(s.school_name||'')+'</div>'+
+      '<div style="font-size:12.5px;margin-top:5px">'+link+
+      ' <span style="color:#9CA3AF">· منفذ محلي '+s.port+'</span>'+
+      (s.ready?'':' <span style="color:#B45309">· لم تُجهَّز بياناتها</span>')+'</div></div>';
+  }).join('')+
+   '<div style="font-size:12px;color:#6B7280;margin-top:4px">'+
+   'للتبديل بين المرحلتين: افتح رابط المرحلة الأخرى، أو شغّل اختصارها على سطح المكتب.'+
+   ' إضافة مرحلة جديدة تحتاج نطاقاً ومفتاحاً من مزوّد النظام.</div>';
+}
 async function loadSettings(){
+  loadStages();
   var d=await api('/web/api/config');if(!d)return;
   if(d.school_name)document.getElementById('ss-name').value=d.school_name;
   if(d.school_gender)document.getElementById('ss-gender').value=d.school_gender;

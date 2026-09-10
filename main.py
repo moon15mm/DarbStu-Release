@@ -27,6 +27,57 @@ try:
 except Exception:
     pass
 
+# ─── تجاوز الملفات المدمجة في EXE (تفعيل التحديثات الخارجية) ────────
+# ⚠️ نُقلت هذه الكتلة إلى ما قبل قفل النسخة الواحدة عمداً: القفل صار
+# يحتاج معرفة المرحلة، والمرحلة تُقرأ عبر stage_manager — ولو استُورد
+# قبل ضبط sys.path لجاء من داخل الـEXE ولما وصلته التحديثات أبداً.
+if getattr(sys, 'frozen', False):
+    _BASE = os.path.dirname(sys.executable)
+else:
+    _BASE = os.path.dirname(os.path.abspath(__file__))
+
+# ملفات .py السائبة بجانب البرنامج تسبق الكود المجمّد داخل الـ EXE — وهذا
+# مقصود ليعمل التحديث التلقائي. لكن بعد تثبيت نسخة جديدة فوق نسخة قديمة تبقى
+# ملفات النسخة القديمة فتُظلّل الجديدة ويتعطّل البرنامج بخطأ ImportError.
+# لذا: لا نُفعّلها إلا إذا كانت أحدث من الـ EXE نفسه.
+_use_loose = True
+if getattr(sys, 'frozen', False):
+    try:
+        _probe = os.path.join(_BASE, 'constants.py')
+        if os.path.exists(_probe):
+            if os.path.getmtime(_probe) < os.path.getmtime(sys.executable) - 5:
+                _use_loose = False
+                print("[BOOT] ملفات كود قديمة بجانب البرنامج — تُتجاهل، "
+                      "ويُستخدم الكود المدمج في النسخة الحالية")
+    except Exception:
+        pass
+
+if _use_loose and _BASE not in sys.path:
+    sys.path.insert(0, _BASE)
+# ──────────────────────────────────────────────────────────────────
+
+# ─── اختيار المرحلة (مدرسة متوسط + ثانوي على جهاز واحد) ────────────
+# يجب أن يسبق كل شيء: القفل يحتاج اسم المرحلة، وprovisioning و constants
+# يحتاجان مجلدها. مدرسة بلا stages.json تمرّ من هنا بلا أي أثر.
+_STAGE_ID = ''
+try:
+    import stage_manager
+    if stage_manager.load_stages():
+        _STAGE_ID = stage_manager.resolve_stage()
+        if not _STAGE_ID:
+            sys.exit(0)          # أُغلقت شاشة الاختيار
+        print("[STAGE] المرحلة النشطة: %s" % _STAGE_ID)
+except SystemExit:
+    raise
+except Exception as _stg_e:
+    # مدرسة عادية يجب ألا تتعطّل بسبب خلل هنا — تُكمل بمسارها القديم
+    print("[STAGE] تعذّر تحديد المرحلة (يُكمل بلا مراحل): %s" % _stg_e)
+
+_STAGE_LOCK_SUFFIX = ('_' + _STAGE_ID) if _STAGE_ID else ''
+_STAGE_ROOT_DIR    = (os.path.join(_BASE, 'stages', _STAGE_ID)
+                      if _STAGE_ID else '')
+# ──────────────────────────────────────────────────────────────────
+
 # ─── منع ازدواجية التطبيق ────────────────────────────────────────
 # كان القفل يحجز منفذاً ثابتاً (59124) ويعتبر أي فشل في الحجز «نسخة
 # تعمل». وهذا يُنتج إنذاراً كاذباً يمنع تشغيل البرنامج نهائياً كلما:
@@ -100,9 +151,42 @@ def _live_sibling_pids():
                 # العطل الذي نُصلحه.
             ok = k32.Process32NextW(snap, ctypes.byref(e))
         k32.CloseHandle(snap)
+
+        # مدرسة بمرحلتين: المرحلتان تعملان من **نفس المجلد** عمداً، فلم
+        # يعد المجلد وحده دليل تعارض — وإلا منعت الأولى الثانية. الدليل
+        # هنا أضيق: العملية المسجَّلة لهذه المرحلة بالذات ما زالت حيّة.
+        if _STAGE_ROOT_DIR:
+            mine = _read_stage_pid()
+            found = [p for p in found if p == mine] if mine else []
+
         return found
     except Exception:
         return []
+
+
+def _stage_pid_file() -> str:
+    return os.path.join(_STAGE_ROOT_DIR, '.darb_pid') if _STAGE_ROOT_DIR else ''
+
+
+def _read_stage_pid() -> int:
+    try:
+        with open(_stage_pid_file(), encoding='utf-8') as f:
+            return int((f.read() or '0').strip() or 0)
+    except Exception:
+        return 0
+
+
+def _write_stage_pid():
+    """يسجّل عملية هذه المرحلة — عليه وحده يعتمد فحص التعارض أعلاه."""
+    p = _stage_pid_file()
+    if not p:
+        return
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, 'w', encoding='utf-8') as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
 
 
 def ensure_single_instance():
@@ -124,7 +208,12 @@ def ensure_single_instance():
             k32.CreateMutexW.argtypes = [wintypes.LPCVOID, wintypes.BOOL,
                                          wintypes.LPCWSTR]
             k32.CreateMutexW.restype = wintypes.HANDLE
-            handle = k32.CreateMutexW(None, False, 'Global\\DarbStu_SingleInstance')
+            # اللاحقة فارغة بلا مراحل — فيبقى الاسم كما كان حرفياً على
+            # كل تنصيب قائم. ومرحلتان في نفس المجلد تحتاجان اسمين،
+            # وإلا منعت الأولى الثانية من الفتح.
+            handle = k32.CreateMutexW(
+                None, False,
+                'Global\\DarbStu_SingleInstance' + _STAGE_LOCK_SUFFIX)
             running = (ctypes.get_last_error() == ERROR_ALREADY_EXISTS)
         except Exception:
             # تعذّر المُزامِن — لا نمنع التشغيل بسببه
@@ -181,33 +270,8 @@ def _close_splash(root=None):
 
 
 _app_lock = ensure_single_instance()
+_write_stage_pid()      # بعد اجتياز القفل — يقرأه فحصُ المرحلة التالي
 # ─────────────────────────────────────────────────────────────
-
-# ─── تجاوز الملفات المدمجة في EXE (تفعيل التحديثات الخارجية) ────────
-if getattr(sys, 'frozen', False):
-    _BASE = os.path.dirname(sys.executable)
-else:
-    _BASE = os.path.dirname(os.path.abspath(__file__))
-
-# ملفات .py السائبة بجانب البرنامج تسبق الكود المجمّد داخل الـ EXE — وهذا
-# مقصود ليعمل التحديث التلقائي. لكن بعد تثبيت نسخة جديدة فوق نسخة قديمة تبقى
-# ملفات النسخة القديمة فتُظلّل الجديدة ويتعطّل البرنامج بخطأ ImportError.
-# لذا: لا نُفعّلها إلا إذا كانت أحدث من الـ EXE نفسه.
-_use_loose = True
-if getattr(sys, 'frozen', False):
-    try:
-        _probe = os.path.join(_BASE, 'constants.py')
-        if os.path.exists(_probe):
-            if os.path.getmtime(_probe) < os.path.getmtime(sys.executable) - 5:
-                _use_loose = False
-                print("[BOOT] ملفات كود قديمة بجانب البرنامج — تُتجاهل، "
-                      "ويُستخدم الكود المدمج في النسخة الحالية")
-    except Exception:
-        pass
-
-if _use_loose and _BASE not in sys.path:
-    sys.path.insert(0, _BASE)
-# ──────────────────────────────────────────────────────────────────
 
 # ─── معالج الإعداد الأولي ─────────────────────────────────────────
 # يجب أن يعمل قبل أي استيراد لـ constants أو api حتى تقرأ الثوابت

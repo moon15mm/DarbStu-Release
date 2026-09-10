@@ -2,7 +2,7 @@
 """
 constants.py — كل الثوابت والمتغيرات العامة المشتركة
 """
-import os, sys, datetime, socket, threading
+import os, re, sys, datetime, socket, threading
 
 # ── Lazy imports globals ──────────────────────────────────────────
 HtmlFrame         = None
@@ -49,19 +49,65 @@ BASE_DIR            = (os.path.dirname(sys.executable)
                        if getattr(sys, 'frozen', False)
                        else os.path.dirname(os.path.abspath(__file__)))
 
-PORT           = int(os.environ.get('ABSENTEE_PORT', '8000'))
+# ── جذر بيانات المرحلة النشطة ─────────────────────────────────
+# مدرسة بمرحلتين (متوسط + ثانوي) على جهاز واحد: البرنامج واحد،
+# والبيانات معزولة في stages/<id>/. انظر stage_manager.py.
+#
+# ⚠️ بلا DARB_STAGE يُرجع BASE_DIR نفسه — فتبقى مسارات كل مدرسة قائمة
+#    مطابقةً حرفاً بحرف. هذا الشرط يحرسه tools/check_stage_isolation.py.
+#
+# مكرّرة عمداً في provisioning.py: ذاك الملف لا يستورد شيئاً من
+# المشروع لأنه يعمل قبل الاستيرادات الثقيلة.
+def _stage_root() -> str:
+    _sid = os.environ.get('DARB_STAGE', '').strip().lower()
+    if not _sid:
+        return BASE_DIR
+    # نفس حصر المحارف في stage_manager — لا يُبنى مسار خارج stages/
+    if not re.match(r'^[a-z0-9_-]{1,32}$', _sid):
+        return BASE_DIR
+    return os.path.join(BASE_DIR, 'stages', _sid)
+
+STAGE_ID   = os.environ.get('DARB_STAGE', '').strip().lower()
+STAGE_ROOT = _stage_root()
 
 # ── قراءة الدومين من config.json عند الاستيراد ────────────────
 def _read_saved_domain() -> str:
     """يقرأ cloudflare_domain مباشرة من config.json بدون config_manager."""
     try:
         import json as _j
-        _p = os.path.join(BASE_DIR, 'data', 'config.json')
+        _p = os.path.join(STAGE_ROOT, 'data', 'config.json')
         if os.path.exists(_p):
             return _j.load(open(_p, 'r', encoding='utf-8')).get('cloudflare_domain', '')
     except Exception:
         pass
     return ''
+
+
+def _stage_port() -> int:
+    """
+    منفذ هذه المرحلة. مدرسة بمرحلة واحدة تبقى على ٨٠٠٠ كما كانت.
+
+    المرحلتان تحتاجان منفذين مختلفين وإلا قتل مُنظِّف الإقلاع في main
+    خادمَ الأولى عند تشغيل الثانية (يقتل ما يستمع على PORT).
+    """
+    _env = os.environ.get('ABSENTEE_PORT', '')
+    if _env.strip().isdigit():
+        return int(_env)
+    if STAGE_ID:
+        try:
+            import json as _j
+            _p = os.path.join(BASE_DIR, 'stages.json')
+            _raw = _j.load(open(_p, 'r', encoding='utf-8'))
+            _items = _raw.get('stages') if isinstance(_raw, dict) else _raw
+            for _i, _s in enumerate(_items or []):
+                if str(_s.get('id', '')).strip().lower() == STAGE_ID:
+                    return int(_s.get('port') or (8000 + _i))
+        except Exception:
+            pass
+    return 8000
+
+
+PORT           = _stage_port()
 
 _saved_domain     = _read_saved_domain()
 STATIC_DOMAIN     = f'https://{_saved_domain}' if _saved_domain else ''
@@ -70,7 +116,7 @@ MY_STATIC_DOMAIN  = _saved_domain
 ngrok = None
 
 APP_TITLE           = 'تسجيل غياب الطلاب'
-APP_VERSION         = '3.6.31'
+APP_VERSION         = '3.6.32'
 UPDATE_URL          = 'https://raw.githubusercontent.com/moon15mm/DarbStu-Release/main/version.json'
 UPDATE_DOWNLOAD_URL = 'https://github.com/moon15mm/DarbStu-Release/archive/refs/heads/main.zip'
 
@@ -80,8 +126,10 @@ UPDATE_DOWNLOAD_URL = 'https://github.com/moon15mm/DarbStu-Release/archive/refs/
 # حقن كود، لأنه لا يملك المفتاح. المفتاح العام آمن أن يكون علنياً.
 UPDATE_MANIFEST_URL = 'https://darbstu.com/update/manifest.json'
 UPDATE_PUBKEY       = 'JU3zbYeDT60ZZ/nXcNxO2PD6oIjmU7r0+o9TBXPbdLs='
-DB_PATH             = os.path.join(BASE_DIR, 'absences.db')
-DATA_DIR            = os.path.join(BASE_DIR, 'data')
+# ⚠️ من STAGE_ROOT لا BASE_DIR — وهو BASE_DIR نفسه بلا مراحل.
+# هنا يقع العزل كله: كل ما تحت DATA_DIR و DB_PATH ينعزل تبعاً لهما.
+DB_PATH             = os.path.join(STAGE_ROOT, 'absences.db')
+DATA_DIR            = os.path.join(STAGE_ROOT, 'data')
 STUDENTS_JSON       = os.path.join(DATA_DIR, 'students.json')
 USERS_JSON          = os.path.join(DATA_DIR, 'users.json')
 TARDINESS_JSON      = os.path.join(DATA_DIR, 'tardiness.db')
