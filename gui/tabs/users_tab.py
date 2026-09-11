@@ -39,7 +39,7 @@ class UsersTabMixin:
                    command=self._user_delete).pack(side="right", padx=3)
         ttk.Button(ctrl, text="📤 إرسال بيانات الدخول",
                    command=self._user_send_teacher_creds).pack(side="right", padx=3)
-        ttk.Button(ctrl, text="⚙️ توليد حسابات المعلمين",
+        ttk.Button(ctrl, text="⚙️ توليد حسابات الطاقم",
                    command=self._user_generate_teachers).pack(side="right", padx=3)
         ttk.Button(ctrl, text="✏️ تعديل",
                    command=self._user_edit_dialog).pack(side="right", padx=3)
@@ -523,54 +523,88 @@ class UsersTabMixin:
 
         delete_user(user_id); self._users_load()
 
+    # وظيفة نور → دور النظام. الاستيراد يسِم كل سجل بوظيفته من ترويسة
+    # ملف نور («نوع المستخدم»)، وكان التوليد يتجاهلها ويجعل الجميع
+    # «معلماً» — فتفتح الإدارية والموجّهة على تبويبات المعلمة وحدها،
+    # ولا ترى ما يخصّ عملها، ويظهر مسمّاها خاطئاً في كل شاشة.
+    _JOB_ROLE = (
+        ("موجه صحي",   "health"),
+        ("موجه",       "counselor"),   # موجه طلابي
+        ("اداري",      "staff"),
+        ("إداري",      "staff"),
+    )
+
+    # تبويبات المعلم مقصورة عمداً وأضيق من ROLE_TABS['teacher'] — تُترك
+    # كما هي حتى لا يتغيّر ما يراه المعلمون في المدارس القائمة.
+    _TEACHER_TABS = ["لوحة المراقبة", "تحليل النتائج", "تحويل طالب",
+                     "نماذج المعلم", "خطابات الاستفسار", "التعاميم والنشرات"]
+
+    @staticmethod
+    def _role_for_job(job: str):
+        j = " ".join(str(job or "").split())
+        for key, role in UsersTabMixin._JOB_ROLE:
+            if key in j:
+                return role
+        return "teacher"
+
     def _user_generate_teachers(self):
-        """توليد حسابات للمعلمين الذين ليس لديهم حسابات (بدون إرسال)."""
+        """توليد حسابات لأعضاء الطاقم الذين ليس لديهم حسابات (بدون إرسال)."""
         if not messagebox.askyesno("تأكيد",
-                "سيتم توليد حسابات بكلمة مرور عشوائية للمعلمين الذين ليس لديهم حسابات.\n"
+                "سيتم توليد حسابات بكلمة مرور عشوائية لكل من ليس له حساب،\n"
+                "ولكلٍّ دورُه حسب وظيفته في ملف نور (معلم / إداري / موجّه).\n"
                 "لن يتم الإرسال — استخدم زر 'إرسال بيانات الدخول' بعد ذلك.\nهل تريد المتابعة؟"):
             return
         from database import load_teachers, create_user, save_user_allowed_tabs, get_all_users
+        from constants import ROLE_TABS, ROLES
         import random
 
         teachers_data = load_teachers().get("teachers", [])
         if not teachers_data:
-            messagebox.showwarning("تنبيه", "لا يوجد معلمين. تأكد من استيراد ملف المعلمين أولاً.")
+            messagebox.showwarning("تنبيه", "لا يوجد طاقم. تأكد من استيراد ملف نور أولاً.")
             return
 
         existing_users = {u["username"] for u in get_all_users()}
         success_count = 0
         skip_count = 0
+        per_role = {}
 
         self.root.config(cursor="wait")
         try:
             for t in teachers_data:
-                name    = t.get("اسم المعلم", "").strip()
-                phone   = t.get("رقم الجوال", "").strip()
-                civ_id  = t.get("رقم الهوية", "").strip()
+                name    = (t.get("اسم المعلم") or t.get("full_name") or "").strip()
+                phone   = (t.get("رقم الجوال") or "").strip()
+                civ_id  = (t.get("رقم الهوية") or "").strip()
                 username = civ_id if civ_id else phone
-                if not username:
+                if not username or not name:
                     skip_count += 1; continue
                 if username in existing_users:
                     skip_count += 1; continue
+                role = self._role_for_job(t.get("الوظيفة", ""))
                 password = str(random.randint(100000, 999999))
-                ok, _ = create_user(username, password, "teacher", name)
+                ok, _ = create_user(username, password, role, name)
                 if ok:
-                    save_user_allowed_tabs(username, [
-                        "لوحة المراقبة", "تحليل النتائج", "تحويل طالب",
-                        "نماذج المعلم", "خطابات الاستفسار", "التعاميم والنشرات"])
+                    tabs = (self._TEACHER_TABS if role == "teacher"
+                            else list(ROLE_TABS.get(role) or self._TEACHER_TABS))
+                    save_user_allowed_tabs(username, tabs)
+                    existing_users.add(username)
+                    per_role[role] = per_role.get(role, 0) + 1
                     success_count += 1
             self._users_load()
+            detail = "\n".join(
+                "   • %s: %d" % (ROLES.get(r, {}).get("label", r), n)
+                for r, n in sorted(per_role.items(), key=lambda x: -x[1]))
             messagebox.showinfo("اكتمل",
                 f"✅ تم إنشاء {success_count} حساب جديد.\n"
-                f"⏭️ تم تخطي {skip_count} (موجود مسبقاً أو بياناته ناقصة).\n\n"
+                + (detail + "\n" if detail else "")
+                + f"⏭️ تم تخطي {skip_count} (موجود مسبقاً أو بياناته ناقصة).\n\n"
                 "استخدم زر 'إرسال بيانات الدخول' لإرسال بيانات الدخول عبر الواتساب.")
         finally:
             self.root.config(cursor="")
 
     def _user_send_teacher_creds(self):
-        """إعادة توليد كلمة مرور وإرسال بيانات الدخول للمعلمين عبر الواتساب."""
+        """إعادة توليد كلمة مرور وإرسال بيانات الدخول لأعضاء الطاقم عبر الواتساب."""
         if not messagebox.askyesno("تأكيد",
-                "سيتم إعادة توليد كلمة مرور جديدة لكل معلم وإرسالها له عبر الواتساب.\n"
+                "سيتم إعادة توليد كلمة مرور جديدة لكل عضو في الطاقم وإرسالها عبر الواتساب.\n"
                 "هل أنت متأكد؟"):
             return
         from database import load_teachers, get_all_users, update_user_password
@@ -580,7 +614,7 @@ class UsersTabMixin:
 
         teachers_data = load_teachers().get("teachers", [])
         if not teachers_data:
-            messagebox.showwarning("تنبيه", "لا يوجد معلمين في الملف."); return
+            messagebox.showwarning("تنبيه", "لا يوجد طاقم في الملف."); return
 
         cfg = load_config()
         public_url = cfg.get("cloud_url_internal", "") or cfg.get("cloud_url", "")
@@ -595,7 +629,7 @@ class UsersTabMixin:
         self.root.config(cursor="wait")
         try:
             for t in teachers_data:
-                name    = t.get("اسم المعلم", "").strip()
+                name    = (t.get("اسم المعلم") or t.get("full_name") or "").strip()
                 phone   = t.get("رقم الجوال", "").strip()
                 civ_id  = t.get("رقم الهوية", "").strip()
                 username = civ_id if civ_id else phone
