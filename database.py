@@ -1828,14 +1828,28 @@ def create_parent_call(student_id, student_name="", class_id="", class_name="",
     now = datetime.datetime.now()
     today = now.strftime("%Y-%m-%d")
     sid = str(student_id)
-    con = get_db(); cur = con.cursor()
+    con = get_db()
+    # الوضع التلقائي ضروري ليعمل BEGIN الصريح: بغيره يدير السائق
+    # المعاملة بنفسه فيفشل «معاملة داخل معاملة».
+    con.isolation_level = None
+    cur = con.cursor()
+
+    # ⚠️ معاملة حصرية: الفحص ثم الإدراج ليس ذرّياً. وليّ أمرٍ يضغط مرتين
+    # (يظن أنها لم تصل) أو وليّان على نفس الطالب — كلاهما يمرّ من الفحص
+    # قبل أن يُدرج الآخر، فيظهر نداءان لطالبة واحدة في شاشة الاستقبال.
+    # ‏BEGIN IMMEDIATE يحجز قفل الكتابة من أول سطر، فيصطفّ الثاني خلف
+    # الأول (busy_timeout = ٢٠ ثانية) ويرى نداءه فيرجع «قائم بالفعل».
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+    except Exception:
+        pass
 
     cur.execute("SELECT %s FROM parent_calls WHERE student_id=? AND date=?"
                 " AND status='waiting' ORDER BY id DESC LIMIT 1" % ",".join(_CALL_COLS),
                 (sid, today))
     row = cur.fetchone()
     if row:
-        con.close()
+        con.rollback(); con.close()
         return {"created": False, "reason": "already_waiting",
                 "call": dict(zip(_CALL_COLS, row))}
 
@@ -1846,7 +1860,7 @@ def create_parent_call(student_id, student_name="", class_id="", class_name="",
         try:
             delta = (now - datetime.datetime.strptime(last[0], "%Y-%m-%d %H:%M:%S"))
             if delta.total_seconds() < PARENT_CALL_COOLDOWN_MIN * 60:
-                con.close()
+                con.rollback(); con.close()
                 return {"created": False, "reason": "cooldown",
                         "wait_seconds": int(PARENT_CALL_COOLDOWN_MIN * 60 - delta.total_seconds())}
         except ValueError:
@@ -3239,7 +3253,8 @@ def _teacher_name(t):
     return str(t.get("اسم المعلم") or t.get("full_name") or "").strip()
 
 
-def save_teacher_record(name, phone="", subject="", national_id="", original=""):
+def save_teacher_record(name, phone="", subject="", national_id="",
+                        original="", job=""):
     """
     يضيف معلماً أو يعدّل قائماً. المفتاح هو الاسم (أو `original` عند إعادة
     التسمية)، لأن جدول الحصص وروابط الفصول تُطابِق بالاسم.
@@ -3274,6 +3289,10 @@ def save_teacher_record(name, phone="", subject="", national_id="", original="")
     hit["التخصص"] = str(subject or "").strip()
     if str(national_id or "").strip():
         hit["رقم الهوية"] = str(national_id).strip()
+    # الوظيفة تفرز الطاقم بين تبويبات المعلمات والإداريات والموجهات.
+    # الفراغ لا يمحو ما وسمه ملف نور — سجلّ قديم بلا وظيفة يُعدّ معلماً.
+    if str(job or "").strip():
+        hit["الوظيفة"] = str(job).strip()
     hit["full_name"] = name
     hit["phone"] = str(phone or "").strip()
 
@@ -3908,80 +3927,242 @@ def _clean_phone_noor(raw) -> str:
     if digits.startswith("5") and len(digits) == 9: return "0" + digits
     return digits if len(digits) >= 9 else ""
 
+# ══════════════════════════════════════════════════════════════════
+#  قراءة تقارير الموظفين من نور
+#
+#  نور يُصدّر الطاقم بأشكال مختلفة، ومواضع الأعمدة **تتغيّر بين ملف
+#  وآخر** (اسم الموظف في العمود ٢٩ لتقرير المعلمات و٢٨ للإداريات).
+#  فلا يصحّ الاعتماد على رقم عمود ثابت، ولا على أول عمود يطابق اسماً:
+#  «مكان الولادة» كان يُنتقى اسماً فتُستورد سبعة صفوف قمامة بلا جوال.
+#  القاعدة هنا: نُرشّح بالعنوان ثم **نحكم بالمحتوى** — العمود الذي
+#  قيمُه أسماءُ أشخاص فعلاً هو عمود الاسم.
+# ══════════════════════════════════════════════════════════════════
+_STAFF_NAME_HINTS = ("اسم المعلم", "اسم المعلمة", "اسم المعلمه",
+                     "اسم الموظف", "اسم الموظفة", "اسم الموظفه",
+                     "الاسم الرباعي", "الإسم", "الاسم", "اسم")
+_STAFF_PHONE_HINTS = ("رقم الجوال", "الجوال", "جوال", "رقم الهاتف",
+                      "phone", "mobile")
+_STAFF_ID_HINTS = ("رقم الهوية", "رقم الهويه", "السجل المدني",
+                   "رقم السجل", "الهوية", "الهويه")
+_STAFF_SUBJ_HINTS = ("التخصص", "المؤهل", "الوظيفة", "الوظيفه")
+
+# كلمات ترد في صفوف العناوين المزدوجة فتبدو أسماءً — تُستبعد صراحةً
+_STAFF_STOP = {
+    "اسم الموظف", "اسم المعلم", "اسم المعلمة", "الاسم", "الإسم",
+    "مكان الولادة", "الحالة الإجتماعية", "الحالة الاجتماعية",
+    "الوظيفة", "الوظيفه", "التخصص", "المؤهل", "الجنسية", "المدرسة",
+    "في المدرسة", "في الوزارة", "في العمل الحالي", "الالكتروني",
+    "المنزل", "الحصص", "نوع المستخدم", "بيانات التواصل", "تصنيف",
+    "الإدارة", "وحدة/قسم/مكتب", "العنوان", "ملاحظات",
+}
+
+
+# عبارات مؤسسية ترد في ترويسة تقارير نور. لا يحويها اسم شخص، ورفضها
+# ضروري: ملفٌ فيه موظفة واحدة كان يخسر أمام «المملكة العربية السعودية»
+# و«وزارة التعليم» — وهما قيمتان متفرّدتان عربيّتان بلا أرقام.
+_STAFF_INSTITUTIONAL = (
+    "وزارة", "المملكة", "الإدارة العامة", "الادارة العامة", "بيانات",
+    "مدرسة", "ثانوية", "متوسطة", "ابتدائية", "مكتب التعليم",
+    "إدارة التعليم", "ادارة التعليم", "تقرير", "المعلمات", "الموظفين",
+)
+
+
+def _looks_like_person(v) -> bool:
+    """هل هذه القيمة اسم شخص؟ عربية، كلمتان فأكثر، بلا أرقام ولا مؤسسات."""
+    s = " ".join(str(v or "").split())
+    if not s or s.lower() in ("nan", "none") or s in _STAFF_STOP:
+        return False
+    if any(ch.isdigit() for ch in s):
+        return False
+    if len(s) < 6 or len(s.split()) < 2:
+        return False
+    if any(w in s for w in _STAFF_INSTITUTIONAL):
+        return False
+    return any("؀" <= ch <= "ۿ" for ch in s)
+
+
+def _detect_job_type(all_sheets: dict) -> str:
+    """
+    نوع الوظيفة من ترويسة الملف («نوع المستخدم : اداري»).
+
+    يسمح بفرز الطاقم لاحقاً: المعلمات في تبويبهنّ والإداريات في تبويبهنّ،
+    من الملف نفسه دون أن يسأل المستخدم.
+    """
+    try:
+        for rows in all_sheets.values():
+            for row in rows[:14]:
+                cells = [" ".join(str(c).split()) for c in row
+                         if c is not None and str(c).strip().lower() not in ("nan", "none", "")]
+                if not any("نوع المستخدم" in c for c in cells):
+                    continue
+                for c in cells:
+                    t = c.replace("أ", "ا").replace("إ", "ا")
+                    if "موجه" in t and "طلاب" in t:
+                        return "موجه طلابي"
+                    if t in ("اداري", "إداري") or "اداري" in t:
+                        return "اداري"
+                    if t.startswith("معلم"):
+                        return "معلم"
+    except Exception:
+        pass
+    return ""
+
+
+def _parse_staff_rows(rows: list, job: str) -> list:
+    """
+    يستخرج الطاقم من ورقة خام. يُرجع [] إن لم يتعرّف عليها.
+
+    يجرّب كل صف من الأوائل كصف عناوين، ويختار التركيبة التي تُنتج
+    أكبر عدد من الأسماء الحقيقية — فلا يتعثّر بترويسات نور المزدوجة
+    (صف «البريد» يعلو صف «الالكتروني») ولا باختلاف مواضع الأعمدة.
+    """
+    if not rows:
+        return []
+    ncol = max((len(r) for r in rows[:60]), default=0)
+    if ncol < 3:
+        return []
+
+    def cell(r, j):
+        return " ".join(str(r[j]).split()) if j < len(r) and r[j] is not None else ""
+
+    # ① عمود الاسم — بعدد القيم **المتفرّدة** التي تشبه أسماء أشخاص.
+    #    العدّ المجرّد لا يكفي: «المؤهل» و«المدرسة» و«الإدارة» عربية
+    #    متعددة الكلمات بلا أرقام فتُحتسب أسماءً، وتعادلت خمسة أعمدة
+    #    فاختير آخرها فاستُورد عمود «الإدارة العامة للتعليم» اسماً.
+    #    الأسماء تتفرّد، وأسماء المدرسة والإدارة والمؤهل تتكرر.
+    def _hinted(j):
+        for i in range(min(len(rows), 30)):
+            t = cell(rows[i], j)
+            if t and any(h in t for h in _STAFF_NAME_HINTS):
+                return 1
+        return 0
+
+    scores = sorted(
+        ((len({cell(r, j) for r in rows if _looks_like_person(cell(r, j))}),
+          _hinted(j), -j) for j in range(ncol)), reverse=True)
+    # عتبة ١ لا ٢: ملف نور لمدرسة فيها موظفة واحدة في الوظيفة صحيحٌ
+    # تماماً، ورفضُه يعني ألا تُستورد الموجّهة الوحيدة إطلاقاً.
+    if not scores or scores[0][0] < 1:
+        return []
+    nj = -scores[0][2]
+
+    # ② أول صف بيانات = أول ظهور لاسم في ذلك العمود
+    first_data = next((i for i, r in enumerate(rows)
+                       if _looks_like_person(cell(r, nj))), None)
+    if first_data is None:
+        return []
+
+    # ③ العناوين = دمج الصفوف الثلاثة فوقه.
+    #    نور يوزّع العنوان على صفّين («البريد» فوق «الالكتروني»)،
+    #    وقراءة صفٍّ واحد تُضيّع «الجوال» و«رقم الهوية» فتُستورد
+    #    المعلمات بلا أرقام — وهي بيانات بلا فائدة.
+    hdr = []
+    for j in range(ncol):
+        parts = [cell(rows[i], j)
+                 for i in range(max(0, first_data - 3), first_data)]
+        hdr.append(" ".join(p for p in parts if p))
+
+    def pick(hints):
+        for h in hints:                          # الأطول أولاً
+            for j, t in enumerate(hdr):
+                if t and h in t and j != nj:
+                    return j
+        return None
+
+    pj, ij, sj = (pick(_STAFF_PHONE_HINTS), pick(_STAFF_ID_HINTS),
+                  pick(_STAFF_SUBJ_HINTS))
+    out = []
+    for r in rows[first_data:]:
+        name = cell(r, nj)
+        if not _looks_like_person(name):
+            continue
+        idv = cell(r, ij) if ij is not None else ""
+        if idv.endswith(".0"):
+            idv = idv[:-2]
+        if not idv.isdigit() or len(idv) < 8:
+            idv = ""
+        subj = cell(r, sj) if sj is not None else ""
+        if subj in _STAFF_STOP or any(ch.isdigit() for ch in subj):
+            subj = ""
+        out.append({
+            "اسم المعلم": name,
+            "رقم الجوال": _clean_phone_noor(cell(r, pj) if pj is not None else ""),
+            "رقم الهوية": idv,
+            "التخصص": subj,
+            "الوظيفة": job,
+        })
+    return out
+
+
 def import_teachers_from_excel(xlsx_path: str) -> Dict[str, Any]:
     """
-    يقرأ ملف Excel للمعلمين — يدعم:
-    1. ملف نور (header مدفون، الاسم في عمود 19، الجوال في عمود 3)
-    2. ملف عادي بأعمدة: اسم المعلم، رقم الجوال
+    يقرأ تقرير الموظفين من نور بأي من أشكاله ويحفظه في teachers.json.
+
+    يدعم `GetEmployeeDataList` (معلمات/إداريات/موجهات) و
+    `GetSchoolTeachersDataReport`، ويسِم كل سجل بوظيفته من ترويسة الملف.
     """
-    NAME_HINTS  = ["اسم المعلم", "المعلم", "الاسم", "اسم الموظف"]
-    PHONE_HINTS = ["رقم الجوال", "الجوال", "phone", "telephone"]
-    
-    ID_HINTS    = ["رقم الهوية", "رقم السجل", "السجل المدني", "الهوية"]
-    
-    xls = pd.ExcelFile(xlsx_path)
-    target_df = None
-
-    for sheet_name in xls.sheet_names:
-        # اقرأ بدون header للبحث عن صف العناوين
-        raw = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=None, dtype=str)
-        found_row = None
-        for i, row in raw.iterrows():
-            vals = [str(v).strip() for v in row.values]
-            if any(h in v for h in NAME_HINTS for v in vals):
-                found_row = i
-                break
-        if found_row is not None:
-            target_df = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=found_row, dtype=str)
-            target_df.columns = [str(c).strip() for c in target_df.columns]
+    all_sheets = _read_excel_safe(xlsx_path)
+    job = _detect_job_type(all_sheets)
+    teachers = []
+    for rows in all_sheets.values():
+        teachers = _parse_staff_rows(rows, job)
+        if teachers:
             break
-
-    if target_df is not None:
-        # ملف بأعمدة واضحة
-        name_col  = next((c for c in target_df.columns if any(h in c for h in NAME_HINTS)), None)
-        phone_col = next((c for c in target_df.columns if any(h in c for h in PHONE_HINTS)), None)
-        id_col    = next((c for c in target_df.columns if any(h in c for h in ID_HINTS)), None)
-        if not name_col:
-            raise ValueError("لم أجد عمود اسم المعلم في الملف.")
-        teachers = []
-        SKIP = {"nan","none","","اسم المعلم","اسم الموظف"}
-        for _, row in target_df.iterrows():
-            name = str(row.get(name_col,"")).strip()
-            if name.lower() in SKIP or not name: continue
-            phone_raw = str(row.get(phone_col,"")) if phone_col else ""
-            id_raw = str(row.get(id_col,"")).strip() if id_col else ""
-            if id_raw.endswith(".0"): id_raw = id_raw[:-2]
-            teachers.append({"اسم المعلم": name, "رقم الجوال": _clean_phone_noor(phone_raw), "رقم الهوية": id_raw})
-    else:
-        # صيغة نور المعروفة: عمود 19 = الاسم، عمود 3 = الجوال، عمود 18 قد يكون السجل
-        raw = pd.read_excel(xlsx_path, header=None, dtype=str)
-        if raw.shape[1] < 20:
-            raise ValueError("لم أتعرف على صيغة الملف. تأكد من أن يحتوي على أعمدة اسم المعلم ورقم الجوال.")
-        teachers = []
-        SKIP = {"nan","none","","اسم المعلم"}
-        for _, row in raw.iterrows():
-            name = str(row.iloc[19]).strip()
-            if name.lower() in SKIP or not name: continue
-            phone_raw = str(row.iloc[3])
-            id_raw = str(row.iloc[18]).strip() if raw.shape[1] >= 19 else ""
-            if id_raw.endswith(".0"): id_raw = id_raw[:-2]
-            if not id_raw.isdigit() or len(id_raw) < 8: id_raw = ""
-            teachers.append({"اسم المعلم": name, "رقم الجوال": _clean_phone_noor(phone_raw), "رقم الهوية": id_raw})
-
     if not teachers:
-        raise ValueError("لم يُعثر على أي معلمين في الملف.")
+        raise ValueError(
+            "لم أتعرّف على صيغة الملف.\n"
+            "تأكد أنه تقرير موظفين من نور (بيانات شاغلي الوظائف أو "
+            "بيانات معلمات المدرسة) وأنه يحوي عمودَي الاسم والجوال.")
 
-    # أزل المكررات
-    seen, unique = set(), []
+    # ── الدمج لا الاستبدال ────────────────────────────────────────
+    # نور يُصدّر كل وظيفة في ملف مستقل (معلمات، إداريات، موجهات)،
+    # وكل مرحلة على حدة. الاستبدال كان يعني أن استيراد ملف الإداريات
+    # يمحو المعلمات — فتُستورد أربعة ملفات ولا يبقى إلا آخرها.
+    def _key(t):
+        return (t.get("رقم الهوية") or "").strip() or \
+               " ".join((t.get("اسم المعلم") or "").split())
+
+    # ⚠️ قراءة مباشرة لا load_teachers: تلك تفتح نافذة «الملف غير موجود
+    # — هل تستورد الآن؟» حين يغيب الملف، فتتعلّق عمليةُ الاستيراد نفسها
+    # على سؤالٍ داخل الاستيراد. وأول استيراد في مدرسة جديدة هو بالضبط
+    # الحالة التي يغيب فيها الملف.
+    _existing = []
+    try:
+        if os.path.exists(TEACHERS_JSON):
+            with open(TEACHERS_JSON, encoding="utf-8") as _f:
+                _raw = json.load(_f)
+            _existing = (_raw.get("teachers") if isinstance(_raw, dict)
+                         else _raw) or []
+    except Exception as e:
+        print("[STAFF] تعذّرت قراءة ملف الطاقم الحالي (يُبنى من جديد): %s" % e)
+
+    merged, order = {}, []
+    for t in _existing:
+        k = _key(t)
+        if k and k not in merged:
+            merged[k] = dict(t); order.append(k)
+
+    added = updated = 0
     for t in teachers:
-        n = t.get("اسم المعلم", "")
-        if n and n not in seen:
-            seen.add(n); unique.append(t)
+        k = _key(t)
+        if not k:
+            continue
+        if k in merged:
+            old = merged[k]
+            for f, v in t.items():
+                if v:                      # لا يُفرِّغ حقلاً ملأه ملف آخر
+                    old[f] = v
+            updated += 1
+        else:
+            merged[k] = dict(t); order.append(k); added += 1
 
-
-    data = {"teachers": unique}
+    unique = [merged[k] for k in order]
+    data = {"teachers": unique, "_added": added, "_updated": updated,
+            "_job": job, "_file_count": len(teachers)}
     with open(TEACHERS_JSON, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump({"teachers": unique}, f, ensure_ascii=False, indent=2)
+    print("[STAFF] %s: %d في الملف — أُضيف %d وحُدِّث %d، الإجمالي %d"
+          % (job or "طاقم", len(teachers), added, updated, len(unique)))
     return data
 
 def load_teachers() -> Dict[str, Any]:

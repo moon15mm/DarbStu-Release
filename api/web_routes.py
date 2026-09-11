@@ -714,6 +714,7 @@ async def web_teachers_save(request: Request):
             phone=body.get("phone", ""),
             subject=body.get("subject", ""),
             national_id=body.get("national_id", ""),
+            job=body.get("job", ""),
             original=body.get("original", ""),
         ))
     except Exception as e:
@@ -1922,6 +1923,7 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
         ("إدارة البيانات", [
             ("إدارة الطلاب",        "student_mgmt",         "fas fa-graduation-cap"),
             ("إدارة المعلمين",      "teachers_mgmt",        "fas fa-chalkboard-teacher"),
+            ("إدارة الإداريين",     "admins_mgmt",          "fas fa-user-tie"),
             ("إضافة طالب",          "add_student",          "fas fa-user-plus"),
             ("إدارة الفصول",        "class_naming",         "fas fa-school"),
             ("إدارة الجوالات",      "phones",               "fas fa-mobile-alt"),
@@ -2930,14 +2932,24 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
 </div>
 
 <div id="tab-teachers_mgmt">
-  <h2 class="pt"><i class="fas fa-chalkboard-teacher"></i> إدارة المعلمين</h2>
+  <h2 class="pt"><i class="fas fa-chalkboard-teacher"></i> إدارة الطاقم</h2>
+  <!-- ‏tm-screen شاشة واحدة يتشارك فيها تبويبا المعلمين والإداريين،
+       ينقلها JS بين الحاويتين. نسختان متطابقتان كانتا ستفترقان عند
+       أول تعديل فيصير لكل تبويب سلوك مختلف بلا سبب. -->
+  <div id="tm-screen">
   <div class="section">
-    <h3 style="margin:0 0 10px;color:#0C2E56;font-size:15px">➕ إضافة معلم / تعديل بياناته</h3>
+    <h3 style="margin:0 0 10px;color:#0C2E56;font-size:15px">➕ إضافة عضو للطاقم / تعديل بياناته</h3>
     <div class="fg2">
       <div class="fg"><label class="fl">اسم المعلم</label><input type="text" id="tm-name" placeholder="الاسم الكامل"></div>
       <div class="fg"><label class="fl">رقم الجوال</label><input type="tel" id="tm-phone" placeholder="05xxxxxxxx"></div>
       <div class="fg"><label class="fl">التخصص</label><input type="text" id="tm-subject" placeholder="رياضيات"></div>
       <div class="fg"><label class="fl">رقم الهوية (اختياري)</label><input type="text" id="tm-nid" placeholder="10xxxxxxxx"></div>
+      <div class="fg"><label class="fl">الوظيفة</label>
+        <select id="tm-job">
+          <option value="معلم">معلمة</option>
+          <option value="اداري">إدارية</option>
+          <option value="موجه طلابي">موجهة طلابية</option>
+        </select></div>
     </div>
     <input type="hidden" id="tm-orig">
     <button class="btn bp1" onclick="saveTeacherRec()">💾 حفظ</button>
@@ -2949,10 +2961,24 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
       <div class="fg" style="flex:1;min-width:200px"><label class="fl">بحث</label><input type="text" id="tm-q" placeholder="اسم أو تخصص..." oninput="renderTeachersTbl()"></div>
       <div id="tm-sum"></div>
     </div>
+    <div id="tm-jobs" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+      <button class="btn bsm bp1" data-j="" onclick="tmSetJob('')">الكل</button>
+      <button class="btn bsm bp2" data-j="معلم" onclick="tmSetJob('معلم')">المعلمات</button>
+      <button class="btn bsm bp2" data-j="اداري" onclick="tmSetJob('اداري')">الإداريات</button>
+      <button class="btn bsm bp2" data-j="موجه طلابي" onclick="tmSetJob('موجه طلابي')">الموجهات</button>
+    </div>
     <div class="tw"><table>
-      <thead><tr><th>#</th><th>اسم المعلم</th><th>الجوال</th><th>التخصص</th><th>إجراءات</th></tr></thead>
+      <thead><tr><th>#</th><th>الاسم</th><th>الوظيفة</th><th>الجوال</th><th>التخصص</th><th>إجراءات</th></tr></thead>
       <tbody id="tm-table"></tbody></table></div>
   </div>
+  </div>
+</div>
+
+<div id="tab-admins_mgmt">
+  <h2 class="pt"><i class="fas fa-user-tie"></i> إدارة الإداريين</h2>
+  <div class="ab ai">📌 بعض الإداريات يؤدّين أدواراً على النظام (رصد الغياب وغيره) —
+    أنشئي لهنّ حسابات من <b>المستخدمون</b> بعد إضافتهنّ هنا.</div>
+  <!-- شاشة الطاقم تُنقل إلى هنا عند فتح التبويب، مُرشَّحةً على الإداريات -->
 </div>
 
 <div id="tab-add_student">
@@ -4292,6 +4318,7 @@ function showTab(key){
     'new_permission':function(){loadClasses();loadTodayPerms();},
     'student_mgmt':function(){loadStudents();fillSel('sm-cls');},
     'teachers_mgmt':loadTeachersMgmt,
+    'admins_mgmt':loadAdminsMgmt,
     'add_student':function(){fillSel('as-cls');},
     'class_naming':loadClassList,
     'phones':function(){loadStudents();fillSel('ph-cls');},
@@ -5269,7 +5296,7 @@ var _US_ALL_TABS = [
   'الموجّه الطلابي','استلام تحويلات','التقارير / الطباعة','تقرير الفصل','تقرير الإدارة',
   'تحليل طالب','أكثر الطلاب غياباً','تقرير الرسائل','الإشعارات الذكية','إرسال رسائل الغياب',
   'إرسال رسائل التأخر','روابط بوابة أولياء الأمور','التعاميم والنشرات','قصص المدرسة',
-  'تعزيز الحضور الأسبوعي','لوحة الصدارة (النقاط)','إدارة الطلاب','إدارة المعلمين','إضافة طالب',
+  'تعزيز الحضور الأسبوعي','لوحة الصدارة (النقاط)','إدارة الطلاب','إدارة المعلمين','إدارة الإداريين','إضافة طالب',
   'إدارة الفصول','إدارة الجوالات','الطلاب المستثنون','نشر النتائج','تصدير نور',
   'زيارات أولياء الأمور','تحويل طالب','نماذج المعلم','تحليل النتائج',
   'إعدادات المدرسة','المستخدمون','النسخ الاحتياطية','شواهد الأداء'
@@ -5280,7 +5307,7 @@ var _US_ROLE_DEFAULTS = {
           'الموجّه الطلابي','استلام تحويلات','التقارير / الطباعة','تقرير الفصل','تقرير الإدارة',
           'تحليل طالب','أكثر الطلاب غياباً','تقرير الرسائل','الإشعارات الذكية','إرسال رسائل الغياب',
           'إرسال رسائل التأخر','روابط بوابة أولياء الأمور','التعاميم والنشرات','قصص المدرسة',
-          'تعزيز الحضور الأسبوعي','لوحة الصدارة (النقاط)','إدارة الطلاب','إدارة المعلمين','إضافة طالب',
+          'تعزيز الحضور الأسبوعي','لوحة الصدارة (النقاط)','إدارة الطلاب','إدارة المعلمين','إدارة الإداريين','إضافة طالب',
           'إدارة الفصول','إدارة الجوالات','الطلاب المستثنون','نشر النتائج','تصدير نور',
           'زيارات أولياء الأمور'],
   staff:['لوحة المراقبة','المراقبة الحية','روابط الفصول','تسجيل الغياب','تسجيل التأخر',
@@ -6863,17 +6890,36 @@ function pcbInit(){
   pcbAudioUnlock(); pcbSoundHint();
 
   _pcbSeen = null;   /* فتحُ الشاشة ليس نداءً جديداً */
+  _pcbSig = null; _pcbFullAt = 0;
   pcbLoad(); pcbStats();
   if(_pcbTimer) clearInterval(_pcbTimer);
-  _pcbTimer = setInterval(function(){
-    var tab=document.getElementById('tab-parent_calls_board');
-    var on=document.getElementById('pcb-auto');
-    if(tab && tab.classList.contains('active')){
-      if(on && on.checked) pcbLoad();
-    } else {
-      pcbSetTitle(0);   /* لا نُبقي العدّاد في العنوان خارج الشاشة */
+  /* ثانيتان بدل خمس عشرة. الاستطلاع هنا بصمةٌ خفيفة لا اللوحةَ كاملة،
+     فلا تُسحب اللوحة (وفيها خلطة الحضور) إلا إذا تغيّر شيء فعلاً.
+     ومعها تحديث كامل كل دقيقة، لأن «من في المدرسة الآن» يتغيّر بوصول
+     الطالبات لا بالنداءات، فلا تلتقطه البصمة. */
+  _pcbTimer = setInterval(pcbTick, 2000);
+}
+
+var _pcbSig = null, _pcbFullAt = 0, _pcbBusy = false;
+async function pcbTick(){
+  var tab=document.getElementById('tab-parent_calls_board');
+  var on=document.getElementById('pcb-auto');
+  if(!tab || !tab.classList.contains('active')){ pcbSetTitle(0); return; }
+  if(!on || !on.checked) return;
+  if(_pcbBusy) return;                 /* لا نُكدّس طلبات على شبكة بطيئة */
+  _pcbBusy = true;
+  try{
+    var date = document.getElementById('pcb-date').value || today;
+    var s = await api('/web/api/parent-calls/signal?date='+encodeURIComponent(date));
+    var now = Date.now();
+    var changed = s && s.ok && s.sig !== _pcbSig;
+    if(s && s.ok) _pcbSig = s.sig;
+    if(changed || now - _pcbFullAt > 60000){
+      _pcbFullAt = now;
+      await pcbLoad();
     }
-  }, 15000);
+  }catch(e){}
+  finally{ _pcbBusy = false; }
 }
 
 /* ── GRADE ANALYSIS — يستخدم نفس محرّك التطبيق المكتبي ── */
@@ -7419,29 +7465,70 @@ function printMsgReport(){
 /* ── إدارة المعلمين ── */
 var _teachersRec=[];
 async function loadTeachersMgmt(){
+  var host=document.getElementById('tab-teachers_mgmt');
+  var body=document.getElementById('tm-screen');
+  if(host&&body&&body.parentNode!==host)host.appendChild(body);
   var d=await api('/web/api/teachers');
   _teachersRec=(d&&d.ok)?(d.teachers||[]):[];
-  renderTeachersTbl();
+  tmSetJob('معلم');
+}
+/* تبويب «إدارة الإداريين» — الشاشة نفسها بمُرشِّح مختلف. لا تكرار
+   للنموذج ولا للجدول: النسختان كانتا ستفترقان عند أول تعديل. */
+async function loadAdminsMgmt(){
+  var host=document.getElementById('tab-admins_mgmt');
+  var body=document.getElementById('tm-screen');
+  if(host&&body&&body.parentNode!==host)host.appendChild(body);
+  var d=await api('/web/api/teachers');
+  _teachersRec=(d&&d.ok)?(d.teachers||[]):[];
+  tmSetJob('اداري');
 }
 function _tName(t){return String(t['اسم المعلم']||t.full_name||'').trim();}
+/* الوظيفة تأتي موسومةً من ملف نور («نوع المستخدم» في ترويسته).
+   السجلّ القديم بلا وظيفة يُعدّ معلماً — فكل ما استُورد قبل اليوم معلمون. */
+function _tJob(t){
+  var j=String(t['الوظيفة']||'').trim();
+  if(j.indexOf('اداري')>=0||j.indexOf('إداري')>=0)return 'اداري';
+  if(j.indexOf('موجه')>=0)return 'موجه طلابي';
+  return 'معلم';
+}
+var _tmJobFilter='';
+function tmSetJob(j){
+  _tmJobFilter=j;
+  var box=document.getElementById('tm-jobs');
+  if(box)Array.prototype.forEach.call(box.children,function(b){
+    b.className='btn bsm '+(b.getAttribute('data-j')===j?'bp1':'bp2');});
+  renderTeachersTbl();
+}
 function renderTeachersTbl(){
   var tb=document.getElementById('tm-table');if(!tb)return;
   var qe=document.getElementById('tm-q');
   var q=((qe&&qe.value)||'').toLowerCase();
   var arr=_teachersRec.filter(function(t){
+    if(_tmJobFilter&&_tJob(t)!==_tmJobFilter)return false;
     if(!q)return true;
     return _tName(t).toLowerCase().indexOf(q)>=0||
            String(t['التخصص']||'').toLowerCase().indexOf(q)>=0;
   });
+  var JC={'معلم':'#065f46','اداري':'#2563eb','موجه طلابي':'#059669'};
   tb.innerHTML=arr.map(function(t,i){
     var n=_tName(t),p=String(t['رقم الجوال']||t.phone||''),s=String(t['التخصص']||'');
+    var j=_tJob(t);
     var esc=n.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
-    return '<tr><td>'+(i+1)+'</td><td>'+n+'</td><td>'+(p||'—')+'</td><td>'+(s||'—')+'</td>'+
+    return '<tr><td>'+(i+1)+'</td><td>'+n+'</td>'+
+      '<td><span class="badge" style="background:'+JC[j]+'22;color:'+JC[j]+'">'+j+'</span></td>'+
+      '<td>'+(p||'—')+'</td><td>'+(s||'—')+'</td>'+
       '<td><button class="btn bp2 bsm" onclick="editTeacherRec(\''+esc+'\')">✏️ تعديل</button> '+
       '<button class="btn bp2 bsm" style="background:#FEE2E2;color:#B91C1C" onclick="delTeacherRec(\''+esc+'\')">🗑️</button></td></tr>';
-  }).join('')||'<tr><td colspan="5" style="color:#9CA3AF">لا يوجد معلمون — أضفهم يدوياً أعلاه</td></tr>';
+  }).join('')||'<tr><td colspan="6" style="color:#9CA3AF">لا يوجد أحد بهذه الوظيفة — استورد ملف نور أو أضف يدوياً أعلاه</td></tr>';
   var sm=document.getElementById('tm-sum');
-  if(sm)sm.innerHTML='<span class="badge bb">'+_teachersRec.length+' معلماً</span>';
+  if(sm){
+    var c={'معلم':0,'اداري':0,'موجه طلابي':0};
+    _teachersRec.forEach(function(t){c[_tJob(t)]++;});
+    sm.innerHTML='<span class="badge bb">'+arr.length+' معروضاً</span> '+
+      '<span class="badge" style="background:#065f4622;color:#065f46">'+c['معلم']+' معلمة</span> '+
+      '<span class="badge" style="background:#2563eb22;color:#2563eb">'+c['اداري']+' إدارية</span> '+
+      '<span class="badge" style="background:#05966922;color:#059669">'+c['موجه طلابي']+' موجهة</span>';
+  }
 }
 function editTeacherRec(name){
   var t=null;
@@ -7451,12 +7538,16 @@ function editTeacherRec(name){
   document.getElementById('tm-phone').value=t['رقم الجوال']||t.phone||'';
   document.getElementById('tm-subject').value=t['التخصص']||'';
   document.getElementById('tm-nid').value=t['رقم الهوية']||'';
+  var jb=document.getElementById('tm-job');if(jb)jb.value=_tJob(t);
   document.getElementById('tm-orig').value=name;
   ss('tm-st','✏️ تعديل: '+name+' — عدّل الحقول ثم احفظ','ai');
 }
 function resetTeacherForm(){
   ['tm-name','tm-phone','tm-subject','tm-nid','tm-orig'].forEach(function(id){
     var e=document.getElementById(id);if(e)e.value='';});
+  var jb=document.getElementById('tm-job');
+  // الوظيفة تعود إلى المُرشَّح المعروض — من يفتح «الإداريات» يضيف إدارية
+  if(jb)jb.value=_tmJobFilter||'معلم';
   ss('tm-st','','ai');
 }
 async function saveTeacherRec(){
@@ -7470,10 +7561,11 @@ async function saveTeacherRec(){
         phone:document.getElementById('tm-phone').value,
         subject:document.getElementById('tm-subject').value,
         national_id:document.getElementById('tm-nid').value,
+        job:(document.getElementById('tm-job')||{}).value||'',
         original:document.getElementById('tm-orig').value})});
     var d=await r.json();
     if(!d.ok){ss('tm-st','❌ '+(d.msg||'خطأ'),'er');return;}
-    ss('tm-st',d.created?'✅ أُضيف المعلم':'✅ حُفظ التعديل','ok');
+    ss('tm-st',d.created?'✅ أُضيف السجل':'✅ حُفظ التعديل','ok');
     resetTeacherForm();loadTeachersMgmt();
   }catch(e){ss('tm-st','❌ خطأ في الاتصال','er');}
 }
@@ -10923,6 +11015,38 @@ async def parent_portal_call_status(token: str):
                          "waiting": bool(waiting),
                          "called_at": (waiting or {}).get("called_at", ""),
                          "last_done_at": (last_done or {}).get("handled_at", "")})
+
+
+@router.get("/web/api/parent-calls/signal", response_class=JSONResponse)
+async def web_parent_calls_signal(request: Request, date: str = None):
+    """
+    بصمة خفيفة لحالة النداءات — استعلام واحد على فهرس، بلا خلطة حضور.
+
+    كانت الشاشة تسحب اللوحة كاملة كل ١٥ ثانية، وكل سحبة تُعيد حساب
+    `reconcile_daily_attendance` للمدرسة كلها. فتقصير المهلة ليصل النداء
+    أسرع كان يضاعف أثقل عملية في النظام على كل جهاز مفتوح.
+    الآن تُستطلع هذه البصمة كل ثانيتين (استعلام مفهرس على جدول صغير)،
+    ولا تُسحب اللوحة إلا إذا تغيّرت فعلاً — أسرعُ للمدرسة وأخفُّ للخادم
+    في آن واحد.
+    """
+    user = _get_current_user(request)
+    if not user:
+        return JSONResponse({"ok": False}, status_code=401)
+    target = (date or "").strip() or now_riyadh_date()
+    try:
+        con = get_db(); cur = con.cursor()
+        cur.execute(
+            "SELECT COUNT(*), COALESCE(MAX(id),0),"
+            " SUM(CASE WHEN status='waiting' THEN 1 ELSE 0 END),"
+            " COALESCE(MAX(handled_at),'')"
+            " FROM parent_calls WHERE date=?", (target,))
+        n, mx, waiting, last = cur.fetchone()
+        con.close()
+        return JSONResponse({"ok": True,
+                             "sig": "%s:%s:%s:%s" % (n, mx, waiting or 0, last),
+                             "waiting": int(waiting or 0)})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 
 
 @router.get("/web/api/parent-calls", response_class=JSONResponse)
