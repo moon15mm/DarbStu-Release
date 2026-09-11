@@ -3,6 +3,32 @@ import tkinter as tk
 from tkinter import messagebox, filedialog
 
 
+# ── مكتبات مدموجة: قراءة Excel القديم (.xls) ─────────────────────
+# ‏pandas يحتاج xlrd لقراءة .xls، ولم تكن مثبَّتة في أي نسخة — فكان
+# استيراد ملف نور بصيغة .xls يفشل بـ
+#   Missing optional dependency 'xlrd'
+# وهي صيغة شائعة جداً في مخرجات نور.
+#
+# مدموجة كمصدر في _vendor لا مُضافة إلى requirements: قناة التحديث
+# تحمل ملفات .py وحدها، فالمكتبة المحزومة في الـEXE لا تصل تنصيباً
+# قائماً إلا بإعادة تنصيب. نفس علاج pyzk في biometric/_vendor.
+def _add_vendor_path():
+    try:
+        base = (os.path.dirname(sys.executable)
+                if getattr(sys, 'frozen', False)
+                else os.path.dirname(os.path.abspath(__file__)))
+        v = os.path.join(base, '_vendor')
+        if os.path.isdir(v):
+            # آخراً في الترتيب لا أولاً: مكتبة مثبَّتة نظامياً أولى
+            if v not in sys.path:
+                sys.path.append(v)
+    except Exception:
+        pass
+
+
+_add_vendor_path()
+
+
 def _safe_write_json(path: str, data) -> None:
     """كتابة آمنة لملف JSON: يكتب في ملف مؤقت ثم يُعيد التسمية لمنع تلف البيانات."""
     tmp = path + ".tmp"
@@ -2385,8 +2411,18 @@ def remember_noor_level(code: str, digit: str, name: str, needs_review: bool = F
     """يضيف رمزاً جديداً للملف ليراه المزوّد ويصحّحه إن لزم."""
     try:
         levels = load_noor_levels()
-        if code in levels:
-            return
+        old = levels.get(code)
+        if isinstance(old, dict):
+            # مدخلة صحيحة (كتبها المزوّد أو استُنتجت بثقة) لا تُمَس.
+            # أما ما كتبه استيرادٌ سابق وهو جاهل بالرمز فيُصحَّح الآن —
+            # وإلا بقي «صف غير معرّف» في ملف المدرسة إلى الأبد يربك
+            # من يفتحه، وإن كان الكود صار يتجاهله.
+            healing = (old.get("needs_review")
+                       or str(old.get("name", "")).startswith("صف غير معرّف"))
+            if not (healing and not needs_review):
+                return
+            print("[NOOR-LEVELS] صُحّح الرمز %s: «%s» ← «%s»"
+                  % (code, old.get("name"), name))
         levels[code] = {"digit": digit, "name": name, "auto": True}
         if needs_review:
             levels[code]["needs_review"] = True
@@ -2425,13 +2461,59 @@ def is_noor_excluded(level_raw, section_raw, excludes: set) -> bool:
 
 
 def lookup_noor_level(raw: str):
-    """يبحث عن الرمز في الترميز. يُرجع (digit, name) أو (None, None)."""
+    """
+    يبحث عن الرمز في الترميز. يُرجع (digit, name) أو (None, None).
+
+    ⚠️ يتجاهل المدخلات التي كتبها الاستيراد نفسه لرمزٍ لم يعرفه
+    (`needs_review` أو اسم «صف غير معرّف»). بدون هذا التجاهل يصير
+    العطلُ دائماً: أول استيراد يكتب «صف غير معرّف (0730)» في ملف
+    المدرسة، ثم يقرأه كل استيراد تالٍ ويثق به — فلا يُصلح التحسينُ
+    اللاحق شيئاً، وتبقى المدرسة بفصولٍ بلا أسماء إلى الأبد.
+    """
     digits = "".join(ch for ch in str(raw) if ch.isdigit())
     if not digits:
         return None, None
     e = load_noor_levels().get(digits)
     if digits != "_exclude" and isinstance(e, dict) and e.get("digit") and e.get("name"):
+        if e.get("needs_review") or str(e["name"]).startswith("صف غير معرّف"):
+            return None, None
         return str(e["digit"]), str(e["name"])
+    return None, None
+
+
+# ترقيم نور المتصل للصفوف ١–١٢: الرقمان الأولان من رمز الصف.
+#   01–06 ابتدائي   ·   07–09 متوسط   ·   10–12 ثانوي
+# ثبت من ملف حقيقي لمتوسطة الدرب الأولى: 0730 / 0830 / 0930 لصفوفها
+# الثلاثة، والخانتان الأخيرتان خطة دراسية لا مستوى (0720 و0730 كلاهما
+# أول متوسط بخطتين).
+_NOOR_CONTINUOUS = {
+    **{"%02d" % n: ("ابتدائي", str(n))     for n in range(1, 7)},
+    **{"%02d" % n: ("متوسط",  str(n - 6)) for n in range(7, 10)},
+    **{"%02d" % n: ("ثانوي",  str(n - 9)) for n in range(10, 13)},
+}
+
+
+def _noor_from_continuous(digits: str, stage: str):
+    """
+    يفكّ رمز نور من ترقيمه المتصل. يُرجع (digit, name) أو (None, None).
+
+    كان الاستنتاج مقصوراً على بادئات الثانوي 13/14/15، فكل مدرسة
+    متوسطة أو ابتدائية تستورد ملفها تخرج بفصول اسمها «صف غير معرّف».
+    """
+    if len(digits) != 4:
+        return None, None
+    hit = _NOOR_CONTINUOUS.get(digits[:2])
+    if not hit:
+        return None, None
+    st, d = hit
+    if st == stage:
+        return d, stage_level_name(d, stage)
+    # المرحلة في الملف تخالف المستنتَج من الرمز — مرحلة المدرسة أوثق،
+    # ولا نقبل مستوى خارج مداها.
+    if int(d) <= stage_level_count(stage):
+        print("[NOOR-IMPORT] ⚠️ الرمز %s يشير إلى %s ومرحلة المدرسة %s —"
+              " اعتُمدت مرحلة المدرسة" % (digits, st, stage))
+        return d, stage_level_name(d, stage)
     return None, None
 
 
@@ -2491,7 +2573,13 @@ def _noor_resolve(raw: str):
             remember_noor_level(digits, pref, nm)
             return pref, nm
 
-    # ⑤ رقم مباشر ضمن مدى المرحلة
+    # ⑤ ترقيم نور المتصل ١–١٢ من أول رقمين — يغطّي المراحل الثلاث
+    _d5, _n5 = _noor_from_continuous(digits, stage)
+    if _d5 and _n5:
+        remember_noor_level(digits, _d5, _n5)
+        return _d5, _n5
+
+    # ⑥ رقم مباشر ضمن مدى المرحلة
     if digits and 1 <= int(digits or 0) <= stage_level_count(stage) and len(digits) == 1:
         return digits, stage_level_name(digits, stage)
 

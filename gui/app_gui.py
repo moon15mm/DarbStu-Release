@@ -529,28 +529,47 @@ class AppGUI(
             self.load_student_analysis(student_id)
 
     def update_all_tabs_after_data_change(self):
+        """
+        يُحدّث كل التبويبات بعد تغيّر البيانات.
+
+        ⚠️ كل نداء معزول بـtry: الحراسة كانت `hasattr(self, "اسم_دالة")`
+        وهي **صحيحة دائماً** لأن الدوال معرَّفة على الصنف لا على الكائن.
+        فالحارس لا يحرس شيئاً، والدالة تلمس أداةً لم تُبنَ بعد (التبويبات
+        تُبنى عند فتحها أول مرة) فتُرفع AttributeError — تُوقف بقية
+        التحديثات وتقذف نافذة خطأ في وجه المستخدم بعد استيراد ناجح.
+        تحديثُ شاشةٍ لم تُفتح ليس عطلاً يستحق إيقاف العملية.
+        """
         self.store = load_students(force_reload=True)
-        if hasattr(self, "tree_dash"):         self.update_dashboard_metrics()
-        if hasattr(self, "_refresh_links_and_teachers"): self._refresh_links_and_teachers()
-        if hasattr(self, "refresh_logs"):         self.refresh_logs()
-        if hasattr(self, "report_class_combo"):  self._refresh_report_options()
-        if hasattr(self, "load_students_to_treeview"): self.load_students_to_treeview()
-        if hasattr(self, "load_students_to_management_treeview"): self.load_students_to_management_treeview()
-        if hasattr(self, "load_class_names_to_treeview"): self.load_class_names_to_treeview()
-        if hasattr(self, "_msg_load_groups"):        self._msg_load_groups()
-        if hasattr(self, "populate_schedule_table"):
-            if hasattr(self, "schedule_widgets"):
-                self._schedule_built_day = None
-                self.populate_schedule_table()
-        if hasattr(self, "_tard_load"):         self._tard_load()
-        if hasattr(self, "_exc_load"):          self._exc_load()
-        if hasattr(self, "_users_load"):         self._users_load()
-        if hasattr(self, "refresh_analysis_students"): 
+
+        def _safe(label, fn, *a):
+            try:
+                fn(*a)
+            except AttributeError as e:
+                print("[REFRESH] تُخطّي %s (تبويب لم يُبنَ بعد): %s" % (label, e))
+            except Exception as e:
+                print("[REFRESH] خطأ في %s: %s" % (label, e))
+
+        if hasattr(self, "tree_dash"):        _safe("لوحة المراقبة", self.update_dashboard_metrics)
+        _safe("الروابط والمعلمون", self._refresh_links_and_teachers)
+        _safe("السجلات", self.refresh_logs)
+        if hasattr(self, "report_class_combo"): _safe("خيارات التقارير", self._refresh_report_options)
+        _safe("قائمة الطلاب", self.load_students_to_treeview)
+        _safe("إدارة الطلاب", self.load_students_to_management_treeview)
+        _safe("أسماء الفصول", self.load_class_names_to_treeview)
+        _safe("مجموعات الرسائل", self._msg_load_groups)
+        if hasattr(self, "schedule_widgets"):
+            self._schedule_built_day = None
+            _safe("جدول الحصص", self.populate_schedule_table)
+        _safe("التأخر", self._tard_load)
+        _safe("الأعذار", self._exc_load)
+        _safe("المستخدمون", self._users_load)
+
+        def _analysis():
             self.refresh_analysis_students()
             if self._current_tab.get() == "تحليل الطالب":
                 self._on_analysis_student_selected()
-        if hasattr(self, "refresh_leaderboard"):
-            self.refresh_leaderboard()
+        _safe("تحليل الطالب", _analysis)
+        _safe("لوحة الصدارة", self.refresh_leaderboard)
 
 
     def _refresh_report_options(self):
