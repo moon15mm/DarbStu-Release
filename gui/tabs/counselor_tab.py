@@ -827,7 +827,7 @@ class CounselorTabMixin:
         session_title_var = tk.StringVar(value="الانضباط المدرسي")
         ttk.Entry(row2, textvariable=session_title_var, width=25, font=FONT_N).pack(side="right", padx=6)
         tk.Label(row2, text="مكانها:", bg=BG_WHITE, font=FONT_N, width=8, anchor="e").pack(side="right")
-        tk.Label(row2, text="مكتب المرشد الطلابي", bg="#f5f3ff", font=FONT_S,
+        tk.Label(row2, text="مكتب الموجّه الطلابي", bg="#f5f3ff", font=FONT_S,
                  relief="sunken", bd=1, width=16, anchor="center").pack(side="right", padx=6)
 
         row3 = tk.Frame(info_fr, bg=BG_WHITE); row3.pack(fill="x", pady=2)
@@ -931,7 +931,7 @@ class CounselorTabMixin:
         # التواقيع
         sig_fr = tk.Frame(main, bg=BG_WHITE, relief="solid", bd=1, padx=10, pady=10)
         sig_fr.pack(fill="x", padx=12, pady=4)
-        tk.Label(sig_fr, text=f"المرشد الطلابي: {counselor_name}", bg=BG_WHITE,
+        tk.Label(sig_fr, text=f"الموجّه الطلابي: {counselor_name}", bg=BG_WHITE,
                  font=("Tahoma",10,"bold"), fg="#7c3aed").pack(side="right", padx=40)
         tk.Label(sig_fr, text="قائد المدرسة", bg=BG_WHITE,
                  font=("Tahoma",10,"bold"), fg="#374151").pack(side="left", padx=40)
@@ -967,7 +967,7 @@ class CounselorTabMixin:
             for i,r in enumerate(recs,1): lines.append(f"  {i}. {r}")
             extra = notes_txt.get("1.0","end-1c").strip()
             if extra: lines.append("\n📝 ملاحظات: " + extra)
-            lines.append("\nالمرشد الطلابي: " + counselor_name)
+            lines.append("\nالموجّه الطلابي: " + counselor_name)
             return "\n".join(lines)
 
         def _save_to_db(goals, discs, recs):

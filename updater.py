@@ -383,8 +383,12 @@ def _show_update_dialog(latest, notes, dl_url):
     """نافذة الإشعار بوجود تحديث مع زر تحديث تلقائي."""
     win = tk.Toplevel()
     win.title("🎉 يوجد تحديث جديد")
-    win.geometry("480x320")
-    win.resizable(False, False)
+    win.geometry("520x420")
+    win.minsize(460, 300)
+    # ⚠️ قابلة للتكبير عمداً. كانت 480x320 ثابتة و«ما الجديد» ملصقاً
+    # يتمدّد بطول النص — فملاحظات إصدارٍ طويلة دفعت زرّ التحديث **خارج
+    # النافذة**، فلم تستطع مدرسة أن تُحدّث أصلاً. الزرّ الآن يُرصَف في
+    # الأسفل **قبل** النص، والنص في صندوق بشريط تمرير مهما طال.
     win.grab_set()
     win.lift()
     win.attributes("-topmost", True)
@@ -395,7 +399,15 @@ def _show_update_dialog(latest, notes, dl_url):
              bg="#1565C0", fg="white",
              font=("Tahoma", 12, "bold")).pack(expand=True)
 
-    body = ttk.Frame(win, padding=20); body.pack(fill="both", expand=True)
+    # ── الأسفل أولاً: يحجز مكانه فلا يزيحه أي نص ──
+    foot = ttk.Frame(win, padding=(20, 6, 20, 14))
+    foot.pack(side="bottom", fill="x")
+    status_lbl = ttk.Label(foot, text="", font=("Tahoma", 9))
+    status_lbl.pack(anchor="e", pady=(0, 8))
+    btn_row = ttk.Frame(foot); btn_row.pack(fill="x")
+
+    body = ttk.Frame(win, padding=(20, 14, 20, 0))
+    body.pack(side="top", fill="both", expand=True)
 
     ttk.Label(body, text=f"الإصدار الحالي:  {_get_installed_version()}",
               font=("Tahoma", 10), foreground="#666").pack(anchor="e")
@@ -404,13 +416,18 @@ def _show_update_dialog(latest, notes, dl_url):
 
     if notes:
         ttk.Label(body, text="ما الجديد:", font=("Tahoma", 9, "bold")).pack(anchor="e")
-        ttk.Label(body, text=notes, font=("Tahoma", 9),
-                  foreground="#333", wraplength=420, justify="right").pack(anchor="e", pady=(0, 10))
-
-    status_lbl = ttk.Label(body, text="", font=("Tahoma", 9))
-    status_lbl.pack(anchor="e", pady=(0, 8))
-
-    btn_row = ttk.Frame(body); btn_row.pack(fill="x")
+        nf = ttk.Frame(body); nf.pack(fill="both", expand=True, pady=(2, 6))
+        sb = ttk.Scrollbar(nf, orient="vertical")
+        txt = tk.Text(nf, font=("Tahoma", 9), fg="#333", wrap="word",
+                      height=6, relief="flat", bg="#F7F8FA",
+                      yscrollcommand=sb.set)
+        sb.config(command=txt.yview)
+        sb.pack(side="left", fill="y")
+        txt.pack(side="right", fill="both", expand=True)
+        txt.insert("1.0", notes)
+        txt.tag_configure("rtl", justify="right")
+        txt.tag_add("rtl", "1.0", "end")
+        txt.config(state="disabled")
 
     auto_btn = tk.Button(btn_row, text="⚡  تحديث تلقائي (موصى به)",
                          bg="#1565C0", fg="white",

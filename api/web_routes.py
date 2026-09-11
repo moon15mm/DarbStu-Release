@@ -3331,6 +3331,7 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
           <option value="deputy">وكيل</option>
           <option value="staff">إداري</option>
           <option value="counselor">موجه طلابي</option>
+          <option value="health">موجه صحي</option>
           <option value="activity_leader">رائد نشاط</option>
           <option value="teacher" selected>معلم</option>
           <option value="lab">محضر</option>
@@ -3661,7 +3662,8 @@ function doEndPeriod(){
             <option value="">اختر الجهة</option>
             <option>المدير</option>
             <option>الوكيل</option>
-            <option>المرشد الطلابي</option>
+            <option>الموجّه الطلابي</option>
+            <option>الموجّه الصحي</option>
             <option>الإداري</option>
             <option>المعلم</option>
             <option>أخرى</option>
