@@ -955,7 +955,25 @@ async def web_get_teachers(request: Request):
     try:
         # نعيد بيانات المعلمين من ملف teachers.json وليس فقط المستخدمين
         data = load_teachers()
-        return JSONResponse({"ok": True, "teachers": data.get("teachers", [])})
+        rows = data.get("teachers", []) or []
+        # ⚠️ مفاتيح لاتينية مرافقة — وليست ترفاً.
+        # وسيط التأنيث يُعيد كتابة نصّ الصفحة في مدارس البنات، وهو يشمل
+        # الجافاسكربت المضمَّن عمداً (تقارن الشيفرةُ نصوصاً معروضة). فكان
+        # `t['اسم المعلم']` يصير `t['اسم المعلمة']` — مفتاحاً لا وجود له
+        # في البيانات، فتظهر قائمة المعلمات **بلا أسماء** في كل مدرسة
+        # بنات. المفتاح اللاتيني لا يطاله التأنيث أبداً.
+        out = []
+        for t in rows:
+            if not isinstance(t, dict):
+                continue
+            r = dict(t)
+            r["name"] = str(t.get("اسم المعلم") or t.get("full_name") or "").strip()
+            r["phone"] = str(t.get("رقم الجوال") or t.get("phone") or "").strip()
+            r["subject"] = str(t.get("التخصص") or "").strip()
+            r["nid"] = str(t.get("رقم الهوية") or "").strip()
+            r["job"] = str(t.get("الوظيفة") or "").strip()
+            out.append(r)
+        return JSONResponse({"ok": True, "teachers": out})
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 
@@ -7482,11 +7500,14 @@ async function loadAdminsMgmt(){
   _teachersRec=(d&&d.ok)?(d.teachers||[]):[];
   tmSetJob('اداري');
 }
-function _tName(t){return String(t['اسم المعلم']||t.full_name||'').trim();}
+/* ⚠️ مفاتيح لاتينية فقط. المفتاح العربي يُعيد التأنيث كتابته في
+   مدارس البنات فيصير مفتاحاً لا وجود له، وتظهر القائمة بلا أسماء.
+   الواجهة ترفق name/phone/subject/job لهذا السبب. */
+function _tName(t){return String((t&&(t.name||t.full_name))||'').trim();}
 /* الوظيفة تأتي موسومةً من ملف نور («نوع المستخدم» في ترويسته).
    السجلّ القديم بلا وظيفة يُعدّ معلماً — فكل ما استُورد قبل اليوم معلمون. */
 function _tJob(t){
-  var j=String(t['الوظيفة']||'').trim();
+  var j=String((t&&t.job)||'').trim();
   if(j.indexOf('اداري')>=0||j.indexOf('إداري')>=0)return 'اداري';
   if(j.indexOf('موجه')>=0)return 'موجه طلابي';
   return 'معلم';
@@ -7507,11 +7528,11 @@ function renderTeachersTbl(){
     if(_tmJobFilter&&_tJob(t)!==_tmJobFilter)return false;
     if(!q)return true;
     return _tName(t).toLowerCase().indexOf(q)>=0||
-           String(t['التخصص']||'').toLowerCase().indexOf(q)>=0;
+           String((t&&t.subject)||'').toLowerCase().indexOf(q)>=0;
   });
   var JC={'معلم':'#065f46','اداري':'#2563eb','موجه طلابي':'#059669'};
   tb.innerHTML=arr.map(function(t,i){
-    var n=_tName(t),p=String(t['رقم الجوال']||t.phone||''),s=String(t['التخصص']||'');
+    var n=_tName(t),p=String((t&&t.phone)||''),s=String((t&&t.subject)||'');
     var j=_tJob(t);
     var esc=n.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
     return '<tr><td>'+(i+1)+'</td><td>'+n+'</td>'+
@@ -7535,9 +7556,9 @@ function editTeacherRec(name){
   for(var i=0;i<_teachersRec.length;i++){if(_tName(_teachersRec[i])===name){t=_teachersRec[i];break;}}
   if(!t)return;
   document.getElementById('tm-name').value=name;
-  document.getElementById('tm-phone').value=t['رقم الجوال']||t.phone||'';
-  document.getElementById('tm-subject').value=t['التخصص']||'';
-  document.getElementById('tm-nid').value=t['رقم الهوية']||'';
+  document.getElementById('tm-phone').value=t.phone||'';
+  document.getElementById('tm-subject').value=t.subject||'';
+  document.getElementById('tm-nid').value=t.nid||'';
   var jb=document.getElementById('tm-job');if(jb)jb.value=_tJob(t);
   document.getElementById('tm-orig').value=name;
   ss('tm-st','✏️ تعديل: '+name+' — عدّل الحقول ثم احفظ','ai');
@@ -7627,7 +7648,7 @@ async function loadCounselorInquiries(){
   var dt=await api('/web/api/teachers');
   if(dt&&dt.ok){
      document.getElementById('coinq-teacher').innerHTML='<option value="">اختر المعلم</option>'+
-       dt.teachers.map(function(t){var n=t["اسم المعلم"]||t.full_name||'';return '<option value="'+n+'">'+n+'</option>';}).join('');
+       dt.teachers.map(function(t){var n=(t&&(t.name||t.full_name))||'';return '<option value="'+n+'">'+n+'</option>';}).join('');
   }
 }
 

@@ -4137,10 +4137,19 @@ def import_teachers_from_excel(xlsx_path: str) -> Dict[str, Any]:
         print("[STAFF] تعذّرت قراءة ملف الطاقم الحالي (يُبنى من جديد): %s" % e)
 
     merged, order = {}, []
+    dropped = 0
     for t in _existing:
+        # سجلّ بلا اسم لا ينفع أحداً: لا يُعرض ولا يُطابَق بجدول الحصص،
+        # ويملأ القائمة بصفوف فارغة. خلّفها استيرادٌ سابق فاشل، فيُنظَّف
+        # هنا بدل أن تُحذف يدوياً واحداً واحداً.
+        if not str(t.get("اسم المعلم") or t.get("full_name") or "").strip():
+            dropped += 1
+            continue
         k = _key(t)
         if k and k not in merged:
             merged[k] = dict(t); order.append(k)
+    if dropped:
+        print("[STAFF] حُذف %d سجلاً بلا اسم من استيراد سابق" % dropped)
 
     added = updated = 0
     for t in teachers:
