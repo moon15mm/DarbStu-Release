@@ -152,15 +152,34 @@ class SetupWizard:
         canvas.bind_all("<MouseWheel>",
                         lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
 
+        # ── ما جهّزه المزوّد مسبقاً ────────────────────────────────
+        # ‏apply_provision_file يكتب اسم المدرسة ونطاقها وجنسها في
+        # config.json **قبل** ظهور هذه الشاشة. وكانت الحقول تبدأ فارغة
+        # و«بنين» دائماً، فيُعيد المدير كتابة ما هو معروف، أو — الأسوأ —
+        # يترك «بنين» في مدرسة بنات فيُكتب فوق ما ضبطه المزوّد ويبقى
+        # النظام كله مذكَّراً. القراءة من الملف تجعل التجهيز عن بُعد ممكناً.
+        _pre = {}
+        try:
+            if os.path.exists(_CONFIG_JSON):
+                with open(_CONFIG_JSON, encoding="utf-8") as _f:
+                    _pre = json.load(_f) or {}
+        except Exception:
+            _pre = {}
+
+        def _pv(key, default=""):
+            v = _pre.get(key)
+            return str(v) if v not in (None, "") else default
+
         # ── متغيرات ───────────────────────────────────────────────
-        self.v_school   = tk.StringVar()
-        self.v_region   = tk.StringVar(value=_REGIONS[0])
-        self.v_principal = tk.StringVar()
-        self.v_assistant = tk.StringVar()
-        self.v_p_phone   = tk.StringVar()
-        self.v_gender    = tk.StringVar(value="boys")
-        self.v_start     = tk.StringVar(value="07:00")
-        self.v_domain    = tk.StringVar()
+        self.v_school   = tk.StringVar(value=_pv("school_name"))
+        self.v_region   = tk.StringVar(value=_pv("education_region", _REGIONS[0]))
+        self.v_principal = tk.StringVar(value=_pv("principal_name"))
+        self.v_assistant = tk.StringVar(value=_pv("assistant_name"))
+        self.v_p_phone   = tk.StringVar(value=_pv("principal_phone"))
+        self.v_gender    = tk.StringVar(
+            value=("girls" if _pv("school_gender") == "girls" else "boys"))
+        self.v_start     = tk.StringVar(value=_pv("school_start_time", "07:00"))
+        self.v_domain    = tk.StringVar(value=_pv("cloudflare_domain"))
         self.v_pw        = tk.StringVar()
         self.v_pw2       = tk.StringVar()
 

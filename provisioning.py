@@ -230,9 +230,16 @@ def apply_provision_file() -> dict:
 
     # النطاق يُخزَّن في المفتاح القديم نفسه، فيقرأه constants.STATIC_DOMAIN
     # وتعمل روابط QR وبوابة أولياء الأمور بلا أي تعديل في بقية الكود.
+    # ما يعرفه المزوّد يُكتب هنا فلا تُسأل عنه المدرسة — ويقرؤه معالج
+    # الإعداد فيبدأ بالقيم الصحيحة بدل أن يفترض «بنين» ويكتب فوقها.
+    # التجهيز عن بُعد يعتمد على هذا: مدرسةٌ بعيدة تُنصّب بنفسها ولا
+    # تُطالَب بضبط ما يعرفه المزوّد أصلاً.
     _merge_config({
         'cloudflare_domain': domain,
-        'school_name': p.get('school_name') or _existing('school_name'),
+        'school_name':   p.get('school_name') or _existing('school_name'),
+        'school_gender': p.get('school_gender') or _existing('school_gender'),
+        'school_stage':  p.get('school_stage') or _existing('school_stage'),
+        'education_region': p.get('education_region') or _existing('education_region'),
     })
 
     # حذف ملف التجهيز — لا يبقى المفتاح الخاص نصاً صريحاً
