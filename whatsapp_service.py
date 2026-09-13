@@ -78,6 +78,62 @@ def get_next_wa_server() -> dict:
     _WA_SERVER_INDEX = (_WA_SERVER_INDEX + 1) % len(servers)
     return server
 
+# ─── محاسبة السقف اليومي ─────────────────────────────────────────────
+# الحجز يسبق الإرسال ضرورةً (وإلا سبقت الرسالةُ العدّاد وتجاوزنا السقف)،
+# لذا يجب ردّ الخانة حين يجزم الخادم بأن شيئاً لم يخرج. بدون الردّ كانت
+# مدرسةٌ واتسابها غير متصل تُحرق سقف اليوم كاملاً على محاولات فاشلة.
+
+def _consume(port, phone):
+    """
+    يحجز خانة من الدفتر الذي يخصّ المستقبِل.
+
+    يُرجع (حُجزت, سبب المنع, الدفتر). الدفتر يُحدَّد برقم المستقبِل لا
+    بالدالة المُرسِلة — مصادر كثيرة تخدم الطاقم وأولياء الأمور معاً.
+    """
+    try:
+        import wa_limits
+        # عنصران فقط — والدفتر في خاصية. انظر `wa_limits._Grant`: تحديثٌ
+        # ينقطع في منتصفه قد يترك الملفين من نسختين، وفكُّ ثلاثة عناصر
+        # يرفع استثناءً تبتلعه `except` أدناه فيمضي الإرسال بلا سقف.
+        grant = wa_limits.try_consume(port, phone=phone)
+        ok, why = grant
+        aud = getattr(grant, "audience", None)
+        if not ok:
+            print(f"[WA-LIMITS] ⛔ {why}")
+            return False, why, aud
+        return True, None, aud
+    except Exception as e:
+        print(f"[WA-LIMITS] تعذّر فحص السقف: {e}")
+        return False, None, None
+
+
+def _refund(port, consumed, audience, phone=None):
+    """يردّ الخانة المحجوزة — تُستدعى فقط عند تأكّد عدم الإرسال."""
+    if not consumed:
+        return
+    try:
+        import wa_limits
+        wa_limits.refund(port, audience=audience, phone=phone)
+    except Exception as e:
+        print(f"[WA-LIMITS] تعذّر ردّ الخانة: {e}")
+
+
+def _mark_sent(audience, phone):
+    """
+    يُسجّل رقم وليّ الأمر «معروفاً» بعد وصول الرسالة.
+
+    بعد النجاح وحده: التسجيل عند المحاولة كان يعني أن دفعةً فاشلة تُعلّم
+    مئات الأرقام معروفةً بلا أن يصل منها شيء، فتسقط الحماية كلها دفعة.
+    """
+    if audience not in ("parent_new", "parent_known") or not phone:
+        return
+    try:
+        import wa_limits
+        wa_limits.mark_known(phone)
+    except Exception as e:
+        print(f"[WA-LIMITS] تعذّر تسجيل الرقم: {e}")
+
+
 def send_whatsapp_message(phone: str, message_body: str, student_data: dict = None, humanize: bool = False) -> (bool, str):
     if humanize:
         message_body = humanize_message(message_body)
@@ -99,18 +155,8 @@ def send_whatsapp_message(phone: str, message_body: str, student_data: dict = No
         print(f"[WHATSAPP-WARN] {msg}")
         return False, msg
 
-    # السقف اليومي والإحماء — يُفحص قبل الإرسال لا بعده. تجاوز السقف
-    # يعني تجميد ٢٤ ساعة، ورسالة واحدة زائدة تُوقف كل رسائل الغد.
-    try:
-        import wa_limits
-        _ok, _why = wa_limits.try_consume(_port)
-        if not _ok:
-            print(f"[WA-LIMITS] ⛔ {_why}")
-            return False, _why
-    except Exception as _e:
-        print(f"[WA-LIMITS] تعذّر فحص السقف: {_e}")
-
-    # تحويل التنسيق المحلي إلى دولي
+    # تحويل التنسيق المحلي إلى دولي — **قبل** حجز خانة السقف. رقمٌ مشوّه
+    # لا يبلغ واتساب أصلاً، وكان يُحسب من رصيد اليوم فيأكل خانةً بلا رسالة.
     if len(cleaned_phone) == 10 and cleaned_phone.startswith('05'):
         cleaned_phone = '966' + cleaned_phone[1:]
     elif len(cleaned_phone) == 9 and cleaned_phone.startswith('5'):
@@ -122,6 +168,12 @@ def send_whatsapp_message(phone: str, message_body: str, student_data: dict = No
         msg = f"تنسيق رقم الجوال غير مدعوم: {cleaned_phone}"
         print(f"[WHATSAPP-WARN] {msg}")
         return False, msg
+
+    # السقف اليومي والإحماء — يُفحص قبل الإرسال لا بعده. تجاوز السقف
+    # يعني تجميد ٢٤ ساعة، ورسالة واحدة زائدة تُوقف كل رسائل الغد.
+    _consumed, _blocked, _aud = _consume(_port, cleaned_phone)
+    if _blocked:
+        return False, _blocked
 
     try:
         print(f"[WHATSAPP] محاولة إرسال إلى: {cleaned_phone}")
@@ -142,14 +194,17 @@ def send_whatsapp_message(phone: str, message_body: str, student_data: dict = No
             response_data = response.json()
             if response_data.get('status') == 'success':
                 print(f"[WHATSAPP] ✅ تم الإرسال بنجاح إلى {cleaned_phone}")
+                _mark_sent(_aud, cleaned_phone)
                 return True, "تم الإرسال بنجاح"
             else:
                 error_msg = response_data.get('message', response.text)
                 print(f"[WHATSAPP] ❌ فشل الإرسال: {error_msg}")
+                _refund(_port, _consumed, _aud, cleaned_phone)
                 return False, f"فشل: {error_msg}"
         elif response.status_code == 503:
             error_msg = "الواتساب غير متصل — امسح QR Code أولاً"
             print(f"[WHATSAPP] ❌ {error_msg}")
+            _refund(_port, _consumed, _aud, cleaned_phone)
             return False, error_msg
         else:
             # أظهر رسالة الخطأ التفصيلية من الخادم
@@ -159,18 +214,24 @@ def send_whatsapp_message(phone: str, message_body: str, student_data: dict = No
                 err_detail = response.text
             error_msg = f"HTTP {response.status_code}: {err_detail}"
             print(f"[WHATSAPP] ❌ {error_msg}")
+            # ٤٠٠ حمولة ناقصة · ٤٠٤ الرقم ليس على واتساب · ٥٠٠ فشل الإرسال
+            # في الخادم — في كلٍّ منها لم يخرج شيء، فتُردّ الخانة.
+            _refund(_port, _consumed, _aud, cleaned_phone)
             return False, error_msg
-            
+
     except requests.exceptions.ConnectionError:
         error_msg = "فشل الاتصال بخادم الواتساب. تأكد من تشغيل الخادم."
         print(f"[WHATSAPP] ❌ {error_msg}")
+        _refund(_port, _consumed, _aud, cleaned_phone)
         return False, error_msg
-        
+
     except requests.exceptions.Timeout:
+        # لا ردّ هنا عمداً: الطلب قد يكون بلغ واتساب وتمّ. التقدير الزائد
+        # يكلّف خانة، والتقدير الناقص يكلّف تجميد الرقم ٢٤ ساعة.
         error_msg = "انتهت مهلة الاتصال بخادم الواتساب."
         print(f"[WHATSAPP] ❌ {error_msg}")
         return False, error_msg
-        
+
     except Exception as e:
         error_msg = f"حدث خطأ غير متوقع: {e}"
         print(f"[WHATSAPP] ❌ {error_msg}")
@@ -195,6 +256,12 @@ def send_whatsapp_pdf(phone: str, pdf_bytes: bytes, filename: str, caption: str 
     elif not (len(cleaned_phone) == 12 and cleaned_phone.startswith("966")):
         return False, f"تنسيق رقم الجوال غير مدعوم: {cleaned_phone}"
 
+    # الملف رسالةُ واتساب كاملة في نظر كاشف الإزعاج، وكان لا يُحسب من
+    # السقف إطلاقاً — فكان حجم اليوم الحقيقي يتجاوز الرقم المعروض.
+    _consumed, _blocked, _aud = _consume(_port, cleaned_phone)
+    if _blocked:
+        return False, _blocked
+
     try:
         b64_data = base64.b64encode(pdf_bytes).decode("utf-8")
         payload = {
@@ -208,11 +275,18 @@ def send_whatsapp_pdf(phone: str, pdf_bytes: bytes, filename: str, caption: str 
         if response.status_code == 200:
             rd = response.json()
             if rd.get("status") == "success":
+                _mark_sent(_aud, cleaned_phone)
                 return True, "تم ارسال PDF بنجاح"
+            _refund(_port, _consumed, _aud, cleaned_phone)
             return False, rd.get("message", response.text)
+        _refund(_port, _consumed, _aud, cleaned_phone)
         return False, f"HTTP {response.status_code}: {response.text}"
     except requests.exceptions.ConnectionError:
+        _refund(_port, _consumed, _aud, cleaned_phone)
         return False, "فشل الاتصال بخادم الواتساب"
+    except requests.exceptions.Timeout:
+        # لا ردّ — الملف قد يكون في الطريق (انظر الشرح في دالة الرسالة)
+        return False, "انتهت مهلة إرسال الملف"
     except Exception as e:
         return False, f"خطأ: {e}"
 

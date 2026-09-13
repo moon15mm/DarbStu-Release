@@ -3008,6 +3008,17 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
       <a href="#" onclick="mrQuick(6);return false">آخر ٧ أيام</a> ·
       <a href="#" onclick="mrQuick(29);return false">آخر ٣٠ يوماً</a>
     </div>
+    <!-- بلا هذه الملاحظة كان الرقمان يبدوان متناقضَين: التقرير ١٣ رسالة
+         وعدّاد اللوحة ١٣٧. الأول رسائل أولياء الأمور وحدها، والثاني كل
+         ما خرج من رقم الواتساب. التفصيل في بطاقة الواتساب باللوحة. -->
+    <div style="margin-top:10px;font-size:12px;color:#6B7280;
+                background:#F8FAFC;border-right:3px solid #0C2E56;
+                padding:8px 10px;border-radius:6px;line-height:1.7">
+      هذا التقرير يعرض <b>رسائل أولياء الأمور</b> (الغياب والتأخر) وحدها.
+      أما عدّاد «أُرسل اليوم» في لوحة المراقبة فيشمل <b>كل</b> ما يخرج من
+      رقم الواتساب — روابط الحصص والإشعارات والتحويلات وغيرها — ولذلك
+      يكون أكبر. توزيعه بالتفصيل في بطاقة الواتساب بلوحة المراقبة.
+    </div>
     <div id="mr-st" style="margin-top:10px"></div>
   </div>
   <div id="mr-out"></div>
@@ -4597,6 +4608,22 @@ function ss(id,msg,type){var el=document.getElementById(id);if(!el)return;
   el.className='sm s'+(type||'in');el.textContent=msg;el.style.display='block';}
 
 /* ── DASHBOARD ── */
+/* تسمية مصادر رسائل الواتساب. المفاتيح **لاتينية** لأنها تصل من JSON
+   وهو لا يُؤنَّث، والقيم عربية في المصدر ليُؤنّثها الوسيط في مدارس
+   البنات. عكسُ ذلك يكسر المطابقة في البنات وحدها بلا رسالة خطأ. */
+var _WA_SRC={
+  absence:'رسائل الغياب', tardiness:'رسائل التأخر',
+  tardiness_link:'رابط التأخر للإدارة', smart_alert:'الإشعارات الذكية',
+  daily_report:'التقرير اليومي', permission:'الاستئذان',
+  /* «روابط حصص المعلمين» لا «للمعلمين»: قاعدة التأنيث تطابق «المعلمين»
+     بأداة التعريف، و«لل» تبتلع الألف فلا تُطابَق وتبقى مذكّرة في البنات */
+  class_links:'روابط حصص المعلمين', portal_link:'روابط بوابة أولياء الأمور',
+  referral:'التحويلات', counselor:'الموجه الطلابي',
+  certificate:'شهادات التميز', reward:'التعزيز الأسبوعي',
+  circular:'التعاميم', credentials:'حسابات المستخدمين',
+  teacher_form:'نماذج المعلمين', bus:'الحافلات',
+  biometric:'جهاز البصمة', test:'رسائل تجريبية', other:'مصادر أخرى'
+};
 function monEsc(s){
   return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
@@ -4661,9 +4688,43 @@ async function loadDashboard(){
                  (w.reply_bot===null||w.reply_bot===undefined)?'—':(w.reply_bot?'يعمل':'موقوف'),
                  (w.reply_bot===null||w.reply_bot===undefined)?'dot-off':(w.reply_bot?'dot-ok':'dot-warn'));
     if(w.pending!==null&&w.pending!==undefined) html+=monRow('ردود منتظَرة', w.pending);
-    html+=monRow('أُرسل اليوم', used+' من '+lim);
-    html+='<div class="mon-bar"><i style="width:'+pctu+'%;background:'+barc+'"></i></div>';
-    if(w.warming_up) html+='<div style="font-size:12px;color:var(--mu);margin-top:7px">الرقم في فترة الإحماء (عمره '+(w.age_days||0)+' يوم) — السقف يرتفع تدريجياً</div>';
+    html+=monRow('أولياء الأمور اليوم', used);
+    /* القيد الحقيقي هو **الأرقام الجديدة** لا عدد الرسائل: واتساب يعاقب
+       مراسلة أرقام لا تحفظك، وقائمة أولياء الأمور مغلقة — فبعد أسبوعين
+       لا يبقى فيها جديد وتصير الرسائل بلا سقف عملي. الشريط يعرض هذا. */
+    var nlim=w.new_limit||0;var nnew=w.new_today||0;
+    if(nlim){
+      var pctn=Math.min(100,Math.round(nnew/nlim*100));
+      var nbc=pctn>=100?'#dc2626':(pctn>=80?'#d97706':'#16a34a');
+      html+=monRow('منهم أرقام جديدة', nnew+' من '+nlim);
+      html+='<div class="mon-bar"><i style="width:'+pctn+'%;background:'+nbc+'"></i></div>';
+    }
+    /* دفتر الطاقم مستقل: أرقام المعلمين والإدارة محفوظة ويردّون على
+       الرسائل، فليست ناقل الحظر. كان دفتراً واحداً فتبتلع روابط الحصص
+       رصيدَ أولياء الأمور قبل أن تُرسَل رسالة غياب واحدة. */
+    var slim=w.staff_limit||0;var sused=w.staff_today||0;
+    if(slim){
+      var pcts=Math.min(100,Math.round(sused/slim*100));
+      html+=monRow('الطاقم اليوم', sused+' من '+slim);
+      html+='<div class="mon-bar"><i style="width:'+pcts+'%;background:#64748B"></i></div>';
+    }
+    /* تفصيل السقف حسب المصدر — «أُرسل اليوم» يعدّ كل ما يخرج من الرقم،
+       بينما تقرير الرسائل لا يعرض إلا الغياب والتأخر. الفارق بين الرقمين
+       كان يبدو عطلاً وهو مصادرُ أخرى لم تكن ظاهرة في أي مكان. */
+    var bs=w.by_source||{};var ks=Object.keys(bs);
+    if(ks.length){
+      ks.sort(function(a,b){return (bs[b]||0)-(bs[a]||0);});
+      html+='<div style="margin-top:9px;padding-top:8px;border-top:1px dashed var(--bd)">'+
+            '<div style="font-size:11.5px;color:var(--mu);margin-bottom:5px">توزيع رسائل اليوم</div>'+
+            ks.map(function(k){
+              return '<div style="display:flex;justify-content:space-between;'+
+                     'font-size:12px;padding:2px 0">'+
+                     '<span>'+monEsc(_WA_SRC[k]||k)+'</span>'+
+                     '<b style="color:var(--pr)">'+(bs[k]||0)+'</b></div>';
+            }).join('')+'</div>';
+    }
+    if(w.warming_up) html+='<div style="font-size:12px;color:var(--mu);margin-top:7px">الرقم في فترة الإحماء (عمره '+(w.age_days||0)+' يوم) — حدّ الأرقام الجديدة يرتفع تدريجياً حتى '+(w.max_daily||150)+' يومياً</div>';
+    else html+='<div style="font-size:11.5px;color:var(--mu);margin-top:7px">المحدود هو عدد الأرقام <b>الجديدة</b> يومياً. الرسائل لمن سبق التواصل معهم ('+(w.known_contacts||0)+' رقماً) بلا سقف عملي، ورسائل الطاقم دفتر مستقل.</div>';
     monSet('mon-wa',html);
   } else { monSet('mon-wa','<p style="color:var(--mu)">للمدير والوكيل</p>'); }
 

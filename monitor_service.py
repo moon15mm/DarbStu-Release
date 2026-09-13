@@ -114,15 +114,31 @@ def _live_block(date_str):
 def _whatsapp_block():
     out = {"connected": False, "reply_bot": None, "pending": None,
            "sent_today": 0, "limit": 0, "remaining": 0, "age_days": 0,
-           "warming_up": False}
+           "warming_up": False, "by_source": {}, "max_daily": 0,
+           "staff_today": 0, "staff_limit": 0, "staff_remaining": 0,
+           "new_today": 0, "new_limit": 0, "new_remaining": 0,
+           "known_contacts": 0}
     try:
         import wa_limits
         st = wa_limits.status()
         out.update({"sent_today": st.get("sent_today", 0),
                     "limit": st.get("limit", 0),
                     "remaining": st.get("remaining", 0),
+                    # القيد الحقيقي: الأرقام الجديدة، لا عدد الرسائل
+                    "new_today": st.get("new_today", 0),
+                    "new_limit": st.get("new_limit", 0),
+                    "new_remaining": st.get("new_remaining", 0),
+                    "known_contacts": st.get("known_contacts", 0),
+                    # دفتر الطاقم مستقل — لا يزاحم رصيد أولياء الأمور
+                    "staff_today": st.get("staff_today", 0),
+                    "staff_limit": st.get("staff_limit", 0),
+                    "staff_remaining": st.get("staff_remaining", 0),
                     "age_days": st.get("age_days", 0),
-                    "warming_up": bool(st.get("warming_up"))})
+                    "warming_up": bool(st.get("warming_up")),
+                    # مفاتيح لاتينية — التسمية العربية في مصدر الصفحة
+                    # ليمرّ عليها وسيط التأنيث في مدارس البنات
+                    "by_source": st.get("by_source") or {},
+                    "max_daily": st.get("max_daily", 0)})
     except Exception:
         pass
     try:
@@ -282,11 +298,19 @@ def _alerts(snap):
     elif wa.get("reply_bot") is False:
         a.append({"level": "warn", "text": "بوت استقبال الأعذار موقوف — لن تُسجَّل ردود أولياء الأمور"})
 
-    lim = wa.get("limit") or 0
-    if lim and wa.get("remaining", 0) == 0:
-        a.append({"level": "warn", "text": "بلغت السقف اليومي لرسائل الواتساب (%d) — يُستأنف غداً" % lim})
-    elif lim and wa.get("remaining", 0) <= max(3, lim * 0.1):
-        a.append({"level": "warn", "text": "بقي %d من سقف اليوم (%d)" % (wa.get("remaining", 0), lim)})
+    # التنبيه على **الأرقام الجديدة** لا على عدد الرسائل: رسائل الأرقام
+    # المعروفة تستمر بعد نفاد نصيب الجديد، فتنبيهٌ بصيغة «بلغت السقف»
+    # يُفزع المدير بلا سبب ويوحي بتوقّف كل شيء وهو لم يتوقّف.
+    nlim = wa.get("new_limit") or 0
+    nrem = wa.get("new_remaining", 0)
+    if nlim and nrem == 0:
+        a.append({"level": "warn",
+                  "text": "بلغت حدّ الأرقام الجديدة اليوم (%d) — الرسائل "
+                          "لمن سبق التواصل معهم تعمل، والجديدة تُستأنف غداً"
+                          % nlim})
+    elif nlim and nrem <= max(3, nlim * 0.1):
+        a.append({"level": "warn",
+                  "text": "بقي %d رقماً جديداً من حدّ اليوم (%d)" % (nrem, nlim)})
 
     if not tasks.get("master"):
         a.append({"level": "warn", "text": "الإرسال لأولياء الأمور موقوف بالمفتاح الرئيسي"})
