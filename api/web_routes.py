@@ -700,6 +700,63 @@ async def web_student_update(request: Request):
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 
 
+@router.post("/web/api/teachers/import", response_class=JSONResponse)
+async def web_teachers_import(request: Request):
+    """
+    استيراد الطاقم من ملف نور عبر الويب — نفس محرّك سطح المكتب.
+
+    كان الاستيراد متاحاً في البرنامج وحده، فمن تُدير النظام من الويب
+    تضطر للجلوس إلى جهاز المدرسة لتستورد ملفاً. والمحرّك يدمج ولا
+    يستبدل، فرفعُ ملفات نور الأربعة واحداً بعد الآخر يبني الطاقم كاملاً.
+    """
+    user = _get_current_user(request)
+    if not user or user.get("role") not in ("admin", "deputy"):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    tmp_path = ""
+    try:
+        import tempfile
+        form = await request.form()
+        upload = form.get("file")
+        if not upload:
+            return JSONResponse({"ok": False, "msg": "لم يتم رفع ملف"})
+        fn = (getattr(upload, "filename", "") or "").lower()
+        suffix = ".xls" if fn.endswith(".xls") else ".xlsx"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix,
+                                          prefix="staff_import_")
+        tmp.write(await upload.read())
+        tmp.close()
+        tmp_path = tmp.name
+
+        from database import import_teachers_from_excel
+        res = import_teachers_from_excel(tmp_path) or {}
+        rows = res.get("teachers") or []
+
+        def _job(t):
+            j = str(t.get("الوظيفة", "") or "")
+            if "اداري" in j or "إداري" in j:
+                return "اداري"
+            return "موجه طلابي" if "موجه" in j else "معلم"
+
+        counts = {"معلم": 0, "اداري": 0, "موجه طلابي": 0}
+        for t in rows:
+            counts[_job(t)] += 1
+        return JSONResponse({
+            "ok": True,
+            "added": res.get("_added", 0),
+            "updated": res.get("_updated", 0),
+            "in_file": res.get("_file_count", 0),
+            "job": res.get("_job", ""),
+            "total": len(rows),
+            "counts": counts,
+        })
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=400)
+    finally:
+        if tmp_path:
+            try: os.unlink(tmp_path)
+            except Exception: pass
+
+
 @router.post("/web/api/teachers/save", response_class=JSONResponse)
 async def web_teachers_save(request: Request):
     """إضافة معلم يدوياً أو تعديل بياناته."""
@@ -2956,6 +3013,14 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
        أول تعديل فيصير لكل تبويب سلوك مختلف بلا سبب. -->
   <div id="tm-screen">
   <div class="section">
+    <h3 style="margin:0 0 10px;color:#0C2E56;font-size:15px">📥 استيراد من نور</h3>
+    <div class="ab ai">📌 ارفع ملفات نور واحداً بعد الآخر — المعلمات والإداريات والموجهات.
+      كل ملف <b>يُضاف ولا يمحو ما قبله</b>، وكلٌّ تذهب لوظيفتها تلقائياً.</div>
+    <input type="file" id="tm-file" accept=".xlsx,.xls">
+    <button class="btn bp1" style="margin-top:12px" onclick="importStaffFile()">📥 استيراد</button>
+    <div id="tm-imp-st" style="margin-top:10px"></div>
+  </div>
+  <div class="section">
     <h3 style="margin:0 0 10px;color:#0C2E56;font-size:15px">➕ إضافة عضو للطاقم / تعديل بياناته</h3>
     <div class="fg2">
       <div class="fg"><label class="fl">اسم المعلم</label><input type="text" id="tm-name" placeholder="الاسم الكامل"></div>
@@ -3261,6 +3326,7 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
   <h2 class="pt"><i class="fas fa-university"></i> إعدادات المدرسة</h2>
   <div class="it">
     <button class="itb active" onclick="si('school_settings','ss-gen')">عام</button>
+    <button class="itb" onclick="si('school_settings','ss-day')">الدوام والتأخر</button>
     <button class="itb" onclick="si('school_settings','ss-msg')">الرسائل</button>
     <button class="itb" onclick="si('school_settings','ss-wa')">واتساب</button>
     <button class="itb" onclick="si('school_settings','ss-adv')">متقدم</button>
@@ -3281,6 +3347,25 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
       <div class="st">🏫 مراحل هذا الجهاز</div>
       <div class="ab ai">📌 لكل مرحلة بياناتها ورابطها ومستخدموها — معزولة تماماً عن الأخرى.</div>
       <div id="ss-stages"></div>
+    </div>
+  </div>
+  <div id="ss-day" class="ip">
+    <div class="section">
+      <div class="st">⏰ بداية الدوام واحتساب التأخر</div>
+      <div class="ab ai">📌 على هذين الحقلين يُحسب التأخر — في التسجيل اليدوي وفي جهاز البصمة معاً.</div>
+      <div class="fg2">
+        <div class="fg"><label class="fl">بداية الدوام</label>
+          <input type="time" id="sd-start" onchange="sdPreview()"></div>
+        <div class="fg"><label class="fl">دقائق السماح بعد البداية</label>
+          <input type="number" id="sd-grace" min="0" max="60" value="0" onchange="sdPreview()"></div>
+      </div>
+      <div id="sd-preview" style="margin:10px 0;font-size:13.5px"></div>
+      <div class="st" style="margin-top:16px">أوقات الحصص</div>
+      <div class="fg" style="max-width:220px"><label class="fl">عدد الحصص اليومية</label>
+        <input type="number" id="sd-count" min="1" max="12" onchange="sdBuildPeriods()"></div>
+      <div id="sd-periods" style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px"></div>
+      <button class="btn bp1" style="margin-top:14px" onclick="saveDaySettings()">💾 حفظ</button>
+      <div id="sd-st" style="margin-top:10px"></div>
     </div>
   </div>
   <div id="ss-msg" class="ip">
@@ -5519,6 +5604,17 @@ async function loadSettings(){
   if(d.message_template)document.getElementById('ss-abs-tpl').value=d.message_template;
   if(d.tardiness_message_template)document.getElementById('ss-tard-tpl').value=d.tardiness_message_template;
   if(d.admin_report_phone)document.getElementById('ss-rpt-phone').value=d.admin_report_phone;
+
+  /* الدوام والتأخر */
+  document.getElementById('sd-start').value = d.school_start_time||'07:00';
+  document.getElementById('sd-grace').value = (d.biometric_grace_min!=null)?d.biometric_grace_min:0;
+  _sdTimes = (d.period_times&&d.period_times.length)?d.period_times.slice()
+             :['07:00','07:50','08:40','09:50','10:40','11:30','12:20'];
+  document.getElementById('sd-count').value = _sdTimes.length;
+  /* حقل «عدد الحصص» في تبويب «عام» كان معروضاً ولا يُحفظ — نُبقيه
+     متوافقاً مع أوقات الحصص الحقيقية بدل أن يعرض رقماً لا أثر له */
+  var per=document.getElementById('ss-per'); if(per) per.value=_sdTimes.length;
+  sdBuildPeriods(); sdPreview();
 }
 async function saveSchoolSettings(){
   var r=await fetch('/web/api/save-config',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -5526,6 +5622,59 @@ async function saveSchoolSettings(){
       school_gender:document.getElementById('ss-gender').value,
       alert_absence_threshold:parseInt(document.getElementById('ss-thr').value)||5})});
   var d=await r.json();ss('ss-st',d.ok?'✅ تم الحفظ':'❌ '+(d.msg||'خطأ'),d.ok?'ok':'er');
+}
+/* ── الدوام والتأخر ── */
+var _sdTimes = [];
+function _hm(s){var p=String(s||'').split(':');return (parseInt(p[0])||0)*60+(parseInt(p[1])||0);}
+function _mh(m){m=((m%1440)+1440)%1440;return ('0'+Math.floor(m/60)).slice(-2)+':'+('0'+(m%60)).slice(-2);}
+function sdPreview(){
+  var el=document.getElementById('sd-preview');if(!el)return;
+  var st=document.getElementById('sd-start').value||'07:00';
+  var g=parseInt(document.getElementById('sd-grace').value)||0;
+  var cut=_mh(_hm(st)+g);
+  el.innerHTML= g>0
+    ? 'الدوام يبدأ <b>'+st+'</b>، ومن تصل بعد <b>'+cut+'</b> تُحتسب متأخرة ('+g+' دقيقة سماح).'
+    : 'الدوام يبدأ <b>'+st+'</b>، ومن تصل بعده تُحتسب متأخرة (بلا سماح).';
+}
+function sdBuildPeriods(){
+  var n=parseInt(document.getElementById('sd-count').value)||7;
+  if(n<1)n=1; if(n>12)n=12;
+  var box=document.getElementById('sd-periods');if(!box)return;
+  var start=document.getElementById('sd-start').value||'07:00';
+  var h='';
+  for(var i=0;i<n;i++){
+    /* الافتراضي لحصة جديدة: خمسون دقيقة بعد سابقتها — تقدير يُعدَّل لا يُفرض */
+    var v=_sdTimes[i]|| (i===0?start:_mh(_hm(_sdTimes[i-1]||start)+50*i));
+    h+='<div class="fg" style="max-width:120px"><label class="fl">الحصة '+(i+1)+'</label>'+
+       '<input type="time" class="sd-p" data-i="'+i+'" value="'+v+'"></div>';
+  }
+  box.innerHTML=h;
+}
+function sdCollect(){
+  var out=[];
+  Array.prototype.forEach.call(document.querySelectorAll('.sd-p'),function(e){
+    out.push(e.value||'');});
+  return out.filter(function(x){return x;});
+}
+async function saveDaySettings(){
+  var st=document.getElementById('sd-start').value;
+  if(!st){ss('sd-st','حدّد بداية الدوام','er');return;}
+  var times=sdCollect();
+  if(!times.length){ss('sd-st','حدّد أوقات الحصص','er');return;}
+  /* ترتيب تصاعدي: حصةٌ قبل سابقتها تعني تأخراً محسوباً على حصة خاطئة */
+  for(var i=1;i<times.length;i++){
+    if(_hm(times[i])<=_hm(times[i-1])){
+      ss('sd-st','وقت الحصة '+(i+1)+' يجب أن يكون بعد الحصة '+i,'er');return;}
+  }
+  ss('sd-st','⏳ جارٍ الحفظ...','ai');
+  var r=await fetch('/web/api/save-config',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({school_start_time:st,
+      biometric_grace_min:parseInt(document.getElementById('sd-grace').value)||0,
+      period_times:times})});
+  var d=await r.json();
+  if(d.ok){_sdTimes=times;ss('sd-st','✅ حُفظ — يسري على التسجيل اليدوي وجهاز البصمة','ok');}
+  else ss('sd-st','❌ '+(d.msg||'خطأ'),'er');
 }
 async function saveMsgTemplates(){
   var r=await fetch('/web/api/save-config',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -7482,6 +7631,29 @@ function printMsgReport(){
 
 /* ── إدارة المعلمين ── */
 var _teachersRec=[];
+async function importStaffFile(){
+  var fi=document.getElementById('tm-file');
+  var f=fi&&fi.files[0];
+  if(!f){ss('tm-imp-st','اختر ملف نور أولاً','er');return;}
+  ss('tm-imp-st','⏳ جارٍ قراءة الملف...','ai');
+  var fd=new FormData(); fd.append('file',f);
+  try{
+    var r=await fetch('/web/api/teachers/import',{method:'POST',body:fd});
+    var d=await r.json();
+    if(!d.ok){ss('tm-imp-st','❌ '+(d.msg||'تعذّر الاستيراد'),'er');return;}
+    var c=d.counts||{};
+    ss('tm-imp-st','✅ '+(d.job?('ملف '+d.job+': '):'')+
+      'قُرئ '+d.in_file+' — أُضيف '+d.added+' وحُدِّث '+d.updated+
+      ' · الطاقم الآن '+d.total+
+      ' ('+(c['معلم']||0)+' معلمة، '+(c['اداري']||0)+' إدارية، '+
+      (c['موجه طلابي']||0)+' موجهة)','ok');
+    fi.value='';
+    _teachersRec=[];
+    var dd=await api('/web/api/teachers');
+    _teachersRec=(dd&&dd.ok)?(dd.teachers||[]):[];
+    renderTeachersTbl();
+  }catch(e){ss('tm-imp-st','❌ خطأ في الاتصال','er');}
+}
 async function loadTeachersMgmt(){
   var host=document.getElementById('tab-teachers_mgmt');
   var body=document.getElementById('tm-screen');
