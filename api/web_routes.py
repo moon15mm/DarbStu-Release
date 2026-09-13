@@ -1029,6 +1029,13 @@ async def web_get_teachers(request: Request):
             r["subject"] = str(t.get("التخصص") or "").strip()
             r["nid"] = str(t.get("رقم الهوية") or "").strip()
             r["job"] = str(t.get("الوظيفة") or "").strip()
+            # ⚠️ رمز لاتيني للوظيفة — التصنيف والتصفية يعتمدان عليه.
+            # مقارنة الشيفرة بنصّ عربي («اداري») يُعيد التأنيث كتابتَها
+            # في مدارس البنات فلا تُطابق البيانات، فيصير الطاقم كله
+            # «معلمين» وتتعطّل أزرار التصفية. الرمز اللاتيني لا يُمَسّ.
+            _j = r["job"]
+            r["job_code"] = ("staff" if ("اداري" in _j or "إداري" in _j)
+                             else "counselor" if "موجه" in _j else "teacher")
             out.append(r)
         return JSONResponse({"ok": True, "teachers": out})
     except Exception as e:
@@ -3014,7 +3021,7 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
   <div id="tm-screen">
   <div class="section">
     <h3 style="margin:0 0 10px;color:#0C2E56;font-size:15px">📥 استيراد من نور</h3>
-    <div class="ab ai">📌 ارفع ملفات نور واحداً بعد الآخر — المعلمات والإداريات والموجهات.
+    <div class="ab ai">📌 ارفع ملفات نور واحداً بعد الآخر — المعلمين والإداريين والموجهين.
       كل ملف <b>يُضاف ولا يمحو ما قبله</b>، وكلٌّ تذهب لوظيفتها تلقائياً.</div>
     <input type="file" id="tm-file" accept=".xlsx,.xls">
     <button class="btn bp1" style="margin-top:12px" onclick="importStaffFile()">📥 استيراد</button>
@@ -3029,9 +3036,9 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
       <div class="fg"><label class="fl">رقم الهوية (اختياري)</label><input type="text" id="tm-nid" placeholder="10xxxxxxxx"></div>
       <div class="fg"><label class="fl">الوظيفة</label>
         <select id="tm-job">
-          <option value="معلم">معلمة</option>
-          <option value="اداري">إدارية</option>
-          <option value="موجه طلابي">موجهة طلابية</option>
+          <option value="teacher">معلم</option>
+          <option value="staff">إداري</option>
+          <option value="counselor">موجه طلابي</option>
         </select></div>
     </div>
     <input type="hidden" id="tm-orig">
@@ -3046,9 +3053,9 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
     </div>
     <div id="tm-jobs" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
       <button class="btn bsm bp1" data-j="" onclick="tmSetJob('')">الكل</button>
-      <button class="btn bsm bp2" data-j="معلم" onclick="tmSetJob('معلم')">المعلمات</button>
-      <button class="btn bsm bp2" data-j="اداري" onclick="tmSetJob('اداري')">الإداريات</button>
-      <button class="btn bsm bp2" data-j="موجه طلابي" onclick="tmSetJob('موجه طلابي')">الموجهات</button>
+      <button class="btn bsm bp2" data-j="teacher" onclick="tmSetJob('teacher')">المعلمين</button>
+      <button class="btn bsm bp2" data-j="staff" onclick="tmSetJob('staff')">الإداريين</button>
+      <button class="btn bsm bp2" data-j="counselor" onclick="tmSetJob('counselor')">الموجهين</button>
     </div>
     <div class="tw"><table>
       <thead><tr><th>#</th><th>الاسم</th><th>الوظيفة</th><th>الجوال</th><th>التخصص</th><th>إجراءات</th></tr></thead>
@@ -3059,9 +3066,9 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
 
 <div id="tab-admins_mgmt">
   <h2 class="pt"><i class="fas fa-user-tie"></i> إدارة الإداريين</h2>
-  <div class="ab ai">📌 بعض الإداريات يؤدّين أدواراً على النظام (رصد الغياب وغيره) —
-    أنشئي لهنّ حسابات من <b>المستخدمون</b> بعد إضافتهنّ هنا.</div>
-  <!-- شاشة الطاقم تُنقل إلى هنا عند فتح التبويب، مُرشَّحةً على الإداريات -->
+  <div class="ab ai">📌 بعض الإداريين يؤدّون أدواراً على النظام (رصد الغياب وغيره) —
+    أنشئ لهم حسابات من <b>المستخدمون</b> بعد إضافتهم هنا.</div>
+  <!-- شاشة الطاقم تُنقل إلى هنا عند فتح التبويب، مُرشَّحةً على الإداريين -->
 </div>
 
 <div id="tab-add_student">
@@ -5785,15 +5792,21 @@ function renderCounselorList(rows){
     return;
   }
   tbl.innerHTML=rows.map(function(r){
+/* ملاحظة: القيمة مكتوبة بترميز يونيكود لا بالعربية عمداً.
+   وسيط التأنيث يُعيد كتابة نصّ الصفحة والشيفرة المضمّنة فيها، فكانت
+   المقارنة تصير 'تحويل معلمة' بينما تبقى قيمة referral_type في
+   البيانات كما هي — فيفقد التحويل لونَه وزرَّ إجراءاته في مدارس
+   البنات. الترميز لا تراه قواعد التأنيث. */
+var T_REF_TEACHER = '\u062a\u062d\u0648\u064a\u0644 \u0645\u0639\u0644\u0645';
     var bg = 'background:#FFF7ED';
     if(r.referral_type === 'غياب') bg = 'background:#FFF0F0';
-    else if(r.referral_type === 'تحويل معلم') bg = 'background:#EDE7F6';
+    else if(r.referral_type === T_REF_TEACHER) bg = 'background:#EDE7F6';
     var sid=String(r.student_id).replace(/'/g,"\\'");
     var sn=String(r.student_name).replace(/'/g,"\\'");
     var cn=String(r.class_name).replace(/'/g,"\\'");
     
     var buttons = '';
-    if (r.referral_type === 'تحويل معلم') {
+    if (r.referral_type === T_REF_TEACHER) {
       buttons = `<button class="btn bp4 bsm" onclick="openCounselorReferralForm('${r.ref_id}')">📋 إجراءات التحويل</button>`;
     } else {
       buttons = `<button class="btn bp1 bsm" onclick="viewCounselorHistory('${sid}','${sn}')" title="السجل الإرشادي">📄</button> `+
@@ -5813,7 +5826,7 @@ function renderCounselorList(rows){
     if(r.referral_type === 'هروب') typeBadge = ' <span style="background:#7f1d1d;color:#fca5a5;font-size:11px;padding:2px 7px;border-radius:10px;font-weight:bold">🏃 هروب</span>';
     else if(r.referral_type === 'غياب') typeBadge = ' <span style="background:#fef2f2;color:#dc2626;font-size:11px;padding:2px 7px;border-radius:10px;border:1px solid #fca5a5">غياب</span>';
     else if(r.referral_type === 'تأخر') typeBadge = ' <span style="background:#fff7ed;color:#ea580c;font-size:11px;padding:2px 7px;border-radius:10px;border:1px solid #fed7aa">تأخر</span>';
-    else if(r.referral_type === 'تحويل معلم') typeBadge = ' <span style="background:#ede9fe;color:#7c3aed;font-size:11px;padding:2px 7px;border-radius:10px;border:1px solid #c4b5fd">تحويل معلم</span>';
+    else if(r.referral_type === T_REF_TEACHER) typeBadge = ' <span style="background:#ede9fe;color:#7c3aed;font-size:11px;padding:2px 7px;border-radius:10px;border:1px solid #c4b5fd">تحويل معلم</span>';
     else if(r.referral_type) typeBadge = ' <span style="background:#f3f4f6;color:#374151;font-size:11px;padding:2px 7px;border-radius:10px">'+r.referral_type+'</span>';
     return '<tr style="'+bg+'">'+
       '<td>'+r.student_id+'</td>'+
@@ -7130,6 +7143,7 @@ async function analyzeStudent(forcedSid){
   var sel = document.getElementById('an-student');
   if(sel && sel.value === sid){
       var opt = sel.options[sel.selectedIndex];
+      /* fem-ok: الطرفان نصٌّ معروض — يُؤنَّثان معاً فتبقى المقارنة صحيحة */
       if(opt.text === 'تحميل الطالب...' || opt.text === 'طالب محدد...') {
           opt.text = fullName;
       }
@@ -7645,8 +7659,8 @@ async function importStaffFile(){
     ss('tm-imp-st','✅ '+(d.job?('ملف '+d.job+': '):'')+
       'قُرئ '+d.in_file+' — أُضيف '+d.added+' وحُدِّث '+d.updated+
       ' · الطاقم الآن '+d.total+
-      ' ('+(c['معلم']||0)+' معلمة، '+(c['اداري']||0)+' إدارية، '+
-      (c['موجه طلابي']||0)+' موجهة)','ok');
+      ' ('+(c.teacher||0)+' معلم، '+(c.staff||0)+' إداري، '+
+      (c.counselor||0)+' موجه)','ok');
     fi.value='';
     _teachersRec=[];
     var dd=await api('/web/api/teachers');
@@ -7660,7 +7674,7 @@ async function loadTeachersMgmt(){
   if(host&&body&&body.parentNode!==host)host.appendChild(body);
   var d=await api('/web/api/teachers');
   _teachersRec=(d&&d.ok)?(d.teachers||[]):[];
-  tmSetJob('معلم');
+  tmSetJob('teacher');
 }
 /* تبويب «إدارة الإداريين» — الشاشة نفسها بمُرشِّح مختلف. لا تكرار
    للنموذج ولا للجدول: النسختان كانتا ستفترقان عند أول تعديل. */
@@ -7670,19 +7684,21 @@ async function loadAdminsMgmt(){
   if(host&&body&&body.parentNode!==host)host.appendChild(body);
   var d=await api('/web/api/teachers');
   _teachersRec=(d&&d.ok)?(d.teachers||[]):[];
-  tmSetJob('اداري');
+  tmSetJob('staff');
 }
 /* ⚠️ مفاتيح لاتينية فقط. المفتاح العربي يُعيد التأنيث كتابته في
    مدارس البنات فيصير مفتاحاً لا وجود له، وتظهر القائمة بلا أسماء.
    الواجهة ترفق name/phone/subject/job لهذا السبب. */
 function _tName(t){return String((t&&(t.name||t.full_name))||'').trim();}
-/* الوظيفة تأتي موسومةً من ملف نور («نوع المستخدم» في ترويسته).
-   السجلّ القديم بلا وظيفة يُعدّ معلماً — فكل ما استُورد قبل اليوم معلمون. */
+/* ⚠️ الرمز لاتيني عمداً. التصنيف بنصّ عربي داخل الشيفرة يكسره
+   التأنيث في مدارس البنات: 'اداري' تصير 'ادارية' فلا تُطابق البيانات.
+   الواجهة ترسل job_code جاهزاً. والتسميات أدناه عربية بالمذكّر —
+   وهذه يُراد تأنيثها عند العرض، فتبقى كما هي. */
+var _JOB_LABEL = {teacher:'معلم', staff:'إداري', counselor:'موجه طلابي'};
+var _JOB_COLOR = {teacher:'#065f46', staff:'#2563eb', counselor:'#059669'};
 function _tJob(t){
-  var j=String((t&&t.job)||'').trim();
-  if(j.indexOf('اداري')>=0||j.indexOf('إداري')>=0)return 'اداري';
-  if(j.indexOf('موجه')>=0)return 'موجه طلابي';
-  return 'معلم';
+  var c=(t&&t.job_code)||'';
+  return (c==='staff'||c==='counselor')?c:'teacher';
 }
 var _tmJobFilter='';
 function tmSetJob(j){
@@ -7702,25 +7718,24 @@ function renderTeachersTbl(){
     return _tName(t).toLowerCase().indexOf(q)>=0||
            String((t&&t.subject)||'').toLowerCase().indexOf(q)>=0;
   });
-  var JC={'معلم':'#065f46','اداري':'#2563eb','موجه طلابي':'#059669'};
   tb.innerHTML=arr.map(function(t,i){
     var n=_tName(t),p=String((t&&t.phone)||''),s=String((t&&t.subject)||'');
-    var j=_tJob(t);
+    var j=_tJob(t), jl=_JOB_LABEL[j]||j;
     var esc=n.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
     return '<tr><td>'+(i+1)+'</td><td>'+n+'</td>'+
-      '<td><span class="badge" style="background:'+JC[j]+'22;color:'+JC[j]+'">'+j+'</span></td>'+
+      '<td><span class="badge" style="background:'+_JOB_COLOR[j]+'22;color:'+_JOB_COLOR[j]+'">'+jl+'</span></td>'+
       '<td>'+(p||'—')+'</td><td>'+(s||'—')+'</td>'+
       '<td><button class="btn bp2 bsm" onclick="editTeacherRec(\''+esc+'\')">✏️ تعديل</button> '+
       '<button class="btn bp2 bsm" style="background:#FEE2E2;color:#B91C1C" onclick="delTeacherRec(\''+esc+'\')">🗑️</button></td></tr>';
   }).join('')||'<tr><td colspan="6" style="color:#9CA3AF">لا يوجد أحد بهذه الوظيفة — استورد ملف نور أو أضف يدوياً أعلاه</td></tr>';
   var sm=document.getElementById('tm-sum');
   if(sm){
-    var c={'معلم':0,'اداري':0,'موجه طلابي':0};
+    var c={teacher:0,staff:0,counselor:0};
     _teachersRec.forEach(function(t){c[_tJob(t)]++;});
     sm.innerHTML='<span class="badge bb">'+arr.length+' معروضاً</span> '+
-      '<span class="badge" style="background:#065f4622;color:#065f46">'+c['معلم']+' معلمة</span> '+
-      '<span class="badge" style="background:#2563eb22;color:#2563eb">'+c['اداري']+' إدارية</span> '+
-      '<span class="badge" style="background:#05966922;color:#059669">'+c['موجه طلابي']+' موجهة</span>';
+      '<span class="badge" style="background:#065f4622;color:#065f46">'+c.teacher+' معلم</span> '+
+      '<span class="badge" style="background:#2563eb22;color:#2563eb">'+c.staff+' إداري</span> '+
+      '<span class="badge" style="background:#05966922;color:#059669">'+c.counselor+' موجه</span>';
   }
 }
 function editTeacherRec(name){
@@ -7740,7 +7755,7 @@ function resetTeacherForm(){
     var e=document.getElementById(id);if(e)e.value='';});
   var jb=document.getElementById('tm-job');
   // الوظيفة تعود إلى المُرشَّح المعروض — من يفتح «الإداريات» يضيف إدارية
-  if(jb)jb.value=_tmJobFilter||'معلم';
+  if(jb)jb.value=_tmJobFilter||'teacher';
   ss('tm-st','','ai');
 }
 async function saveTeacherRec(){

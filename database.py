@@ -3289,10 +3289,15 @@ def save_teacher_record(name, phone="", subject="", national_id="",
     hit["التخصص"] = str(subject or "").strip()
     if str(national_id or "").strip():
         hit["رقم الهوية"] = str(national_id).strip()
-    # الوظيفة تفرز الطاقم بين تبويبات المعلمات والإداريات والموجهات.
+    # الوظيفة تفرز الطاقم بين تبويبات المعلمين والإداريين والموجهين.
     # الفراغ لا يمحو ما وسمه ملف نور — سجلّ قديم بلا وظيفة يُعدّ معلماً.
-    if str(job or "").strip():
-        hit["الوظيفة"] = str(job).strip()
+    # تقبل الرمز اللاتيني من الويب (لأن نصّه العربي يُؤنَّث في الشيفرة
+    # فيصل محرَّفاً) وتقبل النصّ العربي كما يأتي من سطح المكتب ونور.
+    _j = str(job or "").strip()
+    _j = {"teacher": "معلم", "staff": "اداري",
+          "counselor": "موجه طلابي", "health": "موجه صحي"}.get(_j, _j)
+    if _j:
+        hit["الوظيفة"] = _j
     hit["full_name"] = name
     hit["phone"] = str(phone or "").strip()
 

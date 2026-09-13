@@ -219,9 +219,12 @@ function setFilter(f){
     b.className = b.dataset.f==f?'on':''; });
   render();
 }
+/* 'معلم' بترميز يونيكود: التأنيث يحوّلها في الشيفرة إلى 'معلمة'
+   بينما تبقى قيمة المصدر في البيانات كما هي، فتفقد شارة المصدر لونها. */
+var S_TEACHER = '\u0645\u0639\u0644\u0645';
 function srcClass(s){
-  if(s.indexOf('بصمة')>=0 && s.indexOf('معلم')>=0) return 'dev';
-  if(s=='بصمة') return 'dev'; if(s=='معلم') return 'tea';
+  if(s.indexOf('بصمة')>=0 && s.indexOf(S_TEACHER)>=0) return 'dev';
+  if(s=='بصمة') return 'dev'; if(s==S_TEACHER) return 'tea';
   if(s=='يدوي') return 'man'; if(s=='لم يبصم') return 'no'; return 'def';
 }
 function pillClass(st){
