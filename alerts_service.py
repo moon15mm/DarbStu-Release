@@ -176,6 +176,88 @@ def query_messages_report(date_from: str = None, date_to: str = None,
             "rows": rows[:limit], "truncated": len(rows) > limit,
             "date_from": date_from, "date_to": date_to}
 
+def _msg_ok(r) -> bool:
+    """هل نجحت هذه الرسالة؟ (نسخة على مستوى الوحدة — `_ok` مُعشَّشة)"""
+    return str(r.get("status") or "").strip().lower() not in (
+        "failed", "fail", "error", "")
+
+
+# ── أرقام تحتاج تصحيحاً في نور ──────────────────────────────────────
+# تقرير الرسائل يعرض كل محاولة على حدة، فرقمٌ معطوب يتكرّر فيه كل يوم
+# ويختلط بمئات الناجحة — فتُطارده المدرسة ولا تُصلحه. هنا يُجمَع كل رقم
+# مرّة واحدة مع سبب عطبه، فتُصحَّح القائمة في نور دفعةً واحدة.
+_BAD_KINDS = (
+    # (تحقّق من نصّ السبب، رمز لاتيني، ما العمل)
+    (lambda d: "غير مسجّل" in d or "غير مسجل" in d or "404" in d,
+     "no_whatsapp", "الرقم لا يوجد عليه حساب واتساب"),
+    (lambda d: "لا يوجد رقم" in d,
+     "missing", "خانة الجوال فارغة في ملف الطلاب"),
+    (lambda d: "تنسيق رقم الجوال" in d or "غير صالح" in d,
+     "bad_format", "الرقم مشوّه أو ناقص خانات"),
+)
+
+
+def query_bad_numbers(days: int = 30) -> Dict[str, Any]:
+    """
+    أرقام أولياء الأمور التي تفشل الرسائل إليها — مجمَّعة بلا تكرار.
+
+    يُستبعد من نجحت له رسالة واحدة في المدة: رقمٌ صُحِّح ووصلت رسالته
+    لا يصحّ أن يبقى في قائمة الإصلاح. وتُستبعد أسباب العطل المؤقّتة
+    (انقطاع الجلسة، توقّف الخادم، بلوغ السقف) — تلك تُعالَج بنفسها ولا
+    علاقة لها برقم وليّ الأمر.
+    """
+    import datetime as _dt
+    since = (_dt.date.today() - _dt.timedelta(days=max(1, days))).isoformat()
+
+    client = get_cloud_client()
+    if client.is_active():
+        res = client.get("/web/api/messages-report/bad-numbers",
+                         params={"days": days})
+        return res if res.get("ok") else {"ok": False, "rows": []}
+
+    con = get_db(); con.row_factory = sqlite3.Row; cur = con.cursor()
+    try:
+        cur.execute("SELECT * FROM messages_log WHERE date >= ?", (since,))
+        rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        con.close()
+
+    ok_ids = {str(r.get("student_id")) for r in rows if _msg_ok(r)}
+    bad = {}
+    for r in rows:
+        if _msg_ok(r):
+            continue
+        sid = str(r.get("student_id") or "")
+        if not sid or sid in ok_ids:
+            continue
+        detail = str(r.get("detail") or "")
+        kind = reason = None
+        for test, k, why in _BAD_KINDS:
+            if test(detail):
+                kind, reason = k, why
+                break
+        if not kind:                      # عطلٌ مؤقّت — ليس خطأً في الرقم
+            continue
+        e = bad.setdefault(sid, {
+            "student_id": sid, "student_name": r.get("student_name") or "",
+            "class_name": r.get("class_name") or "", "phone": r.get("phone") or "",
+            "kind": kind, "reason": reason, "fails": 0, "last_date": ""})
+        e["fails"] += 1
+        if str(r.get("date") or "") > e["last_date"]:
+            e["last_date"] = str(r.get("date") or "")
+            e["kind"], e["reason"] = kind, reason   # أحدث سبب هو المعتبَر
+        if not e["phone"]:
+            e["phone"] = r.get("phone") or ""
+
+    out = sorted(bad.values(),
+                 key=lambda x: (x["class_name"], x["student_name"]))
+    counts = {}
+    for r in out:
+        counts[r["kind"]] = counts.get(r["kind"], 0) + 1
+    return {"ok": True, "rows": out, "total": len(out),
+            "counts": counts, "days": days, "since": since}
+
+
 def query_today_messages(date_str: str = None) -> List[Dict[str, Any]]:
     if not date_str:
         date_str = now_riyadh_date()

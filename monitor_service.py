@@ -13,6 +13,8 @@ import datetime
 import os
 import sqlite3
 
+from constants import BIOMETRIC_TEACHER_ID
+
 
 def _safe(fn, default=None):
     try:
@@ -93,8 +95,13 @@ def _live_block(date_str):
     total = len(classes)
     con = sqlite3.connect(DB_PATH)
     try:
-        rows = con.execute("SELECT DISTINCT class_id, period FROM absences "
-                           "WHERE date=?", (date_str,)).fetchall()
+        # يُستبعد غياب «اعتماد البصمة»: البطاقة تجيب عن سؤال «هل سجّل
+        # المعلم غياب هذه الحصة؟»، واعتمادُ الإدارة من البصمة كان يملؤها
+        # فتظهر الحصة الأولى ١٥/١٥ وما سجّلها أحد — فيضيع معناها كلّه.
+        rows = con.execute(
+            "SELECT DISTINCT class_id, period FROM absences "
+            "WHERE date=? AND COALESCE(teacher_id,'') <> ?",
+            (date_str, BIOMETRIC_TEACHER_ID)).fetchall()
     finally:
         con.close()
     done = {}

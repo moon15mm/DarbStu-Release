@@ -40,7 +40,8 @@ SRC_COMMITTED = "بصمة (معتمَد)"
 # وسمٌ في `absences.teacher_id` لسجلّات كتبها «اعتماد غياب من لم يبصم».
 # وجوده يتيح شيئين: تمييزها في العرض عن غياب سجّله معلم، وسحبها وحدها
 # عند التراجع بلا أن تُمسّ سجلّات المعلمين إطلاقاً.
-BIO_TEACHER_ID = "BIOMETRIC"
+# مصدره `constants` — تقرؤه وحداتٌ أخرى، وتعريفه هنا كان يُنشئ دورة.
+from constants import BIOMETRIC_TEACHER_ID as BIO_TEACHER_ID
 BIO_TEACHER_NAME = "اعتماد الإدارة من البصمة"
 
 

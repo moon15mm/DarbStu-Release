@@ -1835,6 +1835,18 @@ async def api_messages_report(request: Request, date_from: str = None,
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 
 
+@router.get("/web/api/messages-report/bad-numbers", response_class=JSONResponse)
+async def api_bad_numbers(request: Request, days: int = 30):
+    """أرقام أولياء الأمور التي تفشل الرسائل إليها — مجمَّعة بلا تكرار."""
+    user = _get_current_user(request)
+    if not user: return JSONResponse({"ok": False}, status_code=401)
+    try:
+        from alerts_service import query_bad_numbers
+        return JSONResponse(query_bad_numbers(max(1, min(365, int(days or 30)))))
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
 @router.get("/web/api/messages-log", response_class=JSONResponse)
 async def api_get_msg_log(request: Request, date: str):
     user = _get_current_user(request)
@@ -3002,6 +3014,9 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
       <div class="fg"><label class="fl">الفصل</label><select id="mr-cls"><option value="">الكل</option></select></div>
       <button class="btn bp1" onclick="loadMsgReport()">🔍 عرض</button>
       <button class="btn bp2" onclick="printMsgReport()">🖨️ طباعة</button>
+      <!-- الرقم المعطوب يتكرّر في التقرير كل يوم ويختلط بمئات الناجحة،
+           فتُطارده المدرسة ولا تُصلحه. هنا يُجمَع مرّةً ليُصحَّح في نور. -->
+      <button class="btn bp2" onclick="loadBadNumbers()">🔧 أرقام تحتاج تصحيح</button>
     </div>
     <div style="margin-top:8px;font-size:12px;color:#6B7280">
       اختصارات: <a href="#" onclick="mrQuick(0);return false">اليوم</a> ·
@@ -7689,6 +7704,52 @@ async function loadMsgReport(){
   if(d.truncated)h+='<div style="margin-top:8px;color:#6B7280;font-size:12px">'+
     'عُرضت أول ١٠٠٠ رسالة فقط — ضيّق المدة لعرض الباقي.</div>';
   h+='</div>';
+  document.getElementById('mr-out').innerHTML=h;
+}
+/* ── أرقام تحتاج تصحيحاً في نور ── */
+/* المفاتيح لاتينية — تصل من JSON ولا يُؤنَّث، والتسميات عربية هنا
+   ليُؤنّثها الوسيط في مدارس البنات (نفس قاعدة _WA_SRC). */
+var _BADKIND={no_whatsapp:'لا واتساب على الرقم', missing:'لا يوجد رقم',
+              bad_format:'رقم غير صالح'};
+var _BADCOLOR={no_whatsapp:'#B45309', missing:'#B91C1C', bad_format:'#6D28D9'};
+function bnEsc(s){
+  return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+async function loadBadNumbers(){
+  ss('mr-st','⏳ جارٍ الفحص...','ai');
+  var d=await api('/web/api/messages-report/bad-numbers?days=30');
+  if(!d||!d.ok){ss('mr-st','❌ '+((d&&d.msg)||'تعذّر الفحص'),'er');return;}
+  ss('mr-st','','ai');
+  var h='<div class="section"><h3 style="margin:0 0 4px;color:#0C2E56">🔧 أرقام تحتاج تصحيحاً في نور</h3>'+
+        '<div style="color:#6B7280;font-size:12.5px;margin-bottom:12px">'+
+        'كل رقم مرّة واحدة خلال آخر ٣٠ يوماً. استُبعد من وصلته رسالة واحدة على الأقل.</div>';
+  if(!d.rows.length){
+    h+='<div style="padding:16px;background:#ECFDF5;border-radius:8px;color:#065F46">'+
+       '✅ لا يوجد رقم معطوب — كل أرقام أولياء الأمور تعمل.</div></div>';
+    document.getElementById('mr-out').innerHTML=h;return;
+  }
+  var c=d.counts||{};
+  h+='<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px">';
+  Object.keys(_BADKIND).forEach(function(k){
+    if(!c[k])return;
+    h+='<div style="padding:8px 14px;border-radius:8px;background:#F8FAFC;'+
+       'border-right:3px solid '+_BADCOLOR[k]+'"><b style="font-size:17px">'+c[k]+
+       '</b> <span style="font-size:12px;color:#6B7280">'+_BADKIND[k]+'</span></div>';
+  });
+  h+='</div><div class="tw"><table><thead><tr>'+
+     '<th>#</th><th>الطالب</th><th>الفصل</th><th>الجوال</th>'+
+     '<th>المشكلة</th><th>مرات الفشل</th><th>آخر محاولة</th></tr></thead><tbody>';
+  d.rows.forEach(function(r,i){
+    h+='<tr><td>'+(i+1)+'</td><td>'+bnEsc(r.student_name)+'</td>'+
+       '<td>'+bnEsc(r.class_name)+'</td>'+
+       '<td style="direction:ltr;text-align:right">'+(r.phone||'—')+'</td>'+
+       '<td style="color:'+(_BADCOLOR[r.kind]||'#6B7280')+';font-weight:700">'+
+         bnEsc(_BADKIND[r.kind]||r.kind)+'</td>'+
+       '<td>'+r.fails+'</td><td style="font-size:12px">'+(r.last_date||'')+'</td></tr>';
+  });
+  h+='</tbody></table></div>'+
+     '<div style="margin-top:10px;font-size:12.5px;color:#6B7280">'+
+     'صحّح هذه الأرقام في نور ثم أعد استيراد ملف الطلاب — أو عدّلها من «إدارة الطلاب».</div></div>';
   document.getElementById('mr-out').innerHTML=h;
 }
 function printMsgReport(){

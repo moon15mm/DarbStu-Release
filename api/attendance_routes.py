@@ -131,10 +131,14 @@ async def attendance_commit(request: Request):
                     (s["class_id"], s["class_name"]), []
                 ).append({"id": s["id"], "name": s["name"]})
 
+        from constants import BIOMETRIC_PERIOD
         created = skipped = 0
         for (cid, cname), studs in by_class.items():
+            # الحصة صفر عمداً — بصمةُ بوابة لا حصة دراسية. كانت ١ فظهرت
+            # «تغطية الحصص» ١٥/١٥ للحصة الأولى وما سجّلها معلمٌ واحد.
             r = insert_absences(date, cid, cname, studs,
-                                BIO_TEACHER_ID, BIO_TEACHER_NAME, 1)
+                                BIO_TEACHER_ID, BIO_TEACHER_NAME,
+                                BIOMETRIC_PERIOD)
             created += int(r.get("created", 0))
             skipped += int(r.get("skipped", 0))
         return JSONResponse({"ok": True, "date": date,

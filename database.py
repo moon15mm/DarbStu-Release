@@ -173,6 +173,13 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_absences_date_period_class ON absences(date, period, class_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_absences_student_name ON absences(student_name)")
 
+    # ترحيلٌ لمرّة واحدة: «اعتماد غياب من لم يبصم» في 3.6.46 كتب الحصة ١،
+    # فظهرت «تغطية الحصص اليوم» ١٥/١٥ للحصة الأولى وما سجّلها معلمٌ واحد،
+    # وانحاز إحصاءُ أكثر الحصص غياباً إليها. صارت الحصة صفراً — بصمةُ
+    # بوابة لا حصة دراسية. الشرط على teacher_id فلا يمسّ سجلّ معلمٍ أبداً.
+    cur.execute("UPDATE absences SET period=? WHERE teacher_id=? AND period=1",
+                (constants.BIOMETRIC_PERIOD, constants.BIOMETRIC_TEACHER_ID))
+
     # ─── جدول سجل الرسائل ───────────────────────────────────
     cur.execute("""CREATE TABLE IF NOT EXISTS message_log (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1396,9 +1403,13 @@ def get_partial_absences(date_str: str, min_period: int = 2) -> List[Dict]:
               )
         ),
         classes_checked_early AS (
+            -- ‏«المعلم أخذ الحضور فعلاً» — واعتمادُ الإدارة من البصمة ليس
+            -- أخذَ حضور، فاحتسابُه يفتح الباب لغيابٍ جزئيّ كاذب في فصولٍ
+            -- لم يسجّل فيها معلمٌ شيئاً.
             SELECT DISTINCT class_id
             FROM absences
             WHERE date = ? AND period IS NOT NULL AND period <= ?
+              AND COALESCE(teacher_id,'') <> 'BIOMETRIC'
         )
         SELECT
             la.student_id,

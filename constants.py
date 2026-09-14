@@ -116,7 +116,18 @@ MY_STATIC_DOMAIN  = _saved_domain
 ngrok = None
 
 APP_TITLE           = 'تسجيل غياب الطلاب'
-APP_VERSION         = '3.6.46'
+APP_VERSION         = '3.6.47'
+
+# وسمٌ في `absences.teacher_id` لغيابٍ كتبه «اعتماد غياب من لم يبصم»
+# في صفحة الحضور الموحّد. يُقرأ من ثلاث وحدات (attendance_blend و
+# monitor_service و database) فمكانه هنا: تعريفه في إحداها يُنشئ دورة
+# استيراد، وتكراره حرفياً يجعل تغييره يُصلح موضعاً ويترك موضعين.
+#
+# ولغيابٍ كهذا `period = 0` عمداً — ليست حصةً دراسية بل بصمة بوابة.
+# صفرٌ يُسقطه حلقةُ التغطية (range(1,8)) وإحصاءَ أكثر الحصص غياباً
+# (تتخطّى القيم الكاذبة)، فلا يُحسب تسجيلاً لحصةٍ لم تُسجَّل.
+BIOMETRIC_TEACHER_ID = 'BIOMETRIC'
+BIOMETRIC_PERIOD     = 0
 UPDATE_URL          = 'https://raw.githubusercontent.com/moon15mm/DarbStu-Release/main/version.json'
 UPDATE_DOWNLOAD_URL = 'https://github.com/moon15mm/DarbStu-Release/archive/refs/heads/main.zip'
 
