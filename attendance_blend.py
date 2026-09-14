@@ -35,6 +35,13 @@ SRC_TEACHER = "معلم"
 SRC_MANUAL = "يدوي"
 SRC_DEFAULT = "افتراضي"
 SRC_NOPUNCH = "لم يبصم"
+SRC_COMMITTED = "بصمة (معتمَد)"
+
+# وسمٌ في `absences.teacher_id` لسجلّات كتبها «اعتماد غياب من لم يبصم».
+# وجوده يتيح شيئين: تمييزها في العرض عن غياب سجّله معلم، وسحبها وحدها
+# عند التراجع بلا أن تُمسّ سجلّات المعلمين إطلاقاً.
+BIO_TEACHER_ID = "BIOMETRIC"
+BIO_TEACHER_NAME = "اعتماد الإدارة من البصمة"
 
 
 def _riyadh_today():
@@ -122,8 +129,12 @@ def reconcile_daily_attendance(date_str=None, role=None):
     grace = int(cfg.get("biometric_grace_min", 0) or 0)
 
     exempt = {str(e["student_id"]) for e in get_exempted_students()}
-    absent_ids = {str(r["student_id"])
-                  for r in query_absences(date_filter=date_str)}
+    _abs_rows = query_absences(date_filter=date_str)
+    absent_ids = {str(r["student_id"]) for r in _abs_rows}
+    # غيابٌ اعتمدته الإدارة من البصمة — يبقى موسوماً بمصدره بعد الحفظ،
+    # وإلا ظهر «معلم» فأوهم أن معلماً سجّله.
+    committed_ids = {str(r["student_id"]) for r in _abs_rows
+                     if str(r.get("teacher_id") or "") == BIO_TEACHER_ID}
     tardy_ids = {str(r["student_id"])
                  for r in query_tardiness(date_filter=date_str)}
     arrivals = _punch_arrivals(date_str)
@@ -142,7 +153,8 @@ def reconcile_daily_attendance(date_str=None, role=None):
 
     students, alerts = [], []
     tot = {"present": 0, "late": 0, "absent": 0, "escape": 0, "total": 0,
-           "nopunch": 0}   # nopunch: غائبون سببهم عدم البصم (الوضع الأساسي)
+           "nopunch": 0,      # nopunch: غائبون سببهم عدم البصم (الأساسي)
+           "committed": 0}    # committed: غيابٌ من البصمة اعتمدته الإدارة
 
     for c in load_students().get("list", []):
         cid, cname = c.get("id"), c.get("name", "")
@@ -165,7 +177,9 @@ def reconcile_daily_attendance(date_str=None, role=None):
                 status = LATE if minutes > 0 else PRESENT
                 source = SRC_DEVICE
             elif teacher_absent:
-                status, source = ABSENT, SRC_TEACHER
+                status = ABSENT
+                source = (SRC_COMMITTED if sid in committed_ids
+                          else SRC_TEACHER)
             elif sid in tardy_ids:
                 status, source = LATE, SRC_TEACHER
             else:
@@ -187,6 +201,8 @@ def reconcile_daily_attendance(date_str=None, role=None):
                 tot["absent"] += 1
                 if source == SRC_NOPUNCH:
                     tot["nopunch"] += 1
+                elif source == SRC_COMMITTED:
+                    tot["committed"] += 1
             elif status == ESCAPE:
                 tot["escape"] += 1
 

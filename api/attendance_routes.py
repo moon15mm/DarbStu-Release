@@ -100,6 +100,82 @@ async def attendance_set_role(request: Request):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
+@router.post("/web/api/attendance/commit", response_class=JSONResponse)
+async def attendance_commit(request: Request):
+    """
+    يعتمد غياب «من لم يبصم» فيكتبه غياباً حقيقياً لذلك اليوم.
+
+    الخلطة طبقةُ قراءة لا تكتب شيئاً، فالعرض الأساسي كان يُظهر الغياب ثم
+    يذهب بمغادرة الصفحة — لا لوحةَ تراه ولا تقريرَ ولا رسالةَ وليّ أمر.
+    هذا الزرّ هو الجسر: قرارٌ صريح من الإدارة يحوّل العرض إلى سجلّ.
+
+    يكتب من لم يبصم **فقط**؛ ومن سجّله معلمٌ غائباً له سجلّه أصلاً.
+    والفهرس `uniq_absence(date,class_id,student_id)` مع INSERT OR IGNORE
+    يجعل التكرار بلا أثر، فالضغط مرّتين لا يُنشئ سطراً زائداً.
+    """
+    if not _auth(request):
+        return _unauth()
+    try:
+        from attendance_blend import (reconcile_daily_attendance, ABSENT,
+                                      SRC_NOPUNCH, BIO_TEACHER_ID,
+                                      BIO_TEACHER_NAME)
+        from database import insert_absences
+        d = await request.json()
+        date = (d.get("date") or "").strip() or now_riyadh_date()
+
+        res = reconcile_daily_attendance(date, role="primary")
+        by_class = {}
+        for s in res["students"]:
+            if s["status"] == ABSENT and s["source"] == SRC_NOPUNCH:
+                by_class.setdefault(
+                    (s["class_id"], s["class_name"]), []
+                ).append({"id": s["id"], "name": s["name"]})
+
+        created = skipped = 0
+        for (cid, cname), studs in by_class.items():
+            r = insert_absences(date, cid, cname, studs,
+                                BIO_TEACHER_ID, BIO_TEACHER_NAME, 1)
+            created += int(r.get("created", 0))
+            skipped += int(r.get("skipped", 0))
+        return JSONResponse({"ok": True, "date": date,
+                             "created": created, "skipped": skipped})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@router.post("/web/api/attendance/uncommit", response_class=JSONResponse)
+async def attendance_uncommit(request: Request):
+    """
+    يتراجع عن الاعتماد — يحذف ما كتبه هذا الزرّ **وحده** في ذلك اليوم.
+
+    الشرط على `teacher_id` لا على التاريخ فقط: اعتمادُ ١٤٤ طالباً بالخطأ
+    يجب أن يُلغى بنقرة، وسجلّات المعلمين في اليوم نفسه يجب ألا تُمسّ.
+    """
+    if not _auth(request):
+        return _unauth()
+    try:
+        from attendance_blend import BIO_TEACHER_ID
+        from database import get_db
+        d = await request.json()
+        date = (d.get("date") or "").strip() or now_riyadh_date()
+        con = get_db()
+        try:
+            cur = con.cursor()
+            cur.execute("DELETE FROM absences WHERE date=? AND teacher_id=?",
+                        (date, BIO_TEACHER_ID))
+            removed = cur.rowcount
+            con.commit()
+        finally:
+            con.close()
+        return JSONResponse({"ok": True, "date": date, "removed": removed})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
 _PAGE = r"""<!doctype html>
 <html lang="ar" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -143,6 +219,7 @@ _PAGE = r"""<!doctype html>
   .src{display:inline-block;padding:2px 8px;border-radius:6px;font-size:10px;font-weight:700;color:#fff}
   .src.dev{background:var(--blue)}.src.tea{background:var(--navy)}
   .src.man{background:#64748b}.src.def{background:#94a3b8}.src.no{background:#e0736b}
+  .src.cmt{background:#9A3412}
   table{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:6px}
   th{background:var(--navy);color:#fff;padding:7px 6px;font-weight:700}
   td{padding:6px;border-top:1px solid #EDF2F8;text-align:center}
@@ -178,6 +255,10 @@ _PAGE = r"""<!doctype html>
     </div>
   </div>
   <div class="rolehint" id="rolehint"></div>
+  <!-- الجسر بين العرض والسجلّ: بدونه كان الغياب الأساسي يذهب بمغادرة
+       الصفحة، فلا لوحةَ تراه ولا تقريرَ ولا رسالةَ وليّ أمر. -->
+  <div id="commitbar" style="display:none;margin-top:10px;padding:10px 12px;
+       border:1px solid var(--line);border-radius:10px;background:#fff"></div>
 </div>
 
 <div class="card">
@@ -194,6 +275,7 @@ _PAGE = r"""<!doctype html>
     <span><span class="src man">يدوي</span> إدخال الإدارة</span>
     <span><span class="src def">افتراضي</span> لا سجل (يُفترض حاضراً)</span>
     <span><span class="src no">لم يبصم</span> غياب سببه عدم البصم</span>
+    <span><span class="src cmt">بصمة (معتمَد)</span> غياب اعتمدته الإدارة</span>
   </div>
 </div>
 
@@ -259,6 +341,53 @@ function setRole(r){
    })
    .catch(function(){ load(); });
 }
+/* ── اعتماد الغياب: من العرض إلى السجلّ ───────────────────────────── */
+function fmtCommit(){
+  var bar=document.getElementById('commitbar');
+  if(!DATA){ bar.style.display='none'; return; }
+  var np=DATA.totals.nopunch||0, cm=DATA.totals.committed||0;
+  if(ROLE!='primary' && !cm){ bar.style.display='none'; return; }
+  bar.style.display='block';
+  var h='';
+  if(np>0 && ROLE=='primary'){
+    h+='<div style="margin-bottom:8px">'+np+' طالباً لم يبصموا ولا سجل لهم — '+
+       '<b>اعتمادهم يحفظهم غياباً حقيقياً</b> يظهر في اللوحة والتقارير ورسائل أولياء الأمور.</div>'+
+       '<button class="btn" style="background:var(--err);color:#fff;border:none;'+
+       'padding:9px 16px;border-radius:9px;font-family:inherit;font-weight:700;cursor:pointer" '+
+       'onclick="commitAbs()">✔ اعتماد غياب '+np+' طالباً</button> ';
+  }
+  if(cm>0){
+    h+='<div style="margin-top:'+(np>0?'9px':'0')+'">✅ معتمَد اليوم: <b>'+cm+'</b> طالباً من البصمة. '+
+       '<a href="#" onclick="uncommitAbs();return false" style="color:var(--err)">تراجع عن الاعتماد</a></div>';
+  }
+  bar.innerHTML=h;
+}
+function commitAbs(){
+  var np=DATA.totals.nopunch||0;
+  if(!confirm('سيُسجَّل '+np+' طالباً غائبين اليوم.\n\nيظهرون بعدها في لوحة المراقبة والتقارير، '+
+              'وتشملهم رسائل الغياب لأولياء الأمور.\n\nمتابعة؟')) return;
+  fetch('/web/api/attendance/commit',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({date:document.getElementById('date').value})})
+   .then(function(r){return r.json()})
+   .then(function(j){
+     if(!j.ok){ alert('تعذّر الاعتماد: '+(j.error||'')); return; }
+     alert('تم اعتماد '+j.created+' غياباً.'+(j.skipped?' ('+j.skipped+' مسجَّل مسبقاً أو مستثنى)':''));
+     load();
+   })
+   .catch(function(){ alert('تعذّر الاتصال'); });
+}
+function uncommitAbs(){
+  if(!confirm('سيُحذف الغياب الذي اعتمدته من البصمة في هذا اليوم.\n\nسجلّات المعلمين لا تُمَس.\n\nمتابعة؟')) return;
+  fetch('/web/api/attendance/uncommit',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({date:document.getElementById('date').value})})
+   .then(function(r){return r.json()})
+   .then(function(j){
+     if(!j.ok){ alert('تعذّر التراجع: '+(j.error||'')); return; }
+     alert('حُذف '+j.removed+' سجلّ غياب.');
+     load();
+   })
+   .catch(function(){ alert('تعذّر الاتصال'); });
+}
 function setFilter(f){
   FILTER=f;
   document.querySelectorAll('#filters button').forEach(function(b){
@@ -270,6 +399,9 @@ function setFilter(f){
 var S_TEACHER = '\u0645\u0639\u0644\u0645';
 function srcClass(s){
   if(s.indexOf('بصمة')>=0 && s.indexOf(S_TEACHER)>=0) return 'dev';
+  /* «بصمة (معتمَد)» — غيابٌ اعتمدته الإدارة وصار سجلاً. يُفحص قبل
+     المطابقة التامة على «بصمة» لأنه يحملها في نصّه. */
+  if(s.indexOf('معتمَد')>=0) return 'cmt';
   if(s=='بصمة') return 'dev'; if(s==S_TEACHER) return 'tea';
   if(s=='يدوي') return 'man'; if(s=='لم يبصم') return 'no'; return 'def';
 }
@@ -293,7 +425,7 @@ function load(){
       document.getElementById('k-absent').textContent=j.totals.absent;
       document.getElementById('k-escape').textContent=j.totals.escape;
       document.getElementById('k-total').textContent=j.totals.total;
-      fmtRoleBtns(); renderAlerts(); render();
+      fmtRoleBtns(); fmtCommit(); renderAlerts(); render();
     })
     .catch(function(e){document.getElementById('tblwrap').innerHTML='<div class="spin">تعذّر الاتصال</div>';});
 }

@@ -116,7 +116,7 @@ MY_STATIC_DOMAIN  = _saved_domain
 ngrok = None
 
 APP_TITLE           = 'تسجيل غياب الطلاب'
-APP_VERSION         = '3.6.45'
+APP_VERSION         = '3.6.46'
 UPDATE_URL          = 'https://raw.githubusercontent.com/moon15mm/DarbStu-Release/main/version.json'
 UPDATE_DOWNLOAD_URL = 'https://github.com/moon15mm/DarbStu-Release/archive/refs/heads/main.zip'
 
