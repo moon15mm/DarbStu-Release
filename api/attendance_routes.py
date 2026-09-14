@@ -52,9 +52,14 @@ async def attendance_blend(request: Request, date: str = "", role: str = ""):
     try:
         res = reconcile_daily_attendance(date, role=role)
         res["ok"] = True
-        # الدور الفعّال المحفوظ (لإظهار المفتاح بحالته الصحيحة)
-        res["saved_role"] = load_config().get(
-            "biometric_attendance_role", "supplement")
+        # وضع النظام دائماً «مساعد»؛ «الأساسي» عرضٌ مؤقّت لهذه الصفحة
+        res["saved_role"] = "supplement"
+        # هل «الأساسي» متعذّر أصلاً؟ تُعلَم الصفحة قبل الضغط لا بعده،
+        # فيظهر الزرّ معطّلاً بسببه بدل أن يرتدّ صامتاً بعد الضغط.
+        # المعيار بصماتٌ فعلية لا مفتاح السحب التلقائي — انظر
+        # `attendance_blend.biometric_in_use`.
+        from attendance_blend import biometric_in_use
+        res["role_locked"] = not biometric_in_use()
         return JSONResponse(res)
     except Exception as e:
         import traceback
@@ -64,6 +69,14 @@ async def attendance_blend(request: Request, date: str = "", role: str = ""):
 
 @router.post("/web/api/attendance/role", response_class=JSONResponse)
 async def attendance_set_role(request: Request):
+    """
+    **لم تعد تحفظ شيئاً.** وضع النظام «مساعد» دائماً، و«الأساسي» عرضٌ
+    مؤقّت في صفحة الحضور الموحّد وحدها (معامل `role` في طلب blend).
+
+    بقيت النقطة قائمة لأن صفحةً محفوظة في متصفّح المدرسة من نسخةٍ سابقة
+    تستدعيها؛ حذفها كان يعطّل زرّ التبديل عندها بـ404. تُرجع الآن حكمَ
+    القبول وحده: هل توجد بصمات تُجيز العرض الأساسي؟
+    """
     if not _auth(request):
         return _unauth()
     try:
@@ -72,10 +85,17 @@ async def attendance_set_role(request: Request):
         if role not in _VALID_ROLES:
             return JSONResponse({"ok": False, "error": "دور غير صالح"},
                                 status_code=400)
-        cfg = load_config()
-        cfg["biometric_attendance_role"] = role
-        save_config(cfg)
-        return JSONResponse({"ok": True, "role": role})
+        # بلا بصمة واحدة يُعلّم العرضُ الأساسي كل طلاب المدرسة غائبين،
+        # فيُرفض صراحةً بسببٍ مقروء بدل أن يرتدّ الزرّ صامتاً.
+        from attendance_blend import biometric_in_use
+        if role == "primary" and not biometric_in_use():
+            return JSONResponse(
+                {"ok": False, "role": "supplement", "locked": True,
+                 "error": "لا توجد بصمات مسجَّلة — الوضع الأساسي سيُحسب كل "
+                          "طالب غائباً. اسحب بصمات اليوم من صفحة «جهاز "
+                          "البصمة» ثم أعد المحاولة."},
+                status_code=409)
+        return JSONResponse({"ok": True, "role": role, "persisted": False})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
@@ -114,6 +134,7 @@ _PAGE = r"""<!doctype html>
   .roles{display:flex;gap:0;border:1px solid var(--line);border-radius:10px;overflow:hidden}
   .roles button{font-family:inherit;font-size:13px;font-weight:700;border:none;padding:9px 15px;cursor:pointer;background:#fff;color:var(--mu)}
   .roles button.on{background:var(--navy);color:#fff}
+  .roles button.off{opacity:.45;cursor:not-allowed}
   .rolehint{font-size:12px;color:var(--mu);margin-top:7px;line-height:1.7}
   /* شارات */
   .pill{display:inline-block;padding:3px 11px;border-radius:20px;font-size:11px;font-weight:800}
@@ -197,21 +218,46 @@ _PAGE = r"""<!doctype html>
 var DATA=null, ROLE='supplement', FILTER='all';
 var HINTS={
   supplement:'<b>مساعد:</b> من لم يبصم لا يُحسب غائباً — قد يكون نسي البصم أو الجهاز معطّل. الغياب يحتاج سجل معلم أو إدخالاً يدوياً. البصمة تؤكّد الحضور ووقت الوصول فقط.',
-  primary:'<b>أساسي:</b> البصمة إلزامية — كل من لم يبصم ولم يُعذَر يُحسب غائباً. يتطلّب أن يبصم الجميع فعلاً كل يوم، وإلا ظهر حاضرون كغائبين.'
+  primary:'<b>أساسي:</b> البصمة إلزامية — كل من لم يبصم ولم يُعذَر يُحسب غائباً. <b>عرضٌ مؤقّت لهذه الصفحة فقط</b>: لا يُغيّر أرقام لوحة المراقبة ولا التقارير، ويعود إلى «مساعد» عند إعادة فتح الصفحة.'
 };
+var LOCKED=false, LOCKMSG='';
 function fmtRoleBtns(){
   document.getElementById('r-sup').className = ROLE=='supplement'?'on':'';
-  document.getElementById('r-pri').className = ROLE=='primary'?'on':'';
+  var pri=document.getElementById('r-pri');
+  pri.className = (ROLE=='primary'?'on':'') + (LOCKED?' off':'');
+  pri.title = LOCKED ? 'لا توجد بصمات مسجَّلة' : 'عرض مؤقّت — لا يُغيّر أرقام النظام';
   var h=HINTS[ROLE];
   if(ROLE=='primary' && DATA && DATA.totals.nopunch)
     h+=' <b style="color:#C0392B">('+DATA.totals.nopunch+' منهم غيابهم لأنهم لم يبصموا)</b>';
+  /* كان الزرّ يرتدّ إلى «مساعد» بلا كلمة واحدة تشرح السبب: الحارس في
+     reconcile يفرض المساعد بلا جهاز مُفعّل، فيبدو الأمر عطلاً في الزرّ.
+     السبب يُعرض هنا مع طريق الحل. */
+  if(LOCKED) h+='<div style="margin-top:7px;color:#B8620B">⚠ ' + LOCKMSG +
+    ' <a href="/web/biometric">افتح صفحة جهاز البصمة ←</a></div>';
   document.getElementById('rolehint').innerHTML=h;
 }
+/* التبديل **عرضٌ لهذه الصفحة فقط** ولا يُحفَظ في الإعدادات. الدور
+   المحفوظ كان يغذّي blend_metrics ومن ورائه لوحة المراقبة والتقارير
+   والإشعارات، فنقرةٌ واحدة تقلب أرقام النظام كلّه ولا أثر لها يُرى —
+   ولو نُسيت بقيت. وضع النظام «مساعد» دائماً، والأساسي يُطلب ويُرى هنا. */
 function setRole(r){
+  if(r=='primary' && LOCKED){ fmtRoleBtns(); return; }
+  var prev=ROLE;
   ROLE=r; fmtRoleBtns();
+  if(r=='supplement'){ load(); return; }
+  /* نسأل الخادم أولاً: هل توجد بصمات تُجيز العرض الأساسي؟ */
   fetch('/web/api/attendance/role',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({role:r})});
-  load();
+    body:JSON.stringify({role:r})})
+   .then(function(x){return x.json()})
+   .then(function(j){
+     if(j && j.ok===false){          /* رُفض — أعِد الزرّ واشرح */
+       ROLE = j.role || prev;
+       if(j.locked){ LOCKED=true; LOCKMSG=j.error||''; }
+       fmtRoleBtns();
+     }
+     load();
+   })
+   .catch(function(){ load(); });
 }
 function setFilter(f){
   FILTER=f;
@@ -238,6 +284,10 @@ function load(){
     .then(function(j){
       if(!j.ok){document.getElementById('tblwrap').innerHTML='<div class="spin">خطأ: '+(j.error||'')+'</div>';return;}
       DATA=j; ROLE=j.role;
+      if(j.role_locked){
+        LOCKED=true;
+        LOCKMSG='لا توجد بصمات مسجَّلة — بدونها يُحسب كل طالب غائباً في الوضع الأساسي.';
+      } else { LOCKED=false; LOCKMSG=''; }
       document.getElementById('k-present').textContent=j.totals.present;
       document.getElementById('k-late').textContent=j.totals.late;
       document.getElementById('k-absent').textContent=j.totals.absent;

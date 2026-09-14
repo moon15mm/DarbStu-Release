@@ -11,10 +11,13 @@ attendance_blend.py — الخلطة الذكية: حالة حضور موحّد�
 هذا المحرّك يقرأ كل المصادر وينتج حالةً واحدة لكل طالب، مع وسم مصدرها.
 لا يكتب شيئاً — قراءة وتصالح فقط، فلا يُفسد التسجيل القائم.
 
-دور البصمة قابل للاختيار (biometric_attendance_role):
+دور البصمة:
   • "supplement" (مساعد): من لم يبصم لا يُحسب غائباً — الغياب يحتاج معلماً
-    أو إدخالاً. البصمة تؤكّد الحضور ووقت الوصول فقط.
+    أو إدخالاً. البصمة تؤكّد الحضور ووقت الوصول فقط. **وهذا وضع النظام
+    دائماً**: هو ما تراه لوحة المراقبة والتقارير والإشعارات بلا استثناء.
   • "primary" (أساسي): البصمة إلزامية — من لم يبصم ولم يُعذَر = غائب.
+    **عرضٌ مؤقّت** لا يُطلب إلا صراحةً بمعامل `role` من صفحة الحضور
+    الموحّد، ولا يُحفَظ في الإعدادات ولا يُغيّر أرقام بقية النظام.
 
 قاعدة التعارض (بصم + معلم غائب): «هروب/جزئي» + تنبيه.
 """
@@ -66,6 +69,32 @@ def _punch_arrivals(date_str):
     return out
 
 
+def biometric_in_use(days=14):
+    """
+    هل للمدرسة جهاز بصمة يعمل فعلاً؟
+
+    لا يكفي `biometric_enabled` — ذلك **مفتاح السحب التلقائي**، ومدرسةٌ
+    تسحب بصماتها يدوياً تتركه مطفأً وبصماتها تصل. فنقبل الدليل الأقوى:
+    بصماتٌ مطابَقة فعلاً خلال المدة الأخيرة.
+    """
+    from config_manager import load_config
+    if load_config().get("biometric_enabled"):
+        return True
+    try:
+        import datetime as _dt
+        from database import query_biometric_punches
+        cut = (_dt.date.today() - _dt.timedelta(days=days)).isoformat()
+        for r in query_biometric_punches(limit=500) or []:
+            if not r.get("matched"):
+                continue
+            d = str(r.get("punch_local") or r.get("date") or "")[:10]
+            if d and d >= cut:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def reconcile_daily_attendance(date_str=None, role=None):
     """
     يُرجع حالة موحّدة لكل طالب غير مستثنى.
@@ -82,12 +111,13 @@ def reconcile_daily_attendance(date_str=None, role=None):
 
     date_str = date_str or _riyadh_today()
     cfg = load_config()
-    role = role or cfg.get("biometric_attendance_role", "supplement")
-    # حارس حاسم: الوضع «الأساسي» (لم يبصم = غائب) بلا جهاز بصمة مُفعّل
-    # سيُعلّم كل طلاب المدرسة غائبين. فبلا تفعيل البصمة نفرض «المساعد»
-    # دائماً — لا غياب يُفترَض من عدم بصمٍ لا وجود له.
-    if not cfg.get("biometric_enabled"):
-        role = "supplement"
+    # ‏«المساعد» هو وضع النظام دائماً، ولا يُقرأ من الإعدادات إطلاقاً.
+    # «الأساسي» عرضٌ مؤقّت لا يُطلب إلا صراحةً بـrole من صفحة الحضور
+    # الموحّد. سبب ذلك أن هذه الدالة تغذّي `blend_metrics` ومن ورائه
+    # لوحة المراقبة والتقارير والإشعارات: فدورٌ محفوظ بـ«أساسي» يقلب
+    # أرقام النظام كلّه، ويُعلّم كل من لم يبصم غائباً في كل مكان — ولو
+    # نُسي مرّةً بقي. الافتراض الآمن يبقى افتراضاً ولا يُحفَظ ضدّه شيء.
+    role = role if role in ("supplement", "primary") else "supplement"
     start = cfg.get("school_start_time", "07:00")
     grace = int(cfg.get("biometric_grace_min", 0) or 0)
 
@@ -97,6 +127,18 @@ def reconcile_daily_attendance(date_str=None, role=None):
     tardy_ids = {str(r["student_id"])
                  for r in query_tardiness(date_filter=date_str)}
     arrivals = _punch_arrivals(date_str)
+
+    # حارس حاسم: الوضع «الأساسي» (لم يبصم = غائب) بلا أي بصمة سيُعلّم كل
+    # طلاب المدرسة غائبين. فبلا دليل على الجهاز نفرض «المساعد» دائماً —
+    # لا غياب يُفترَض من عدم بصمٍ لا وجود له.
+    #
+    # كان الشرط `biometric_enabled` وحده، وهو **مفتاح السحب التلقائي كل
+    # ١٠ ثوانٍ** لا إقرارٌ بوجود جهاز: مدرسةٌ وصلت جهازها وسحبت بصماتها
+    # يدوياً (`run_once` لا يفحص المفتاح) كانت ترى متأخريها من البصمة
+    # ويُرفض عليها الوضع الأساسي — والزرّ يرتدّ بلا سبب ظاهر.
+    # الدليل الصحيح هو البصمات نفسها في ذلك اليوم.
+    if not cfg.get("biometric_enabled") and not arrivals:
+        role = "supplement"
 
     students, alerts = [], []
     tot = {"present": 0, "late": 0, "absent": 0, "escape": 0, "total": 0,
