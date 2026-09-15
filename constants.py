@@ -116,7 +116,7 @@ MY_STATIC_DOMAIN  = _saved_domain
 ngrok = None
 
 APP_TITLE           = 'تسجيل غياب الطلاب'
-APP_VERSION         = '3.6.47'
+APP_VERSION         = '3.6.48'
 
 # وسمٌ في `absences.teacher_id` لغيابٍ كتبه «اعتماد غياب من لم يبصم»
 # في صفحة الحضور الموحّد. يُقرأ من ثلاث وحدات (attendance_blend و

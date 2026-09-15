@@ -290,9 +290,149 @@ def send_whatsapp_pdf(phone: str, pdf_bytes: bytes, filename: str, caption: str 
     except Exception as e:
         return False, f"خطأ: {e}"
 
+# ─── إصلاح ذاتي لتثبيت نسخة واتساب-ويب ───────────────────────────────
+# ‏`server.js` يطلب عند كل تشغيل ملفَ نسخةٍ من مستودع طرفٍ ثالث:
+#     .../wa-version/main/html/2.2412.54.html
+# وفي ١٥ سبتمبر ٢٠٢٦ حذف المستودع كل نسخ 2.2412.x وأبقى 2.3000.x، فصار
+# الرابط 404. و`whatsapp-web.js` ينتظر ذلك الجلب **بلا مهلة**، فعلّقت كل
+# المدارس دفعةً واحدة عند «الخادم يبدأ…»، ولا تُصلحها إعادة التشغيل.
+#
+# ولا يصل إصلاح `server.js` عبر التحديث: المُحدِّث لا يشحن `.js` ويحمي
+# مجلد الواتساب عمداً (لئلا يمسح الجلسة المحفوظة). فالإصلاح يجب أن يأتي
+# من بايثون — فهي وحدها التي تبلغ كل مدرسة عبر القناة الموقَّعة.
+#
+# ولأن الأمر سيتكرر حتماً حين يُحذف 2.3000.x، لا نستبدل الرابط بثابتٍ
+# جديد بل **نتحقق عند كل تشغيل**: إن كان المثبَّت حياً لا نلمس شيئاً،
+# وإن مات جلبنا أحدث المتاح وكتبناه. فتُشفى المدارس نفسها إلى الأبد.
+_WAVER_API = "https://api.github.com/repos/wppconnect-team/wa-version/contents/html"
+_WAVER_RAW = "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/"
+
+
+def _ensure_wa_version_pin():
+    """
+    يتحقق أن نسخة واتساب-ويب المثبَّتة في `server.js` ما زالت موجودة،
+    ويستبدلها بأحدث متاح إن حُذفت. يُرجع نصّاً يصف ما جرى (للسجل).
+
+    **لا يرفع استثناءً أبداً، ولا يكتب إلا بعد التأكد من البديل.** إن
+    تعذّرت الشبكة نترك الملف كما هو: مدرسةٌ بلا إنترنت لحظةَ التشغيل
+    يجب ألا يُفسد ملفَّها فحصٌ فاشل.
+    """
+    import re
+    try:
+        js = os.path.join(WHATS_PATH, "server.js")
+        if not os.path.isfile(js):
+            return "لا server.js"
+
+        with open(js, "r", encoding="utf-8") as f:
+            src = f.read()
+
+        pat = re.compile(
+            r"https://raw\.githubusercontent\.com/wppconnect-team/"
+            r"wa-version/main/html/([^'\"\s]+\.html)")
+        m = pat.search(src)
+        if not m:
+            return "بلا تثبيت — النسخة المرنة مثبَّتة"
+
+        current = m.group(1)
+        # ① هل المثبَّت ما زال حياً؟
+        try:
+            r = requests.get(_WAVER_RAW + current, timeout=8)
+            if r.status_code == 200 and len(r.content) > 10000:
+                return f"سليم ({current})"
+        except Exception:
+            return "تعذّر الفحص — تُرك كما هو"
+
+        # ② مات — نجلب قائمة المتاح ونختار الأحدث
+        try:
+            lst = requests.get(_WAVER_API, timeout=12).json()
+            names = sorted(x.get("name", "") for x in lst
+                           if str(x.get("name", "")).endswith(".html"))
+            if not names:
+                return "قائمة النسخ فارغة — تُرك كما هو"
+            newest = names[-1]
+            chk = requests.get(_WAVER_RAW + newest, timeout=15)
+            if chk.status_code != 200 or len(chk.content) < 10000:
+                return "البديل غير صالح — تُرك كما هو"
+        except Exception as e:
+            return f"تعذّر جلب البديل ({e}) — تُرك كما هو"
+
+        # ③ كتابة ذرّية مع نسخة احتياطية
+        new_src = src.replace(_WAVER_RAW + current, _WAVER_RAW + newest)
+        if new_src == src:
+            return "لا تغيير"
+        try:
+            bak = js + ".bak"
+            if not os.path.exists(bak):
+                with open(bak, "w", encoding="utf-8") as f:
+                    f.write(src)
+            tmp = js + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(new_src)
+            os.replace(tmp, js)
+        except Exception as e:
+            return f"تعذّرت الكتابة ({e})"
+        return f"أُصلح: {current} ← {newest}"
+    except Exception as e:
+        return f"خطأ غير متوقع ({e})"
+
+
+def _kill_stale_wa_server(port=3000):
+    """
+    يُنهي خادم واتساب عالقاً يحتجز المنفذ.
+
+    ضروريٌّ بعد إصلاح التثبيت: المدرسة المتعطّلة لديها عملية node معلّقة
+    عند «يبدأ…» ما زالت ممسكةً بالمنفذ. فلو شغّلنا خادماً جديداً بالملف
+    المُصلَح لمات فوراً بـ EADDRINUSE وبقيت المدرسة معطّلة — ولا يُصلح
+    ذلك إلا زيارةٌ يدوية، وهي بالضبط ما نتجنّبه.
+
+    لا يُنهي إلا `node.exe` مستمعاً على منفذنا — لا يُقتل شيء سواه.
+    """
+    if sys.platform != "win32":
+        return "غير ويندوز — تُخطّي"
+    try:
+        out = subprocess.run(["netstat", "-ano"], capture_output=True,
+                             text=True, timeout=15,
+                             creationflags=subprocess.CREATE_NO_WINDOW).stdout
+        pids = set()
+        for line in out.splitlines():
+            if f":{port}" in line and "LISTENING" in line.upper():
+                parts = line.split()
+                if parts and parts[-1].isdigit():
+                    pids.add(parts[-1])
+        if not pids:
+            return "لا خادم عالق"
+
+        tl = subprocess.run(["tasklist", "/FI", "IMAGENAME eq node.exe"],
+                            capture_output=True, text=True, timeout=15,
+                            creationflags=subprocess.CREATE_NO_WINDOW).stdout
+        killed = []
+        for pid in pids:
+            if pid not in tl:          # ليست node.exe — لا نلمسها
+                continue
+            subprocess.run(["taskkill", "/F", "/PID", pid],
+                           capture_output=True, timeout=15,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+            killed.append(pid)
+        time.sleep(1.5)
+        return ("أُنهيت عمليات عالقة: " + ", ".join(killed)) if killed \
+            else "المنفذ محجوز بغير node — لم يُلمس"
+    except Exception as e:
+        return f"تعذّر الفحص ({e})"
+
+
 def start_whatsapp_server():
     """يفتح نافذة خادم الواتساب Node.js."""
     try:
+        # يسبق التشغيل: تثبيتٌ ميت يُعلّق الخادم أبداً عند «يبدأ…»
+        try:
+            _v = _ensure_wa_version_pin()
+            print(f"[WA-VERSION] {_v}")
+            # أُصلح الملف ⇒ العملية العالقة تحمل الكود القديم، ولا بد من
+            # إنهائها وإلا احتجزت المنفذ ومات الخادم الجديد فور ولادته.
+            if str(_v).startswith("أُصلح"):
+                print(f"[WA-VERSION] {_kill_stale_wa_server()}")
+        except Exception:
+            pass
         if not os.path.isdir(WHATS_PATH):
             # messagebox من خيط خلفي لا يرمي استثناءً — بل يتجمّد ويُعلّق
             # الخادم كله، فنفحص الخيط قبل عرض أي نافذة.
