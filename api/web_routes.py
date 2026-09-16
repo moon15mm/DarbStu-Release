@@ -234,9 +234,21 @@ async def web_dashboard_data(request: Request, date: str = None):
     try:
         d       = date or now_riyadh_date()
         metrics = compute_today_metrics(d)
-        # أضف إحصاء التأخر
-        tard = query_tardiness(date_filter=d)
-        metrics["totals"]["tardiness"] = len(tard)
+        # «التأخر» في اللوحة يجب أن يطابق «متأخر» في الحضور الموحّد —
+        # كلاهما سؤال واحد، فلا يصحّ أن تُجيب شاشتان بجوابين.
+        #
+        # كان يُحسب بعدّ سجلّات جدول التأخر **خاماً**، وجدولُها يمتلئ
+        # بسجلّات صفرية من بوابة البصمة في وضع «attendance»، فقرأت
+        # اللوحة ٣٢٠ متأخراً (كل الحاضرين) بينما الحقيقة ٧٤.
+        # الخلطة تحسبه من وقت البصمة الفعلي، فهي المرجع.
+        _tot = metrics.setdefault("totals", {})
+        if "late" in _tot:
+            _tot["tardiness"] = _tot["late"]
+        else:
+            # مسار السحابة لا يمرّ بالخلطة — نستبعد الصفرية يدوياً
+            tard = query_tardiness(date_filter=d)
+            _tot["tardiness"] = sum(
+                1 for r in tard if int(r.get("minutes_late") or 0) > 0)
         return JSONResponse({"ok": True, "date": d, "metrics": metrics})
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
@@ -4120,7 +4132,7 @@ function doEndPeriod(){
     <div class="ab ai">💡 الصور المرفوعة هنا ستظهر كـ "سناب" أو "كاروسيل" في بوابة ولي الأمر لتبرز أنشطة المدرسة.</div>
     <div class="fg2">
       <div class="fg"><label class="fl">عنوان النشاط (اختياري)</label><input type="text" id="ss-title" placeholder="مثال: تكريم المتفوقين"></div>
-      <div class="fg"><label class="fl">الصورة</label><input type="file" id="ss-file" accept="image/*"></div>
+      <div class="fg"><label class="fl">الصور <span style="font-weight:400;color:var(--mu);font-size:12px">(يمكن اختيار أكثر من صورة)</span></label><input type="file" id="ss-file" accept="image/*" multiple></div>
     </div>
     <button class="btn bp1" onclick="uploadStory()" style="margin-top:10px">📤 رفع ونشر القصة</button>
     <div id="ss-upload-st" style="margin-top:10px"></div>
@@ -5404,8 +5416,34 @@ function renderStuTbl(arr){
            '<td>'+(s.academic_no?('<b>'+s.academic_no+'</b>'):'—')+'</td>'+
            '<td>'+s.name+'</td><td>'+s.class_name+'</td>'+
            '<td>'+(s.phone||'—')+'</td>'+
-           '<td><button class="btn bp2 bsm" onclick="editStudent(\''+sid+'\')">✏️ تعديل</button></td></tr>';
+           '<td><button class="btn bp2 bsm" onclick="editStudent(\''+sid+'\')">✏️ تعديل</button> '+
+             '<button class="btn bsm" style="background:#DC2626;color:#fff" '+
+             'onclick="deleteStudent(\''+sid+'\')">🗑️ حذف</button></td></tr>';
   }).join('')||'<tr><td colspan="6" style="color:#9CA3AF">لا يوجد</td></tr>';
+}
+/* حذف الطالب من كشف المدرسة.
+   سجلّاته السابقة (غياب/تأخر) تبقى عمداً: حذفها يُغيّر تقارير شهور مضت
+   بأثر رجعي. ويُدرَج في «الطلاب المحوَّلون» فلا يختفي أثره بلا بيان. */
+async function deleteStudent(id){
+  var s=null,all=window._students||[];
+  for(var i=0;i<all.length;i++){if(String(all[i].id)===String(id)){s=all[i];break;}}
+  if(!s){alert('الطالب غير موجود');return;}
+  /* الصياغة تجعل «الاسم» هو الفاعل عمداً: وسيط التأنيث يبدّل الأسماء
+     (الطالب←الطالبة) ولا يصرّف الأفعال ولا الضمائر، فجملةٌ مثل «لن
+     يظهر… غيابه» تبقى بالمذكّر في مدارس البنات. وبإسناد الفعل إلى
+     «الاسم» يستقيم النصّ في المدرستين بلا استثناء. */
+  if(!confirm('حذف الطالب «'+s.name+'» من '+(s.class_name||'')+'؟\n\n'+
+              '• يُرفع الاسم من كشف المدرسة، فلا يظهر في التحضير ولا الرسائل\n'+
+              '• سجلّ الغياب والتأخر السابق يبقى كما هو\n'+
+              '• يُضاف الاسم إلى قائمة المحوَّلين\n'+
+              '• تُؤخذ نسخة احتياطية تلقائياً قبل الحذف\n\n'+
+              'متابعة؟')) return;
+  try{
+    var r=await fetch('/web/api/students/'+encodeURIComponent(id),{method:'DELETE'});
+    var d=await r.json();
+    if(!d.ok){ss('sm-sum','❌ '+(d.msg||'تعذّر الحذف'),'er');return;}
+    loadStudents();
+  }catch(e){ ss('sm-sum','❌ خطأ في الاتصال','er'); }
 }
 /* تعديل بيانات الطالب ونقله بين الصفوف — الرقم الأكاديمي يرافقه ولا يتغيّر */
 async function editStudent(id){
@@ -8614,15 +8652,19 @@ async function loadStories(){
 async function uploadStory(){
   var title = document.getElementById('ss-title').value;
   var fileInput = document.getElementById('ss-file');
-  var file = fileInput.files[0];
-  if(!file){ alert('يرجى اختيار صورة أولاً'); return; }
-  ss('ss-upload-st', '⏳ جاري الرفع...', 'in');
-  var fd = new FormData(); fd.append('title', title); fd.append('file', file);
+  var chosen = fileInput.files;
+  if(!chosen || !chosen.length){ alert('يرجى اختيار صورة أولاً'); return; }
+  ss('ss-upload-st', '⏳ جاري رفع '+chosen.length+' صورة...', 'in');
+  /* اسم الحقل 'files' متكرّراً — كل صورة تصير بطاقةً مستقلة بالعنوان نفسه */
+  var fd = new FormData(); fd.append('title', title);
+  for(var i=0;i<chosen.length;i++) fd.append('files', chosen[i]);
   try {
     var r = await fetch('/web/api/stories/add', {method:'POST', body:fd});
     var d = await r.json();
     if(d.ok){
-      ss('ss-upload-st', '✅ تم النشر بنجاح', 'ok');
+      var msg = '✅ نُشرت ' + (d.saved||chosen.length) + ' صورة';
+      if(d.rejected && d.rejected.length) msg += ' — تُجوهلت '+d.rejected.length+' (صيغة غير مدعومة)';
+      ss('ss-upload-st', msg, 'ok');
       document.getElementById('ss-title').value = ''; fileInput.value = '';
       loadStories();
     } else ss('ss-upload-st', '❌ فشل الرفع: ' + (d.msg||'خطأ'), 'er');
@@ -11742,31 +11784,60 @@ async def api_get_stories(request: Request):
     from database import get_active_stories
     return JSONResponse({"ok": True, "stories": get_active_stories()})
 
+_STORY_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+
+
 @router.post("/web/api/stories/add", response_class=JSONResponse)
-async def api_add_story(request: Request, title: str = Form(None), file: UploadFile = File(...)):
+async def api_add_story(request: Request, title: str = Form(None),
+                        file: UploadFile = File(None),
+                        files: List[UploadFile] = File(None)):
+    """
+    ينشر قصةً أو أكثر. كل صورة تصير بطاقةً مستقلة تحمل العنوان نفسه —
+    فالجدول يخزّن مساراً واحداً لكل سطر، وبوابة وليّ الأمر تعرضها
+    كـ«كاروسيل» أصلاً، فلا حاجة لتغيير البنية لدعم عدة صور.
+
+    ‏`file` المفردة باقية عمداً: صفحةٌ محفوظة في متصفّح مدرسة من نسخة
+    سابقة ما زالت ترسلها، وحذفها كان يُعطّل النشر عندها بلا سبب ظاهر.
+    """
     user = _get_current_user(request)
     if not user or user["role"] not in ("admin", "deputy", "activity_leader"):
         return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=401)
-    
+
     try:
         from constants import DATA_DIR
         import shutil
-        
+
+        incoming = [f for f in (list(files or []) + ([file] if file else []))
+                    if f is not None and getattr(f, "filename", "")]
+        if not incoming:
+            return JSONResponse({"ok": False, "msg": "لم تُرفَع أي صورة"})
+
         stories_dir = os.path.join(DATA_DIR, "school_stories")
         os.makedirs(stories_dir, exist_ok=True)
-        
-        # حفظ الملف
-        ext = os.path.splitext(file.filename)[1]
-        fname = f"story_{int(datetime.datetime.now().timestamp())}{ext}"
-        fpath = os.path.join(stories_dir, fname)
-        
-        with open(fpath, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-            
+
         from database import add_school_story
-        add_school_story(title, fpath)
-        
-        return JSONResponse({"ok": True})
+        saved, rejected = 0, []
+        stamp = int(datetime.datetime.now().timestamp())
+        for idx, up in enumerate(incoming):
+            ext = os.path.splitext(up.filename)[1].lower()
+            if ext not in _STORY_EXTS:
+                rejected.append(up.filename)
+                continue
+            # الفهرس ضروري: الطابع الزمني بالثواني يتكرّر حين تُرفع عدة
+            # صور معاً، فيدهس بعضُها بعضاً وتبقى صورةٌ واحدة.
+            fname = f"story_{stamp}_{idx}{ext}"
+            fpath = os.path.join(stories_dir, fname)
+            with open(fpath, "wb") as buffer:
+                shutil.copyfileobj(up.file, buffer)
+            add_school_story(title, fpath)
+            saved += 1
+
+        if not saved:
+            return JSONResponse({"ok": False,
+                                 "msg": "صيغة غير مدعومة — الصور فقط "
+                                        "(jpg/png/webp/gif)"})
+        return JSONResponse({"ok": True, "saved": saved,
+                             "rejected": rejected})
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 

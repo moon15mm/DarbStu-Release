@@ -168,7 +168,21 @@ def reconcile_daily_attendance(date_str=None, role=None):
             teacher_absent = sid in absent_ids
             minutes = 0
 
-            if punched and teacher_absent:
+            if punched and teacher_absent and sid in committed_ids:
+                # اعتماد الغياب من البصمة **لقطةٌ زمنية**: من لم يكن قد بصم
+                # لحظتَها كُتب له سجلّ غياب. فإن وصل بعدها وبصم، صار عندنا
+                # «بصمة + غياب» فيُحسب هروباً — وهو ليس هروباً بل تأخّراً،
+                # ولا معلمَ سجّله أصلاً. نُصحّح حالته ونُنبّه الإدارة، لأن
+                # سجلّ الغياب ما زال قائماً وسيصل وليَّ أمره إشعارُ غياب.
+                minutes = _minutes_late(arrivals[sid], start, grace)
+                status = LATE if minutes > 0 else PRESENT
+                source = SRC_DEVICE
+                alerts.append({"student_id": sid, "name": s.get("name", ""),
+                               "class_name": cname, "kind": "stale_commit",
+                               "text": "اعتُمد غائباً ثم بصم بعد الاعتماد — "
+                                       "أعِد الاعتماد ليُصحَّح سجلّه، وإلا "
+                                       "وصل وليَّ أمره إشعارُ غياب بالخطأ."})
+            elif punched and teacher_absent:
                 status, source = ESCAPE, "%s + %s" % (SRC_DEVICE, SRC_TEACHER)
                 alerts.append({"student_id": sid, "name": s.get("name", ""),
                                "class_name": cname, "kind": "escape",

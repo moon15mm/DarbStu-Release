@@ -436,10 +436,17 @@ function load(){
 function renderAlerts(){
   var box=document.getElementById('alerts'); box.innerHTML='';
   if(!DATA.alerts||!DATA.alerts.length) return;
+  /* نوعان مختلفان تماماً، وخلطهما تحت وصفٍ واحد كان يتّهم معلماً لم
+     يسجّل شيئاً: «اعتماد قديم» سببه أن الاعتماد لقطةٌ زمنية سبقت وصول
+     الطالب، لا أن معلماً غيّبه. */
+  var esc=0, stale=0;
+  DATA.alerts.forEach(function(a){ if(a.kind=='stale_commit') stale++; else esc++; });
   var html='<div class="card"><h2>تنبيهات تحتاج مراجعة <span class="muted">('+DATA.alerts.length+')</span></h2>';
-  html+='<p class="d">طلابٌ بصموا عند البوابة (حاضرون في المبنى) لكن سجّلهم معلمٌ غائبين في حصة — الأرجح «هروب» لا غياباً كاملاً.</p>';
+  if(esc) html+='<p class="d"><b>هروب محتمل ('+esc+'):</b> طلابٌ بصموا عند البوابة (حاضرون في المبنى) لكن سجّلهم معلمٌ غائبين في حصة.</p>';
+  if(stale) html+='<p class="d"><b>اعتماد قديم ('+stale+'):</b> طلابٌ اعتُمدوا غائبين من البصمة ثم وصلوا وبصموا بعد الاعتماد. لم يسجّلهم معلمٌ غائبين — أعِد الاعتماد ليُصحَّح سجلّهم قبل إرسال رسائل الغياب.</p>';
   DATA.alerts.forEach(function(a){
-    html+='<div class="alert"><b>'+a.name+'</b> — '+a.class_name+'<br>'+a.text+'</div>';
+    var stl = (a.kind=='stale_commit') ? ' style="border-right:4px solid #B45309"' : '';
+    html+='<div class="alert"'+stl+'><b>'+a.name+'</b> — '+a.class_name+'<br>'+a.text+'</div>';
   });
   html+='</div>'; box.innerHTML=html;
 }

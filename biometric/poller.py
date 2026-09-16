@@ -123,8 +123,16 @@ def process_pending(cfg=None):
         reg_t = datetime.datetime.strptime(local.strftime("%H:%M"), "%H:%M")
         minutes_late = int((reg_t - start_t).total_seconds() / 60) - grace
 
-        if mode == "tardiness" and minutes_late <= 0:
+        if minutes_late <= 0:
             # حضر في الوقت — لا تأخر. نعلّمه حاضراً ولا نُشعر.
+            #
+            # كان الشرط مقيَّداً بـ`mode == "tardiness"`، فمدرسةٌ في وضع
+            # «attendance» يُكتب لها سجلّ تأخر **بصفر دقيقة لكل من بصم**.
+            # فظهر في اللوحة أن كل الحاضرين متأخرون (٣٢٠ بدل ٧٤)، وكاد
+            # يُرسَل لأولياء أمورهم جميعاً إشعارُ «تأخر ٠ دقيقة».
+            #
+            # وحضورُ الطالب مسجَّل أصلاً في جدول البصمات، ومنه تقرؤه
+            # الخلطة — فلا حاجة لسجلّ تأخر كاذب ليُعرف أنه حضر.
             mark_punch_processed(p["id"], "حاضر", student_id=sid, matched=1)
             stat["present"] += 1
             continue
