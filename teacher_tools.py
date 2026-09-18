@@ -831,6 +831,14 @@ def get_gradebook(subject_id: int, period: int = 1) -> dict:
         con.close()
         return {"ok": False, "msg": "المادة غير موجودة"}
     subj = subj[0]
+    # اسم الفصل المعروض — `tt_subjects` تخزّن المعرّف وحده. تحتاجه ورقة
+    # الطباعة والتحويل السريع للموجّه، وإلا ظهر «2-A» بدل «ثاني ثانوي/أ».
+    try:
+        subj["class_name"] = {c["id"]: c["name"]
+                              for c in load_students().get("list", [])
+                              }.get(subj.get("class_id"), subj.get("class_id"))
+    except Exception:
+        subj["class_name"] = subj.get("class_id")
 
     cur.execute("SELECT * FROM tt_components WHERE subject_id=? AND period=? "
                 "ORDER BY sort_order, id", (subject_id, period))
@@ -1009,6 +1017,11 @@ def analyze_class(subject_id: int, period: int = 1) -> dict:
         tier = _tier(pct)
         ratios = _ratios(s["marks"], comps, asmts_by_comp)
         flags, actions = [], []
+        # رمزٌ لاتيني لكل معالجة تقبل إجراءً سريعاً في الواجهة.
+        # الربط بالنصّ لا بالفهرس، لأن `actions` تُنقّى من التكرار أدناه
+        # فينزاح أي فهرس موازٍ. واللاتينية مقصودة: وسيط التأنيث يُعيد
+        # كتابة النصّ العربي في مدارس البنات، فمطابقتُه هناك تنكسر.
+        act_kind = {}
 
         # مكوّنٌ يتخلّف عن معدّل الطالب نفسه — ضعفٌ في مهارة لا في مستوى
         own = []
@@ -1027,6 +1040,7 @@ def analyze_class(subject_id: int, period: int = 1) -> dict:
         if att is not None and att < ATT_WARN:
             flags.append("حضور %g٪ — الغياب يُفسّر جزءاً من التحصيل" % att)
             actions.append("تحويلٌ للموجّه الطلابي وخطةُ متابعة حضور مع ولي الأمر")
+            act_kind[actions[-1]] = "counselor"
 
         beh = s.get("behavior") or 0
         if beh >= BEH_WARN:
@@ -1062,6 +1076,7 @@ def analyze_class(subject_id: int, period: int = 1) -> dict:
         if total_cells and graded == 0:
             flags.append("لم يُرصد له شيء في هذه الفترة")
 
+        _acts = list(dict.fromkeys(actions))
         rows.append({
             "id": s["id"], "name": s["name"], "total": pct,
             "tier": tier["name"], "tier_color": tier["color"],
@@ -1072,7 +1087,10 @@ def analyze_class(subject_id: int, period: int = 1) -> dict:
             "trend": trend, "weak": weak,
             "flags": flags,
             # المكرّر يُحذف مع حفظ الترتيب: علّتان قد تقترحان الشيء نفسه
-            "actions": list(dict.fromkeys(actions)),
+            "actions": _acts,
+            # موازية لـactions حرفاً بحرف بعد التنقية — الواجهة تقرأ
+            # منها لتعرف أي معالجة يقابلها زرّ إجراء سريع
+            "action_kinds": [act_kind.get(a, "") for a in _acts],
         })
 
     summary = {}
@@ -1143,6 +1161,7 @@ def student_across_subjects(student_id: str) -> dict:
                 "attendance": row["attendance"], "behavior": row["behavior"],
                 "coverage": row["coverage"], "trend": row["trend"],
                 "flags": row["flags"], "actions": row["actions"],
+                "action_kinds": row.get("action_kinds", []),
                 "class_avg": res["class_avg"],
             })
     graded = [o["total"] for o in out if o["total"] is not None]

@@ -13,7 +13,8 @@ from constants import (DB_PATH, DATA_DIR, TEACHERS_JSON, HOST, PORT, TZ_OFFSET,
                        now_riyadh_date, local_ip, navbar_html, debug_on,
                        public_base_url, CURRENT_USER, ROLES)
 from config_manager import (load_config, get_terms, logo_img_tag_from_config,
-                            ar, feminize as _fem, bot_enabled)
+                            ar, feminize as _fem, bot_enabled,
+                            get_message_template)
 from database import (get_db, load_students, load_teachers,
                       insert_absences, query_absences,
                       query_tardiness, insert_tardiness, delete_tardiness,
@@ -30,7 +31,8 @@ from report_builder import (generate_report_html, generate_daily_report,
 from alerts_service import (log_message_status, query_today_messages,
                              load_schedule, save_schedule,
                              query_permissions, insert_permission,
-                             update_permission_status, delete_permission)
+                             update_permission_status, delete_permission,
+                             build_absent_groups, send_absence_alert)
 from pdf_generator import (results_portal_html, student_result_html, get_student_result, _render_pdf_page_as_png)
 
 router = APIRouter()

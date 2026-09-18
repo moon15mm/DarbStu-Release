@@ -31,6 +31,7 @@ from database import (get_db, load_students, load_teachers,
                       insert_excuse, delete_excuse,
                       create_backup, get_backup_list, get_all_users,
                       create_user, delete_user, toggle_user_active,
+                      update_user_password, clear_student_results,
                       authenticate, hash_password, save_user_allowed_tabs,
                       delete_circular, get_user_allowed_tabs, get_user_info,
                       import_students_from_excel_sheet2_format,
@@ -6886,14 +6887,59 @@ function ttStudentCard(sid){
       : '<div class="ab ai">لا ملاحظات — المستوى مستقر.</div>';
 
   h+='<div class="st" style="margin:14px 0 8px">المعالجة المقترحة</div>';
-  h+= s.actions.length ? s.actions.map(function(a){
-        return '<span class="tt-act">'+ttEsc(a)+'</span>'; }).join('')
+  /* المعالجة التي يقابلها إجراء في النظام يُلحَق بها زرّه.
+     التعرّف بـaction_kinds اللاتينية لا بنصّ المعالجة: وسيط التأنيث
+     يُعيد كتابة النصّ في مدارس البنات فتنكسر أي مطابقة عربية. */
+  var _kinds = s.action_kinds || [];
+  h+= s.actions.length ? s.actions.map(function(a,i){
+        var btn='';
+        if(_kinds[i]==='counselor')
+          btn='<button class="btn bsm bp1" style="margin-right:8px;vertical-align:middle"'+
+              ' onclick="ttQuickRefer(\''+String(s.id).replace(/'/g,"\\'")+'\')">'+
+              '↗ تحويل الآن</button>';
+        return '<span class="tt-act">'+ttEsc(a)+'</span>'+btn; }).join('')
       : '<div class="ab ai">لا إجراء مطلوب.</div>';
 
+  h+='<div id="tt-refer-st" style="margin-top:10px;font-size:13px"></div>';
   h+='<div style="display:grid;gap:8px;margin-top:16px">'+
      '<button class="btn bp2" onclick="showTab(\'student_analysis\');'+
      'document.getElementById(\'co-modal\').remove()">فتح صفحة الطالب الكاملة</button></div>';
   showCoModal('تحليل ومعالجة — '+ttEsc(s.name),h,'#7C3AED','#5B21B6');
+}
+
+/* تحويلٌ سريع للموجّه الطلابي من بطاقة المعالجة — بدل أن ينتقل المعلّم
+   لنموذج التحويل ويُعيد إدخال ما يعرفه النظام أصلاً. سببُ التحويل
+   وأسبابه تُملأ من تحليل الطالب نفسه. */
+async function ttQuickRefer(sid){
+  var s=(_ttAn.students||[]).filter(function(x){return x.id===sid;})[0];
+  if(!s){ alert('الطالب غير موجود'); return; }
+  var subj=(_ttData&&_ttData.subject)||{};
+  var cls = subj.class_name || subj.class_id || '';
+  if(!confirm('تحويل «'+s.name+'» للموجّه الطلابي؟\n\n'+
+              'الفصل: '+cls+'\nالسبب: ضعف الحضور ('+
+              (s.attendance==null?'—':s.attendance+'٪')+')\n\n'+
+              'يصل التحويل للموجّه ويُشعَر الوكيل.')) return;
+  var st=document.getElementById('tt-refer-st');
+  if(st) st.innerHTML='<span class="ab ai">⏳ جارٍ التحويل...</span>';
+  try{
+    var r=await fetch('/web/api/create-referral',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        student_id:s.id, student_name:s.name,
+        class_id:subj.class_id||'', class_name:cls,
+        subject:subj.subject||'',
+        violation_type:'تربوية',
+        violation:'ضعف الحضور — نسبة الحضور '+(s.attendance==null?'—':s.attendance+'٪'),
+        problem_causes:(s.flags||[]).join(' · '),
+        teacher_action1:(s.actions||[])[0]||'',
+        teacher_action2:(s.actions||[])[1]||''})});
+    var d=await r.json();
+    if(st) st.innerHTML = d.ok
+      ? '<span class="ab ao">✅ حُوِّل للموجّه الطلابي.</span>'
+      : '<span class="ab ae">❌ '+((d&&d.msg)||'تعذّر التحويل')+'</span>';
+  }catch(e){
+    if(st) st.innerHTML='<span class="ab ae">❌ خطأ في الاتصال</span>';
+  }
 }
 
 function ttRender(){
