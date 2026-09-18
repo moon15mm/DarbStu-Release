@@ -11,6 +11,7 @@ from config_manager import load_config, logo_img_tag_from_config, get_terms
 from database import (get_db, query_absences, _apply_class_name_fix,
                       query_tardiness, query_excuses, load_students, load_teachers,
                       get_cloud_client)
+import teacher_tools as _tt
 
 def build_daily_report_df(date_str):
     rows = _apply_class_name_fix(query_absences(date_filter=date_str))
@@ -707,6 +708,66 @@ def detect_suspicious_patterns(months_back: int = 2) -> List[Dict]:
 # لوحة ولي الأمر — رابط شخصي لكل ولي
 # ═══════════════════════════════════════════════════════════════
 
+def _portal_gradebook_section(student_id: str) -> str:
+    """
+    قسم دفتر المتابعة في بوابة ولي الأمر.
+
+    يُعرض للوالد ما يخصّ ابنه: الدرجة ومتوسط الفصل والمستوى والحضور
+    والمخالفات، مع الملاحظات. **ولا تُعرض المعالجة المقترحة** — تلك
+    اقتراحاتٌ للمعلّم لم تقرّرها المدرسة بعد («تحويل للموجّه»، «عقد
+    سلوكي»)، وعرضُها على الوالد يجعلها وعداً لم يُقطع.
+
+    للمدرسة أن تُخفي القسم كلّه بـportal_show_gradebook=false في config.
+    """
+    try:
+        if not load_config().get("portal_show_gradebook", True):
+            return ""
+        data = _tt.student_across_subjects(str(student_id))
+    except Exception:
+        return ""
+    if not data.get("ok") or not data.get("rows"):
+        return ""
+
+    rows = ""
+    for r in data["rows"]:
+        tot = "—" if r["total"] is None else r["total"]
+        avg = "—" if r["class_avg"] is None else r["class_avg"]
+        att = "—" if r["attendance"] is None else ("%g%%" % r["attendance"])
+        rows += (
+            '<tr><td style="text-align:right">%s</td><td>%s</td>'
+            '<td style="font-weight:bold">%s</td><td style="color:#5A6A7E">%s</td>'
+            '<td><span style="background:%s;color:%s;padding:2px 9px;border-radius:9px;'
+            'font-size:11px;font-weight:bold">%s</span></td><td>%s</td></tr>'
+            % (r["subject"], r["period"], tot, avg,
+               r["tier_bg"], r["tier_color"], r["tier"], att))
+
+    notes = ""
+    seen = set()
+    for r in data["rows"]:
+        for f in r.get("flags", []):
+            key = (r["subject"], f)
+            if key in seen:
+                continue
+            seen.add(key)
+            notes += ('<div style="font-size:12px;background:#FFFBEB;color:#92400E;'
+                      'border-right:3px solid #F59E0B;padding:6px 9px;border-radius:5px;'
+                      'margin-bottom:5px"><b>%s:</b> %s</div>' % (r["subject"], f))
+
+    avg_txt = "" if data.get("average") is None else \
+        ' — المعدل العام <b>%s</b>' % data["average"]
+    return (
+        '<div class="section">'
+        '<h2>الدرجات ومتابعة المعلمين</h2>'
+        '<p style="font-size:12px;color:#5A6A7E;margin:0 0 10px">'
+        'درجات أعمال السنة كما رصدها المعلمون حتى اليوم%s. '
+        'وهي غير نهائية وتتغيّر مع بقية الفترة.</p>'
+        '<table><tr><th>المادة</th><th>الفترة</th><th>الدرجة</th>'
+        '<th>متوسط الفصل</th><th>المستوى</th><th>الحضور</th></tr>%s</table>'
+        '%s</div>'
+        % (avg_txt, rows,
+           ('<div style="margin-top:10px">%s</div>' % notes) if notes else ""))
+
+
 def parent_portal_html(student_id: str) -> str:
     """صفحة HTML شخصية لولي الأمر — تعرض سجل ابنه فقط."""
     store = load_students()
@@ -778,6 +839,8 @@ def parent_portal_html(student_id: str) -> str:
           <span style="font-size:12px;font-weight:bold;color:{c}">{d} يوم</span>
         </div>""".format(m=r["m"], c=color, p=pct, d=r["d"])
 
+    gradebook_section = _portal_gradebook_section(student_id)
+
     return """<!DOCTYPE html><html lang="ar" dir="rtl">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>سجل {name} — {school}</title>
@@ -818,6 +881,7 @@ td{{padding:6px 8px;border-bottom:1px solid #EEE;text-align:center}}
   <h2>سجل الغياب (آخر 30)</h2>
   <table><tr><th>التاريخ</th><th>الحصة</th></tr>{abs_html}</table>
 </div>
+{gradebook_section}
 {tard_section}
 {perm_section}
 <p style="text-align:center;color:#9CA3AF;font-size:11px;padding:12px">
@@ -825,6 +889,7 @@ td{{padding:6px 8px;border-bottom:1px solid #EEE;text-align:center}}
 </body></html>""".format(
         name=student["name"], school=school, cls_name=cls_name,
         abs_color=abs_color, total_abs=total_abs,
+        gradebook_section=gradebook_section,
         tard_cnt=len(tard_rows), perm_cnt=len(perm_rows),
         monthly_bars=monthly_bars, abs_html=abs_html or "<tr><td colspan='2'>لا يوجد غياب</td></tr>",
         tard_section='<div class="section"><h2>سجل التأخر</h2><table><tr><th>التاريخ</th><th>الدقائق</th></tr>{}</table></div>'.format(tard_html) if tard_rows else "",

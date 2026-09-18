@@ -1059,6 +1059,129 @@ def init_db():
         enrolled_at  TEXT NOT NULL
     )""")
 
+    # ═══ أدوات المعلم — دفتر المتابعة الصفّي ════════════════════════
+    # المادة المسندة للمعلّم هي جذر الدفتر: المعلّم الواحد قد يدرّس المادة
+    # نفسها لعدة فصول، ولكل (معلّم، فصل، مادة) دفترٌ مستقل بمكوّناته.
+    # الفصل والمادة نصّان لأن DarbStu لا يملك كياناً للمواد أصلاً، وجدول
+    # schedule يخزّن اسم المعلّم بلا مادة — فلا مرجع يُربط به.
+    cur.execute("""CREATE TABLE IF NOT EXISTS tt_subjects (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        teacher    TEXT NOT NULL,
+        class_id   TEXT NOT NULL,
+        subject    TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(teacher, class_id, subject)
+    )""")
+
+    # مكوّنات توزيع الدرجات، لكل مادة وفترة على حدة.
+    # category: perf = المهام الأدائية والمشاركة | exam = تقويمات شفهية وتحريرية
+    # grade_mode: bool = صح/خطأ (عدد التقييمات مفتوح، والدرجة نسبةُ الصحيح)
+    #             score = درجات (كل تقييم يقتطع من درجة المكوّن حتى تنفد)
+    cur.execute("""CREATE TABLE IF NOT EXISTS tt_components (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        subject_id INTEGER NOT NULL,
+        period     INTEGER NOT NULL DEFAULT 1,
+        name       TEXT NOT NULL,
+        max_score  REAL NOT NULL DEFAULT 10,
+        category   TEXT NOT NULL DEFAULT 'perf',
+        grade_mode TEXT NOT NULL DEFAULT 'bool',
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    )""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ttcomp_subject "
+                "ON tt_components(subject_id, period)")
+
+    # التقييمات داخل المكوّن (واجب ١، واجب ٢ …). في وضع score يكون
+    # max_score حصّة التقييم من درجة المكوّن، وفي وضع bool لا معنى له.
+    cur.execute("""CREATE TABLE IF NOT EXISTS tt_assessments (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        component_id INTEGER NOT NULL,
+        title        TEXT NOT NULL,
+        max_score    REAL NOT NULL DEFAULT 0,
+        due_date     TEXT NOT NULL DEFAULT '',
+        sort_order   INTEGER NOT NULL DEFAULT 0,
+        created_at   TEXT NOT NULL
+    )""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ttasmt_comp "
+                "ON tt_assessments(component_id)")
+
+    # درجة طالب في تقييم. value في وضع bool تساوي 1 أو 0، وغيابُ السطر
+    # يعني «لم يُرصد بعد» — وهو مختلف عن الصفر، فلا يدخل في الحساب.
+    cur.execute("""CREATE TABLE IF NOT EXISTS tt_marks (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        assessment_id INTEGER NOT NULL,
+        student_id    TEXT NOT NULL,
+        value         REAL,
+        updated_by    TEXT NOT NULL DEFAULT '',
+        updated_at    TEXT NOT NULL,
+        UNIQUE(assessment_id, student_id)
+    )""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ttmark_asmt "
+                "ON tt_marks(assessment_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ttmark_student "
+                "ON tt_marks(student_id)")
+
+    # تجهيز المعلّم: عدد الفترات وعلامة إتمام المعالج. بلا العلامة كان
+    # المعالج يُفتح كل مرة على من أنهاه، أو لا يُفتح على من لم يبدأ.
+    cur.execute("""CREATE TABLE IF NOT EXISTS tt_settings (
+        teacher    TEXT PRIMARY KEY,
+        periods    INTEGER NOT NULL DEFAULT 2,
+        setup_done INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    )""")
+
+    # مصدر درجة الحضور لكل مادة: system = محسوبة من سجل غياب المدرسة،
+    # manual = يرصدها المعلّم بنفسه. attendance_max = صفر يعني بلا درجة.
+    _tt_cols = {r[1] for r in cur.execute("PRAGMA table_info(tt_subjects)")}
+    if "attendance_mode" not in _tt_cols:
+        cur.execute("ALTER TABLE tt_subjects ADD COLUMN "
+                    "attendance_mode TEXT NOT NULL DEFAULT 'system'")
+    if "attendance_max" not in _tt_cols:
+        cur.execute("ALTER TABLE tt_subjects ADD COLUMN "
+                    "attendance_max REAL NOT NULL DEFAULT 0")
+    if "behavior_max" not in _tt_cols:
+        cur.execute("ALTER TABLE tt_subjects ADD COLUMN "
+                    "behavior_max REAL NOT NULL DEFAULT 0")
+
+    # درجة الحضور المرصودة يدوياً — منفصلة عن tt_marks لأنها ليست تقييماً
+    cur.execute("""CREATE TABLE IF NOT EXISTS tt_attendance_marks (
+        subject_id INTEGER NOT NULL,
+        period     INTEGER NOT NULL DEFAULT 1,
+        student_id TEXT NOT NULL,
+        value      REAL,
+        updated_by TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (subject_id, period, student_id)
+    )""")
+
+    # المخالفات السلوكية داخل المادة. تُحسم من behavior_max تراكمياً،
+    # ولا تُمسّ سجلات السلوك المدرسية (التحويلات والموجّه) — تلك قرار إدارة.
+    cur.execute("""CREATE TABLE IF NOT EXISTS tt_behavior (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        subject_id INTEGER NOT NULL,
+        period     INTEGER NOT NULL DEFAULT 1,
+        student_id TEXT NOT NULL,
+        kind       TEXT NOT NULL DEFAULT '',
+        note       TEXT NOT NULL DEFAULT '',
+        deduct     REAL NOT NULL DEFAULT 0,
+        created_by TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+    )""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ttbeh_subject "
+                "ON tt_behavior(subject_id, period, student_id)")
+
+    # لقطةٌ لما كانت عليه خلايا التقييم قبل «منح الجميع الدرجة الكاملة».
+    # المنح يطمس رصداً سابقاً بلا رجعة، والمعلّم يضغطه على العمود الخطأ.
+    # لقطةٌ واحدة لكل تقييم تكفي: التراجع يُعيد الحال ثم يُستهلك.
+    cur.execute("""CREATE TABLE IF NOT EXISTS tt_award_undo (
+        assessment_id INTEGER PRIMARY KEY,
+        payload       TEXT NOT NULL,
+        created_by    TEXT NOT NULL DEFAULT '',
+        created_at    TEXT NOT NULL
+    )""")
+
+    _migrate_add_tab(cur, 'دفتر المتابعة', ('admin', 'deputy', 'teacher'))
+
     con.commit(); con.close()
 
 # ══════════════════════════════════════════════════════════════
@@ -2038,14 +2161,19 @@ def clear_yearly_data(reset_type='term'):
     term_tables = [
         "absences", "tardiness", "messages_log", "message_log",
         "excuses", "permissions", "student_referrals",
-        "counselor_referrals", "academic_inquiries"
+        "counselor_referrals", "academic_inquiries",
+        # رصد الدفتر فصليّ: التقييمات ودرجاتها تُصفَّر، أما توزيع الدرجات
+        # فيبقى ليُعاد استعماله في الفصل التالي بلا إعادة ضبط.
+        "tt_marks", "tt_assessments", "tt_attendance_marks", "tt_behavior",
+        "tt_award_undo"
     ]
-    
+
     # الجداول الإضافية التي تُحذف فقط في نهاية السنة
     year_only_tables = [
         "student_results", "result_tokens", "counselor_sessions",
         "behavioral_contracts", "circulars", "circular_reads",
-        "counselor_alerts"
+        "counselor_alerts",
+        "tt_components", "tt_subjects", "tt_settings"
     ]
     
     tables_to_clear = term_tables

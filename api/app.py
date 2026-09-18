@@ -46,6 +46,21 @@ from api.bus_routes       import router as _bus_router
 from api.biometric_routes import router as _biometric_router
 from api.attendance_routes import router as _attendance_router
 from api.schedule_routes   import router as _schedule_router
+
+# ‏«دفتر المتابعة» وحدة **جديدة لم تصل المدارس بعد**، بخلاف المسارات
+# أعلاه الموجودة عندها سلفاً. والمُحدِّث يكتب ملفات `.py` واحداً واحداً،
+# فلو انقطع بعد `app.py` وقبل `teacher_tools_routes.py` لصار استيرادٌ
+# صارمٌ يمنع **إقلاع البرنامج كلّه** في تلك المدرسة — لا مجرّد غياب
+# تبويب. فقدُ تبويبٍ أهونُ ألف مرة من مدرسة لا يفتح برنامجها.
+#
+# ⚠️ الوحدتان مدرجتان في `DarbStu.spec` (hiddenimports) — وبدونهما
+# يسقط الاستيراد صامتاً في النسخة المجمّدة. لا تحذفهما من هناك.
+try:
+    from api.teacher_tools_routes import router as _teacher_tools_router
+except Exception as _e:                      # pragma: no cover
+    _teacher_tools_router = None
+    print(f"[APP] دفتر المتابعة غير متاح: {_e}")
+
 app.include_router(_mobile_router)
 app.include_router(_misc_router)
 app.include_router(_web_router)
@@ -54,6 +69,8 @@ app.include_router(_bus_router)
 app.include_router(_biometric_router)
 app.include_router(_attendance_router)
 app.include_router(_schedule_router)
+if _teacher_tools_router is not None:
+    app.include_router(_teacher_tools_router)
 
 # ── خدمة الملفات الثابتة ──
 # لا يُخدَم مجلد data كاملاً: فهو يحوي config.json (وفيه cloud_token وأرقام

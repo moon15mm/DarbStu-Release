@@ -17,6 +17,7 @@ from config_manager import (load_config, save_config, get_terms,
                              invalidate_config_cache)
 import hashlib as _hl
 import security as _sec
+import teacher_tools as _tt
 # سر التوقيع فريد لكل تثبيت ويُولَّد عشوائياً عند أول تشغيل (security.py).
 # لا يُشتق من ثابت في الكود حتى لا يمكن تزوير الجلسات من المصدر العلني.
 _JWT_SECRET = _sec.get_jwt_secret()
@@ -2038,6 +2039,7 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
             ("تصدير نور",           "noor_export",          "fas fa-cloud-upload-alt"),
         ]),
         ("أدوات المعلم", [
+            ("دفتر المتابعة",       "teacher_gradebook",    "fas fa-table"),
             ("تحويل طالب",          "referral_teacher",     "fas fa-clipboard-list"),
             ("نماذج المعلم",        "teacher_forms",        "fas fa-file-contract"),
             ("تحليل النتائج",       "grade_analysis",       "fas fa-chart-bar"),
@@ -2257,6 +2259,74 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
         '}'
         '@media(max-width:420px){.topbar h1{font-size:13px}.section{padding:12px}}'
         '@media print{.topbar,.sidebar,#ov{display:none!important}.content{margin:0!important;padding:0!important}}'
+        # ── دفتر المتابعة ──────────────────────────────────────
+        # الشبكة تُمرَّر أفقياً وعمود الطالب ثابت: الفصل ٣٠ طالباً وقد
+        # تتجاوز التقييمات العشرين، فبلا تثبيتٍ يضيع صاحب الصف.
+        '.tt-bar{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px}'
+        '.tt-wrap{overflow:auto;max-height:70vh;border:1px solid var(--bd);border-radius:var(--rd);background:#fff}'
+        'table.tt{border-collapse:separate;border-spacing:0;font-size:13px;width:max-content;min-width:100%}'
+        '.tt th,.tt td{border-bottom:1px solid var(--bd);border-left:1px solid var(--bd);padding:6px 8px;text-align:center;white-space:nowrap}'
+        '.tt thead th{position:sticky;top:0;z-index:3;background:var(--pr);color:#fff;font-weight:700}'
+        '.tt thead tr:nth-child(2) th{top:34px;font-size:11px;font-weight:500;background:var(--pr-dk)}'
+        '.tt .tt-nm{position:sticky;right:0;z-index:4;background:#fff;text-align:right;'
+        'min-width:170px;max-width:220px;overflow:hidden;text-overflow:ellipsis;cursor:pointer;font-weight:500}'
+        '.tt .tt-nm:hover{background:var(--pr-lt);color:var(--pr)}'
+        '.tt thead .tt-nm{background:var(--pr);color:#fff;z-index:5;cursor:default}'
+        '.tt tbody tr:nth-child(even) td{background:#FAFBFC}'
+        '.tt tbody tr:nth-child(even) .tt-nm{background:#FAFBFC}'
+        '.tt tbody tr:hover td{background:var(--pr-lt)}'
+        '.tt tbody tr:hover .tt-nm{background:var(--pr-lt)}'
+        # الخلية دائرةٌ تُنقَر: أخضر صحيح، أحمر خطأ، رمادي باهت لم يُرصد.
+        # «لم يُرصد» يجب أن يُرى مختلفاً عن الصفر وإلا بدا الفصل راسباً.
+        '.tt-d{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;'
+        'border-radius:50%;cursor:pointer;font-size:12px;font-weight:700;border:1px solid transparent;transition:transform .1s}'
+        '.tt-d:hover{transform:scale(1.15)}'
+        '.tt-ok{background:#DCFCE7;color:#166534;border-color:#86EFAC}'
+        '.tt-no{background:#FEE2E2;color:#991B1B;border-color:#FCA5A5}'
+        '.tt-na{background:#F1F5F9;color:#94A3B8;border-color:#E2E8F0}'
+        '.tt-nu{background:#DBEAFE;color:#1E40AF;border-color:#93C5FD;width:auto;min-width:26px;padding:0 6px;border-radius:13px}'
+        '.tt-hd{cursor:pointer}.tt-hd:hover{text-decoration:underline}'
+        '.tt-plus{background:rgba(255,255,255,.18);border:1px dashed rgba(255,255,255,.6);color:#fff;'
+        'border-radius:6px;cursor:pointer;padding:1px 7px;font-size:13px}'
+        '.tt-plus:hover{background:rgba(255,255,255,.35)}'
+        '.tt-sc{font-weight:700;background:#F8FAFC!important;color:var(--pr-dk)}'
+        '.tt-tot{font-weight:900;background:#EFF6FF!important;color:var(--pr-dk)}'
+        '.tt-low{background:#FEF2F2!important;color:#B91C1C}'
+        '.tt-cmp{display:flex;align-items:center;justify-content:space-between;gap:8px;'
+        'padding:10px 12px;border:1px solid var(--bd);border-radius:10px;margin-bottom:8px;background:#fff}'
+        '.tt-pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:700}'
+        '.tt-pp{background:#EDE9FE;color:#5B21B6}.tt-pe{background:#FEF3C7;color:#92400E}'
+        '.tt-empty{padding:40px 20px;text-align:center;color:var(--mu)}'
+        # أيقونة العجلة: زرٌّ دائري بارز في أعلى الدفتر لا بندٌ في قائمة
+        '.tt-ico{width:40px;height:40px;border-radius:50%;border:none;cursor:pointer;font-size:19px;'
+        'background:linear-gradient(135deg,#F59E0B,#EF4444);color:#fff;line-height:1;'
+        'box-shadow:0 2px 8px rgba(239,68,68,.35);transition:transform .15s}'
+        '.tt-ico:hover{transform:rotate(25deg) scale(1.08)}'
+        '.tt-att{background:#F0FDF4!important;font-weight:700;color:#166534;cursor:pointer}'
+        '.tt-beh{background:#FFF7ED!important;font-weight:700;color:#9A3412;cursor:pointer}'
+        '.tt-lvl{border:1px solid var(--bd);border-radius:10px;padding:10px 12px;margin-bottom:10px}'
+        '.tt-lvl>b{display:block;margin-bottom:8px;color:var(--pr-dk)}'
+        '.tt-chk{display:inline-flex;align-items:center;gap:6px;background:#F8FAFC;border:1px solid var(--bd);'
+        'border-radius:8px;padding:6px 10px;margin:0 0 6px 6px;cursor:pointer;font-size:13px}'
+        '.tt-chk:hover{background:var(--pr-lt);border-color:var(--pr)}'
+        '.tt-chk input{margin:0;cursor:pointer}'
+        '.tt-chk.on{background:var(--pr-lt);border-color:var(--pr);color:var(--pr);font-weight:700}'
+        '.tt-step{font-size:12px;color:var(--mu);margin:2px 0 10px}'
+        '.tt-views{display:flex;gap:6px;margin:0 0 12px;flex-wrap:wrap;border-bottom:2px solid var(--bd);padding-bottom:8px}'
+        '.tt-vb{background:none;border:1px solid var(--bd);border-radius:8px;padding:7px 14px;cursor:pointer;'
+        'font-family:inherit;font-size:13px;font-weight:600;color:var(--mu);display:flex;align-items:center;gap:6px}'
+        '.tt-vb:hover{background:var(--pr-lt);color:var(--pr)}'
+        '.tt-vb.active{background:var(--pr);border-color:var(--pr);color:#fff}'
+        '.tt-tier{display:inline-block;padding:2px 10px;border-radius:999px;font-size:11px;font-weight:800}'
+        '.tt-bar2{height:7px;border-radius:4px;background:#E2E8F0;overflow:hidden;min-width:70px}'
+        '.tt-bar2>i{display:block;height:100%;border-radius:4px}'
+        '.tt-flag{display:block;font-size:12px;color:#92400E;background:#FFFBEB;border-right:3px solid #F59E0B;'
+        'padding:5px 9px;border-radius:5px;margin-bottom:4px}'
+        '.tt-act{display:block;font-size:12px;color:#065F46;background:#ECFDF5;border-right:3px solid #10B981;'
+        'padding:5px 9px;border-radius:5px;margin-bottom:4px}'
+        '.tt-scard{border:1px solid var(--bd);border-radius:10px;padding:12px;margin-bottom:8px;background:#fff;'
+        'display:flex;gap:12px;align-items:center;flex-wrap:wrap;cursor:pointer}'
+        '.tt-scard:hover{border-color:var(--pr);background:var(--pr-lt)}'
         '</style><script src="https://cdn.jsdelivr.net/npm/chart.js"></script></head><body data-user="' + username + '">'
     )
 
@@ -2978,6 +3048,37 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
     </div>
     <button class="btn bp1" onclick="addRecipient()">+ إضافة مستلم</button>
     <div id="rec-st" style="margin-top:10px"></div>
+  </div>
+</div>
+
+<div id="tab-teacher_gradebook">
+  <h2 class="pt"><i class="fas fa-table"></i> دفتر المتابعة</h2>
+  <div class="ab ai">💡 عمود الحضور يُحسب من سجل غياب المدرسة تلقائياً — لا تُعِد رصده هنا.</div>
+  <div class="section">
+    <div class="tt-bar">
+      <div class="fg" style="min-width:220px">
+        <label class="fl">المادة والفصل</label>
+        <select id="tt-subj" onchange="ttLoad()"><option value="">— اختر —</option></select>
+      </div>
+      <div class="fg">
+        <label class="fl">الفترة</label>
+        <select id="tt-period" onchange="ttLoad()"></select>
+      </div>
+      <button class="tt-ico" onclick="ttWheel()" title="عجلة الأسماء — اختيار طالب عشوائياً">🎯</button>
+      <button class="btn bp2 bsm" onclick="ttDistribution()"><i class="fas fa-sliders-h"></i> توزيع الدرجات</button>
+      <button class="btn bp2 bsm" onclick="ttOptions()"><i class="fas fa-user-check"></i> الحضور والسلوك</button>
+      <button class="btn bp2 bsm" onclick="ttPrint()"><i class="fas fa-print"></i> طباعة</button>
+      <span style="flex:1"></span>
+      <button class="btn bp1 bsm" onclick="ttSetupWizard()"><i class="fas fa-wand-magic-sparkles"></i> تجهيز الدفتر</button>
+      <button class="btn bsm" onclick="ttResetDialog()" style="background:#FEF3C7;color:#92400E">تصفير الأرقام</button>
+      <button class="btn bsm" onclick="ttDeleteSubject()" style="background:#FEE2E2;color:#991B1B">حذف المادة</button>
+    </div>
+    <div class="tt-views">
+      <button class="tt-vb active" data-v="grid" onclick="ttSetView('grid')"><i class="fas fa-table-cells"></i> سجل المتابعة</button>
+      <button class="tt-vb" data-v="students" onclick="ttSetView('students')"><i class="fas fa-users"></i> الطلاب</button>
+      <button class="tt-vb" data-v="analysis" onclick="ttSetView('analysis')"><i class="fas fa-brain"></i> التحليل والمعالجة</button>
+    </div>
+    <div id="tt-body"><div class="tt-empty">اختر مادة، أو أسند مادةً جديدة للبدء.</div></div>
   </div>
 </div>
 
@@ -4487,6 +4588,7 @@ function showTab(key){
     'exempted_students':function(){fillSel('ex-cls');loadExemptedStudents();},
     'points_control': function(){ loadPointsAdminLogs(); loadTeachersUsage(); loadUsersForAdj(); },
     'school_stories':loadStories,
+    'teacher_gradebook':ttInit,
     'referral_teacher':function(){loadRefStudents();loadRefHistory();},
     'referral_deputy':loadDeputyReferrals,
     'teacher_forms':function(){
@@ -6528,6 +6630,882 @@ function setCoModalBody(html){
   if(body)body.innerHTML=html;
 }
 
+/* ══ دفتر المتابعة (أدوات المعلم) ══════════════════════════ */
+var _ttData=null, _ttSaveTimer=null, _ttPending=0;
+
+function ttEsc(s){var d=document.createElement('div');d.textContent=(s==null?'':s);return d.innerHTML;}
+function ttNum(v){return (v==null)?'':(Math.round(v*100)/100);}
+
+/* api() تُرجع null للانقطاع وللجلسة المنتهية معاً، فكانت كل الأخطاء تظهر
+   «تعذّر الحفظ» — وهي رسالة تُوهم بعطبٍ في البيانات بينما الخادم متوقف.
+   يُرجع true إذا كان الرد سليماً. */
+function ttOk(r, what){
+  if(r===null||r===undefined){
+    alert('تعذّر الاتصال بالخادم.\n\nتأكد أن برنامج DarbStu يعمل، ثم أعد المحاولة.\n'+
+          'إن كنت قد تركت الصفحة مفتوحةً طويلاً فأعد تحميلها.');
+    return false;
+  }
+  if(!r.ok){ alert(r.msg||('تعذّر '+(what||'التنفيذ'))); return false; }
+  return true;
+}
+
+var _ttClasses=[], _ttSetup=null;
+
+async function ttInit(){
+  var st=await api('/web/api/tt/setup');
+  if(st&&st.ok){ _ttSetup=st; ttFillPeriods(st.periods||2); }
+  var d=await api('/web/api/tt/subjects'); if(!d||!d.ok) return;
+  var sel=document.getElementById('tt-subj'); if(!sel) return;
+  var prev=sel.value;
+  var h='<option value="">— اختر —</option>';
+  (d.subjects||[]).forEach(function(s){
+    h+='<option value="'+s.id+'">'+ttEsc(s.subject)+' — '+ttEsc(s.class_name)+'</option>';
+  });
+  sel.innerHTML=h;
+  _ttClasses=d.classes||[];
+  // المعلّم الجديد يُستقبل بالمعالج لا بشبكة فارغة
+  if(!(d.subjects||[]).length){ ttSetupWizard(); return; }
+  sel.value = (prev && sel.querySelector('option[value="'+prev+'"]')) ? prev
+            : String(d.subjects[0].id);
+  ttLoad();
+}
+
+function ttFillPeriods(n){
+  var ord=['','الأولى','الثانية','الثالثة','الرابعة','الخامسة','السادسة'];
+  var sel=document.getElementById('tt-period'); if(!sel) return;
+  var prev=sel.value, h='';
+  for(var i=1;i<=(n||2);i++) h+='<option value="'+i+'">الفترة '+ord[i]+'</option>';
+  sel.innerHTML=h;
+  if(prev && prev<=(n||2)) sel.value=prev;
+}
+
+/* ── معالج تجهيز الدفتر ── */
+function ttSetupWizard(){
+  api('/web/api/tt/setup').then(function(d){
+    if(!d||!d.ok){alert('تعذّر تحميل بيانات التجهيز');return;}
+    _ttSetup=d;
+    var done={}; (d.existing||[]).forEach(function(e){done[e.class_id+'|'+e.subject]=1;});
+    var h='<div class="tt-step">مرحلة المدرسة <b>'+ttEsc(d.stage)+'</b> — '+
+          'الصفوف المعروضة هي صفوف هذه المرحلة وحدها.</div>';
+
+    h+='<div class="st" style="margin-bottom:6px">١) الفصول التي تُدرّسها</div>';
+    (d.levels||[]).forEach(function(l){
+      h+='<div class="tt-lvl"><b>'+ttEsc(l.name)+'</b>';
+      l.classes.forEach(function(c){
+        h+='<label class="tt-chk"><input type="checkbox" class="tt-cls" value="'+ttEsc(c.id)+'" '+
+           'onchange="this.parentNode.classList.toggle(\'on\',this.checked)">'+
+           ttEsc(c.name)+' <span style="color:#94A3B8">('+c.count+')</span></label>';
+      });
+      h+='</div>';
+    });
+    if(!(d.levels||[]).length)
+      h+='<div class="ab aw">لا توجد فصول في النظام بعد — استورد الطلاب أولاً.</div>';
+
+    h+='<div class="st" style="margin:14px 0 6px">٢) المواد التي تُدرّسها</div><div>';
+    (d.suggested||[]).forEach(function(s){
+      h+='<label class="tt-chk"><input type="checkbox" class="tt-sub" value="'+ttEsc(s)+'" '+
+         'onchange="this.parentNode.classList.toggle(\'on\',this.checked)">'+ttEsc(s)+'</label>';
+    });
+    h+='</div><div class="fg" style="margin-top:8px"><label class="fl">مواد أخرى (افصل بفاصلة)</label>'+
+       '<input type="text" id="tt-extra" placeholder="مثال: علم البيئة، الأنشطة"></div>';
+
+    h+='<div class="st" style="margin:14px 0 6px">٣) عدد الفترات في الفصل الدراسي</div>'+
+       '<select id="tt-nper" style="width:100%">';
+    for(var i=1;i<=6;i++) h+='<option value="'+i+'"'+(i===(d.periods||2)?' selected':'')+'>'+i+'</option>';
+    h+='</select>';
+
+    if(Object.keys(done).length)
+      h+='<div class="tt-step" style="margin-top:10px">لديك '+Object.keys(done).length+
+         ' دفتراً مُنشأً — ما تختاره هنا يُضاف إليها ولا يحذف شيئاً.</div>';
+
+    h+='<button class="btn bp1" style="width:100%;margin-top:14px" onclick="ttApplySetup()">'+
+       'إنشاء الدفاتر</button>';
+    showCoModal('تجهيز دفتر المتابعة',h,'#1565C0','#0D47A1');
+  });
+}
+
+async function ttApplySetup(){
+  var cls=[].slice.call(document.querySelectorAll('.tt-cls:checked')).map(function(x){return x.value;});
+  var subs=[].slice.call(document.querySelectorAll('.tt-sub:checked')).map(function(x){return x.value;});
+  var extra=(document.getElementById('tt-extra').value||'').split(/[,،]/);
+  extra.forEach(function(s){ s=s.trim(); if(s) subs.push(s); });
+  if(!cls.length){alert('اختر فصلاً واحداً على الأقل');return;}
+  if(!subs.length){alert('اختر مادةً واحدة على الأقل');return;}
+  var per=parseInt(document.getElementById('tt-nper').value)||2;
+  var r=await api('/web/api/tt/setup/apply',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({classes:cls,subjects:subs,periods:per})});
+  if(!ttOk(r,'التجهيز')) return;
+  var m=document.getElementById('co-modal'); if(m)m.remove();
+  alert('تم إنشاء '+r.created+' دفتراً'+(r.skipped?' (و'+r.skipped+' كان موجوداً)':''));
+  ttFillPeriods(per);
+  await ttInit();
+}
+
+async function ttLoad(){
+  var sid=document.getElementById('tt-subj').value;
+  var per=document.getElementById('tt-period').value||1;
+  var box=document.getElementById('tt-body');
+  if(!sid){box.innerHTML='<div class="tt-empty">اختر مادة، أو أسند مادةً جديدة للبدء.</div>';_ttData=null;return;}
+  box.innerHTML='<div class="loading">⏳</div>';
+  var d=await api('/web/api/tt/gradebook?subject_id='+sid+'&period='+per);
+  if(!d||!d.ok){box.innerHTML='<div class="tt-empty">'+ttEsc((d&&d.msg)||'تعذّر تحميل الدفتر')+'</div>';return;}
+  _ttData=d;
+  if(_ttView==='grid') ttRender(); else ttLoadAnalysis();
+}
+
+/* ── تبديل العرض: الشبكة / الطلاب / التحليل ── */
+var _ttView='grid', _ttAn=null, _ttQ='';
+
+function ttSetView(v){
+  _ttView=v;
+  document.querySelectorAll('.tt-vb').forEach(function(b){
+    b.classList.toggle('active', b.getAttribute('data-v')===v);
+  });
+  if(v==='grid'){ ttRender(); return; }
+  if(!_ttData){ document.getElementById('tt-body').innerHTML=
+    '<div class="tt-empty">اختر مادةً أولاً.</div>'; return; }
+  ttLoadAnalysis();
+}
+
+async function ttLoadAnalysis(){
+  var box=document.getElementById('tt-body');
+  box.innerHTML='<div class="loading">⏳</div>';
+  var d=await api('/web/api/tt/analyze?subject_id='+_ttData.subject.id+
+                  '&period='+_ttData.period);
+  if(!d||!d.ok){ box.innerHTML='<div class="tt-empty">'+
+    ttEsc((d&&d.msg)||'تعذّر التحليل')+'</div>'; return; }
+  _ttAn=d;
+  if(_ttView==='students') ttRenderStudents(); else ttRenderAnalysis();
+}
+
+function ttSearch(v){ _ttQ=(v||'').trim();
+  if(_ttView==='students') ttRenderStudents(); else ttRenderAnalysis(); }
+
+function ttMatch(s){ return !_ttQ || s.name.indexOf(_ttQ)>=0 || String(s.id).indexOf(_ttQ)>=0; }
+
+function ttSearchBox(){
+  return '<div class="fg" style="margin-bottom:12px"><input type="text" id="tt-q" '+
+    'placeholder="ابحث باسم الطالب أو رقمه…" value="'+ttEsc(_ttQ)+'" '+
+    'oninput="ttSearch(this.value)"></div>';
+}
+
+function ttTierChip(s){
+  return '<span class="tt-tier" style="background:'+s.tier_bg+';color:'+s.tier_color+'">'+
+         ttEsc(s.tier)+'</span>';
+}
+
+/* الطلاب: قائمة المادة بأرقامها — بديل التمرير الأفقي في الشبكة */
+function ttRenderStudents(){
+  var d=_ttAn; if(!d) return;
+  var rows=(d.students||[]).filter(ttMatch);
+  var h=ttSearchBox()+
+    '<div class="tt-step">'+rows.length+' من '+d.students.length+' طالباً · '+
+    'اضغط الطالب لتحليله ومعالجته.</div>'+
+    '<div class="tw"><table><thead><tr><th>#</th><th>الطالب</th><th>الدرجة</th>'+
+    '<th>التصنيف</th><th>الحضور</th><th>السلوك</th><th>ما رُصد له</th></tr></thead><tbody>';
+  rows.forEach(function(s){
+    h+='<tr style="cursor:pointer" onclick="ttStudentCard(\''+s.id+'\')">'+
+       '<td>'+(s.rank||'—')+'</td>'+
+       '<td style="text-align:right">'+ttEsc(s.name)+'</td>'+
+       '<td><b>'+(s.total==null?'—':s.total)+'</b></td>'+
+       '<td>'+ttTierChip(s)+'</td>'+
+       '<td'+(s.attendance!=null&&s.attendance<75?' class="tt-low"':'')+'>'+
+       (s.attendance==null?'—':s.attendance+'٪')+'</td>'+
+       '<td'+(s.behavior?' class="tt-low"':'')+'>'+(s.behavior||0)+'</td>'+
+       '<td><div class="tt-bar2" title="'+s.graded+' من '+s.cells+'"><i style="width:'+
+       s.coverage+'%;background:'+(s.coverage<50?'#F59E0B':'#10B981')+'"></i></div></td></tr>';
+  });
+  h+='</tbody></table></div>';
+  document.getElementById('tt-body').innerHTML=h;
+}
+
+/* التحليل: توزيع الفصل على المستويات ثم من يحتاج معالجة أولاً */
+function ttRenderAnalysis(){
+  var d=_ttAn; if(!d) return;
+  var h='<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px">'+
+    '<div class="sc" style="flex:1;min-width:110px"><div class="v">'+
+    (d.class_avg==null?'—':d.class_avg)+'</div><div class="l">متوسط الفصل</div></div>'+
+    '<div class="sc" style="flex:1;min-width:110px"><div class="v" style="color:#B91C1C">'+
+    d.needs_help+'</div><div class="l">يحتاجون معالجة</div></div>'+
+    '<div class="sc" style="flex:1;min-width:110px"><div class="v">'+
+    d.students.length+'</div><div class="l">إجمالي الطلاب</div></div></div>';
+
+  h+='<div class="st" style="margin-bottom:8px">توزيع المستويات</div>'+
+     '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px">';
+  (d.tiers||[]).forEach(function(t){
+    var n=d.summary[t]||0; if(!n) return;
+    var one=(d.students.filter(function(s){return s.tier===t;})[0])||{};
+    h+='<div style="flex:1;min-width:92px;text-align:center;padding:9px;border-radius:9px;'+
+       'background:'+(one.tier_bg||'#F1F5F9')+';color:'+(one.tier_color||'#334155')+'">'+
+       '<div style="font-size:21px;font-weight:900">'+n+'</div>'+
+       '<div style="font-size:11px;font-weight:700">'+ttEsc(t)+'</div></div>';
+  });
+  h+='</div>';
+
+  var rows=(d.students||[]).filter(ttMatch)
+            .filter(function(s){return s.flags.length||s.tier_rank>=3;})
+            .sort(function(a,b){return (b.tier_rank-a.tier_rank)||
+                                       ((a.total==null?0:a.total)-(b.total==null?0:b.total));});
+  h+=ttSearchBox()+'<div class="st" style="margin-bottom:8px">من يحتاج وقفة ('+rows.length+')</div>';
+  if(!rows.length)
+    h+='<div class="ab ai">لا توجد حالات تستدعي معالجة في هذه الفترة.</div>';
+  rows.forEach(function(s){
+    h+='<div class="tt-scard" onclick="ttStudentCard(\''+s.id+'\')">'+
+       '<div style="flex:1;min-width:150px"><b>'+ttEsc(s.name)+'</b> '+ttTierChip(s)+
+       '<div style="font-size:12px;color:#64748B;margin-top:3px">'+
+       ttEsc(s.flags[0]||'')+(s.flags.length>1?(' · و'+(s.flags.length-1)+' غيرها'):'')+'</div></div>'+
+       '<div style="font-size:19px;font-weight:900;color:'+s.tier_color+'">'+
+       (s.total==null?'—':s.total)+'</div></div>';
+  });
+  document.getElementById('tt-body').innerHTML=h;
+}
+
+/* بطاقة الطالب: ما رُصد، وما لوحظ، وما يُقترح عمله */
+function ttStudentCard(sid){
+  var s=(_ttAn.students||[]).filter(function(x){return x.id===sid;})[0];
+  if(!s) return;
+  var h='<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px">'+
+    '<div class="sc" style="flex:1;min-width:100px"><div class="v" style="color:'+s.tier_color+'">'+
+    (s.total==null?'—':s.total)+'</div><div class="l">من ١٠٠</div></div>'+
+    '<div class="sc" style="flex:1;min-width:100px"><div class="v">'+(s.rank||'—')+
+    '</div><div class="l">ترتيبه</div></div>'+
+    '<div class="sc" style="flex:1;min-width:100px"><div class="v">'+
+    (s.attendance==null?'—':s.attendance+'٪')+'</div><div class="l">الحضور</div></div>'+
+    '<div class="sc" style="flex:1;min-width:100px"><div class="v">'+(s.behavior||0)+
+    '</div><div class="l">مخالفات</div></div></div>'+
+    '<div style="text-align:center;margin-bottom:14px">'+ttTierChip(s)+
+    (s.trend?(' <span class="tt-tier" style="background:#F1F5F9;color:#334155">'+
+    ttEsc(s.trend)+'</span>'):'')+
+    ' <span class="tt-tier" style="background:#F1F5F9;color:#334155">رُصد له '+
+    s.graded+' من '+s.cells+'</span></div>';
+
+  h+='<div class="st" style="margin-bottom:8px">ما لوحظ</div>';
+  h+= s.flags.length ? s.flags.map(function(f){
+        return '<span class="tt-flag">'+ttEsc(f)+'</span>'; }).join('')
+      : '<div class="ab ai">لا ملاحظات — المستوى مستقر.</div>';
+
+  h+='<div class="st" style="margin:14px 0 8px">المعالجة المقترحة</div>';
+  h+= s.actions.length ? s.actions.map(function(a){
+        return '<span class="tt-act">'+ttEsc(a)+'</span>'; }).join('')
+      : '<div class="ab ai">لا إجراء مطلوب.</div>';
+
+  h+='<div style="display:grid;gap:8px;margin-top:16px">'+
+     '<button class="btn bp2" onclick="showTab(\'student_analysis\');'+
+     'document.getElementById(\'co-modal\').remove()">فتح صفحة الطالب الكاملة</button></div>';
+  showCoModal('تحليل ومعالجة — '+ttEsc(s.name),h,'#7C3AED','#5B21B6');
+}
+
+function ttRender(){
+  if(_ttView!=='grid') return;
+  var d=_ttData; if(!d) return;
+  var comps=d.components||[], studs=d.students||[];
+  if(!comps.length){
+    document.getElementById('tt-body').innerHTML=
+      '<div class="tt-empty">لا توجد مكوّنات في هذه الفترة.<br><br>'+
+      '<button class="btn bp1" onclick="ttDistribution()">فتح توزيع الدرجات</button></div>';
+    return;
+  }
+  var h='<div class="tt-wrap"><table class="tt"><thead><tr>';
+  h+='<th class="tt-nm" rowspan="2">الطالب</th>';
+  comps.forEach(function(c){
+    var n=(c.assessments||[]).length+1;
+    h+='<th colspan="'+n+'" class="tt-hd" onclick="ttCompMenu('+c.id+')" title="اضغط لخيارات المكوّن">'+
+       ttEsc(c.name)+' <span style="opacity:.75;font-weight:400">('+ttNum(c.max_score)+')</span></th>';
+  });
+  var sub='<br><span style="font-weight:400;font-size:11px">';
+  h+= (d.att_max>0)
+      ? '<th rowspan="2">الحضور'+sub+'من '+ttNum(d.att_max)+
+        (d.att_mode==='manual'?' · يدوي':' · آلي')+'</span></th>'
+      : '<th rowspan="2">الحضور'+sub+'نسبة</span></th>';
+  if(d.beh_max>0) h+='<th rowspan="2">السلوك'+sub+'من '+ttNum(d.beh_max)+'</span></th>';
+  h+='<th rowspan="2">الدرجة'+sub+'من ١٠٠</span></th></tr><tr>';
+  comps.forEach(function(c){
+    (c.assessments||[]).forEach(function(a,i){
+      h+='<th class="tt-hd" onclick="ttAsmtMenu('+a.id+','+c.id+')" title="'+ttEsc(a.title)+'">'+(i+1)+'</th>';
+    });
+    h+='<th><button class="tt-plus" onclick="ttAddAssessment('+c.id+')" title="إضافة تقييم">+</button></th>';
+  });
+  h+='</tr></thead><tbody>';
+
+  studs.forEach(function(s){
+    h+='<tr><td class="tt-nm" onclick="ttStudent(\''+s.id+'\')" title="فتح ملف الطالب">'+ttEsc(s.name)+'</td>';
+    comps.forEach(function(c){
+      (c.assessments||[]).forEach(function(a){
+        h+='<td>'+ttDot(s.id,a,c)+'</td>';
+      });
+      var sc=s.components[String(c.id)];
+      h+='<td class="tt-sc">'+(sc==null?'—':ttNum(sc))+'</td>';
+    });
+    var att=s.attendance;
+    if(d.att_max>0){
+      var ttl=(d.att_mode==='manual')?'اضغط لرصد درجة الحضور'
+              :('محسوبة من سجل المدرسة — نسبة الحضور '+(att==null?'—':att+'٪'));
+      h+='<td class="tt-att'+(d.att_mode==='manual'?'':' ')+'" title="'+ttl+'"'+
+         (d.att_mode==='manual'?(' onclick="ttAttCell(\''+s.id+'\')"'):'')+'>'+
+         (s.att_score==null?'<span class="tt-d tt-na">+</span>':ttNum(s.att_score))+'</td>';
+    }else{
+      h+='<td'+(att!=null&&att<75?' class="tt-low"':'')+'>'+(att==null?'—':att+'٪')+'</td>';
+    }
+    if(d.beh_max>0){
+      h+='<td class="tt-beh" onclick="ttBehavior(\''+s.id+'\')" title="اضغط لتسجيل مخالفة">'+
+         ttNum(s.beh_score)+(s.behavior? ' <span style="background:#EF4444;color:#fff;'+
+         'border-radius:999px;padding:0 6px;font-size:10px">'+s.behavior+'</span>':'')+'</td>';
+    }
+    h+='<td class="tt-tot'+(s.total!=null&&s.total<60?' tt-low':'')+'">'+(s.total==null?'—':s.total)+'</td></tr>';
+  });
+  h+='</tbody></table></div>';
+  h+='<div style="margin-top:8px;font-size:12px;color:#64748B">'+
+     'الخلية الرمادية = لم تُرصد بعد (لا تُحتسب). اضغط اسم الطالب لملفه، ورأس العمود لخياراته.</div>';
+  document.getElementById('tt-body').innerHTML=h;
+}
+
+function ttDot(sid,a,c){
+  var v=_ttData.students.filter(function(x){return x.id===sid;})[0].marks[String(a.id)];
+  var cls='tt-na', txt='+';
+  if(v!=null){
+    if(c.grade_mode==='bool'){ if(v>=1){cls='tt-ok';txt='✓';} else {cls='tt-no';txt='✗';} }
+    else { cls='tt-nu'; txt=ttNum(v); }
+  }
+  return '<span class="tt-d '+cls+'" onclick="ttCell(\''+sid+'\','+a.id+','+c.id+')">'+txt+'</span>';
+}
+
+/* النقر يدوّر: لم يُرصد ← صحيح ← خطأ ← لم يُرصد. وفي وضع الدرجات يُسأل رقم. */
+function ttCell(sid,aid,cid){
+  var c=_ttData.components.filter(function(x){return x.id===cid;})[0];
+  var stu=_ttData.students.filter(function(x){return x.id===sid;})[0];
+  var cur=stu.marks[String(aid)];
+  var nv;
+  if(c.grade_mode==='bool'){
+    if(cur==null) nv=1; else if(cur>=1) nv=0; else nv=null;
+  }else{
+    var a=(c.assessments||[]).filter(function(x){return x.id===aid;})[0];
+    var raw=prompt('الدرجة من '+ttNum(a.max_score)+' (اتركه فارغاً لمسح الرصد):',cur==null?'':cur);
+    if(raw===null) return;
+    raw=raw.trim();
+    if(raw===''){ nv=null; }
+    else { nv=parseFloat(raw);
+           if(isNaN(nv)){alert('أدخل رقماً صحيحاً');return;}
+           if(nv>a.max_score){alert('الدرجة تتجاوز درجة التقييم ('+ttNum(a.max_score)+')');return;} }
+  }
+  if(nv==null) delete stu.marks[String(aid)]; else stu.marks[String(aid)]=nv;
+  ttRender();
+  ttQueueSave(aid,sid,nv);
+}
+
+/* الرصد يُرسل فوراً، وإعادةُ الحساب تؤجَّل نصف ثانية بعد آخر نقرة:
+   المعلّم يرصد ثلاثين طالباً متتابعين، فلا يُعاد جلب الدفتر ثلاثين مرة.
+   الحساب يبقى في الخادم وحده حتى لا تختلف نسختان من المعادلة. */
+function ttQueueSave(aid,sid,val){
+  _ttPending++;
+  api('/web/api/tt/mark',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({asmt_id:aid,student_id:sid,value:val})}).then(function(r){
+    _ttPending--;
+    if(r&&!r.ok&&r.msg) alert(r.msg);
+  });
+  clearTimeout(_ttSaveTimer);
+  _ttSaveTimer=setTimeout(function(){ if(_ttPending===0) ttLoad(); else ttQueueSave2(); },600);
+}
+function ttQueueSave2(){ clearTimeout(_ttSaveTimer); _ttSaveTimer=setTimeout(function(){
+  if(_ttPending===0) ttLoad(); else ttQueueSave2(); },300); }
+
+async function ttAddAssessment(cid){
+  var c=_ttData.components.filter(function(x){return x.id===cid;})[0];
+  var body={comp_id:cid};
+  if(c.grade_mode==='score'){
+    var b=await api('/web/api/tt/component/budget?comp_id='+cid);
+    if(!b||!b.ok) return;
+    if(b.remaining<=0){ alert('اكتملت الدرجات\n\nلا توجد درجات متبقية في مكوّن «'+c.name+'».'); return; }
+    var raw=prompt('درجة التقييم الجديد — المتبقي للمكوّن '+ttNum(b.remaining)+':',ttNum(b.remaining));
+    if(raw===null) return;
+    var v=parseFloat(raw);
+    if(isNaN(v)||v<=0){alert('أدخل درجةً صحيحة');return;}
+    body.max_score=v;
+  }
+  var t=prompt('اسم التقييم (اتركه فارغاً للترقيم التلقائي):','');
+  if(t===null) return;
+  if(t.trim()) body.title=t.trim();
+  var r=await api('/web/api/tt/assessment/add',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(!ttOk(r,'الإضافة')) return;
+  ttLoad();
+}
+
+function ttCompMenu(cid){
+  var c=_ttData.components.filter(function(x){return x.id===cid;})[0];
+  var mode=c.grade_mode==='bool'?'صح / خطأ':'درجات';
+  var cat=c.category==='exam'?'تقويمات شفهية وتحريرية':'المهام الأدائية والمشاركة';
+  showCoModal('مكوّن: '+ttEsc(c.name),
+    '<div style="display:grid;gap:8px;font-size:14px">'+
+    '<div>الدرجة: <b>'+ttNum(c.max_score)+'</b> · التصحيح: <b>'+mode+'</b></div>'+
+    '<div>التصنيف: <b>'+cat+'</b> · التقييمات: <b>'+(c.assessments||[]).length+'</b></div>'+
+    '<hr style="border:none;border-top:1px solid #E2E8F0;margin:6px 0">'+
+    '<button class="btn bp1" onclick="ttAddAssessment('+cid+');document.getElementById(\'co-modal\').remove()">+ إضافة تقييم</button>'+
+    '<button class="btn bp2" onclick="ttDistribution();document.getElementById(\'co-modal\').remove()">تعديل توزيع الدرجات</button>'+
+    '<button class="btn" style="background:#FEE2E2;color:#991B1B" onclick="ttDeleteComp('+cid+')">حذف المكوّن وكل تقييماته</button>'+
+    '</div>','#1565C0','#0D47A1');
+}
+
+function ttAsmtMenu(aid,cid){
+  var c=_ttData.components.filter(function(x){return x.id===cid;})[0];
+  var a=(c.assessments||[]).filter(function(x){return x.id===aid;})[0];
+  var extra=c.grade_mode==='score'?(' · من '+ttNum(a.max_score)):'';
+  var canUndo=((_ttData.undoable||[]).indexOf(aid)>=0);
+  showCoModal(ttEsc(a.title)+extra,
+    '<div style="display:grid;gap:8px">'+
+    '<button class="btn bp1" onclick="ttAwardFull('+aid+')">منح الجميع الدرجة الكاملة</button>'+
+    (canUndo?('<button class="btn" style="background:#FEF3C7;color:#92400E" '+
+      'onclick="ttUndoAward('+aid+')"><i class="fas fa-rotate-left"></i> '+
+      'التراجع عن منح الجميع — إعادة ما كان قبله</button>'):'')+
+    '<button class="btn bp2" onclick="ttWheel()">🎯 عجلة الأسماء</button>'+
+    '<button class="btn" style="background:#FEE2E2;color:#991B1B" onclick="ttDeleteAsmt('+aid+')">حذف هذا التقييم</button>'+
+    '</div>','#1565C0','#0D47A1');
+}
+
+async function ttAwardFull(aid){
+  if(!confirm('منح جميع طلاب الفصل الدرجة الكاملة في هذا التقييم؟\n\n'+
+              'ما رُصد سابقاً سيُستبدل — ويمكنك التراجع بعدها من القائمة نفسها.')) return;
+  var r=await api('/web/api/tt/award-full',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({asmt_id:aid})});
+  var m=document.getElementById('co-modal'); if(m)m.remove();
+  if(!ttOk(r,'التنفيذ')) return;
+  if(r.overwritten)
+    alert('مُنح '+r.count+' طالباً الدرجة الكاملة، وتغيّر رصدُ '+r.overwritten+' منهم.\n\n'+
+          'للتراجع: اضغط رأس العمود ثم «التراجع عن منح الجميع».');
+  ttLoad();
+}
+
+async function ttUndoAward(aid){
+  var r=await api('/web/api/tt/undo-award',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({asmt_id:aid})});
+  var m=document.getElementById('co-modal'); if(m)m.remove();
+  if(!ttOk(r,'التراجع')) return;
+  ttLoad();
+}
+
+/* ── تصفير أرقام الدفتر ── */
+function ttResetDialog(){
+  if(!_ttData){alert('اختر مادةً أولاً');return;}
+  showCoModal('تصفير أرقام الدفتر',
+    '<div class="ab aw">يمسح <b>الأرقام</b> وحدها: الرصد ودرجات الحضور اليدوية '+
+    'والمخالفات. أما المكوّنات والتقييمات فتبقى كما هي.<br>'+
+    '<b>لا يمكن التراجع عن هذه العملية.</b></div>'+
+    '<div class="fg"><label class="fl">النطاق</label><select id="ttr-scope">'+
+    '<option value="period">الفترة الحالية فقط (الفترة '+_ttData.period+')</option>'+
+    '<option value="all">كل فترات هذه المادة</option></select></div>'+
+    '<div class="fg"><label class="fl">أدخل كلمة مرورك للتأكيد</label>'+
+    '<input type="password" id="ttr-pwd" autocomplete="current-password" '+
+    'placeholder="كلمة مرور حسابك"></div>'+
+    '<button class="btn" style="width:100%;background:#DC2626;color:#fff" '+
+    'onclick="ttDoReset()">تصفير الأرقام</button>',
+    '#B45309','#92400E');
+}
+
+async function ttDoReset(){
+  var pwd=document.getElementById('ttr-pwd').value||'';
+  if(!pwd){alert('أدخل كلمة المرور');return;}
+  var scope=document.getElementById('ttr-scope').value;
+  if(!confirm('تأكيد أخير: تصفير أرقام '+
+     (scope==='all'?'كل الفترات':'الفترة '+_ttData.period)+' في مادة «'+
+     _ttData.subject.subject+'»؟')) return;
+  var r=await api('/web/api/tt/reset',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({subject_id:_ttData.subject.id,period:_ttData.period,
+                         scope:scope,password:pwd})});
+  if(!ttOk(r,'التصفير')) return;
+  var m=document.getElementById('co-modal'); if(m)m.remove();
+  alert('تم التصفير — مُسح رصد '+r.marks+' خلية.');
+  ttLoad();
+}
+
+/* ── نسخ التوزيع إلى مواد أخرى ── */
+function ttCopyDist(){
+  var d=_ttData;
+  api('/web/api/tt/subjects').then(function(s){
+    if(!s||!s.ok) return;
+    var others=(s.subjects||[]).filter(function(x){return x.id!==d.subject.id;});
+    if(!others.length){
+      alert('لا توجد مواد أخرى لديك لنسخ التوزيع إليها.'); return;
+    }
+    var h='<div class="tt-step">يُنسخ توزيع «'+ttEsc(d.subject.subject)+
+          '» للفترة '+d.period+' إلى المواد المختارة، في الفترة نفسها.</div>';
+    others.forEach(function(o){
+      h+='<label class="tt-chk" style="display:flex;width:100%"><input type="checkbox" class="ttc-t" '+
+         'value="'+o.id+'" onchange="this.parentNode.classList.toggle(\'on\',this.checked)">'+
+         ttEsc(o.subject)+' — '+ttEsc(o.class_name)+'</label>';
+    });
+    h+='<label class="tt-chk on" style="display:flex;width:100%;margin-top:10px">'+
+       '<input type="checkbox" id="ttc-asm" checked onchange="this.parentNode.classList.toggle(\'on\',this.checked)">'+
+       'انسخ أعمدة التقييمات أيضاً (فارغةً بلا درجات)</label>'+
+       '<label class="tt-chk" style="display:flex;width:100%">'+
+       '<input type="checkbox" id="ttc-opt" onchange="this.parentNode.classList.toggle(\'on\',this.checked)">'+
+       'انسخ سقفَي درجة الحضور والسلوك أيضاً (السقوف وحدها، لا الرصد)</label>'+
+       '<label class="tt-chk" style="display:flex;width:100%">'+
+       '<input type="checkbox" id="ttc-rep" onchange="this.parentNode.classList.toggle(\'on\',this.checked)">'+
+       'استبدل حتى لو كانت المادة فيها درجات مرصودة (تُحذف)</label>'+
+       '<div class="tt-step">المادة الفارغة يُستبدل توزيعها دائماً — لا شيء فيها ليُفقد. '+
+       'وما رُصدت فيه درجات يُتخطّى إلا بتأشير الخيار أعلاه.</div>'+
+       '<button class="btn bp1" style="width:100%" onclick="ttDoCopyDist()">نسخ التوزيع</button>';
+    showCoModal('نسخ التوزيع إلى مواد أخرى',h,'#1565C0','#0D47A1');
+  });
+}
+
+async function ttDoCopyDist(){
+  var targets=[].slice.call(document.querySelectorAll('.ttc-t:checked'))
+                 .map(function(x){return parseInt(x.value);});
+  if(!targets.length){alert('اختر مادةً واحدة على الأقل');return;}
+  var rep=document.getElementById('ttc-rep').checked;
+  if(rep && !confirm('سيُحذف ما رُصد من درجات في المواد المختارة لهذه الفترة. متابعة؟')) return;
+  var r=await api('/web/api/tt/components/copy',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({from_subject_id:_ttData.subject.id,period:_ttData.period,
+      targets:targets, with_assessments:document.getElementById('ttc-asm').checked,
+      with_options:document.getElementById('ttc-opt').checked,
+      replace:rep})});
+  if(!ttOk(r,'النسخ')) return;
+  var m=document.getElementById('co-modal'); if(m)m.remove();
+  alert('نُسخ '+r.components+' مكوّناً'+
+        (r.assessments?(' و'+r.assessments+' عمود تقييم'):'')+
+        ' إلى '+r.copied+' مادة.'+
+        (r.skipped?('\n\nوتُخطّيت '+r.skipped+' مادة لأن فيها درجاتٍ مرصودة — '+
+                    'أشِّر «استبدل حتى لو…» لتشملها.'):''));
+  ttLoad();
+}
+
+async function ttDeleteAsmt(aid){
+  if(!confirm('حذف التقييم وكل الدرجات المرصودة فيه؟')) return;
+  await api('/web/api/tt/assessment/delete',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({asmt_id:aid})});
+  var m=document.getElementById('co-modal'); if(m)m.remove();
+  ttLoad();
+}
+
+async function ttDeleteComp(cid){
+  if(!confirm('حذف المكوّن وكل تقييماته ودرجاته؟ لا يمكن التراجع.')) return;
+  await api('/web/api/tt/component/delete',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({comp_id:cid})});
+  var m=document.getElementById('co-modal'); if(m)m.remove();
+  ttLoad();
+}
+
+/* ── توزيع الدرجات ── */
+function ttDistribution(){
+  if(!_ttData){alert('اختر مادةً أولاً');return;}
+  var comps=_ttData.components||[];
+  var tot=0; comps.forEach(function(c){tot+=parseFloat(c.max_score)||0;});
+  var h='<div style="font-size:13px;color:#64748B;margin-bottom:10px">'+
+        'مجموع المكوّنات الحالي: <b>'+ttNum(tot)+'</b> درجة</div>';
+  comps.forEach(function(c){
+    var pill=c.category==='exam'?'<span class="tt-pill tt-pe">تقويمات</span>':'<span class="tt-pill tt-pp">مهام أدائية</span>';
+    var mode=c.grade_mode==='bool'?'صح/خطأ':'درجات';
+    h+='<div class="tt-cmp"><div><b>'+ttEsc(c.name)+'</b> '+pill+
+       '<div style="font-size:12px;color:#64748B;margin-top:3px">'+ttNum(c.max_score)+' درجة · '+mode+
+       ' · موزَّع '+ttNum(c.allocated)+'</div></div>'+
+       '<div style="display:flex;gap:6px">'+
+       '<button class="btn bsm bp2" onclick="ttEditComp('+c.id+')">تعديل</button>'+
+       '<button class="btn bsm" style="background:#FEE2E2;color:#991B1B" onclick="ttDeleteComp('+c.id+')">حذف</button>'+
+       '</div></div>';
+  });
+  h+='<button class="btn bp1" style="width:100%;margin-top:6px" onclick="ttEditComp(0)">+ إضافة مكوّن جديد</button>'+
+     '<button class="btn bp2" style="width:100%;margin-top:8px" onclick="ttCopyDist()">'+
+     '<i class="fas fa-copy"></i> نسخ هذا التوزيع إلى موادي الأخرى</button>';
+  showCoModal('توزيع الدرجات','<div id="tt-dist">'+h+'</div>','#1565C0','#0D47A1');
+}
+
+function ttEditComp(cid){
+  var c=cid?_ttData.components.filter(function(x){return x.id===cid;})[0]:null;
+  var h='<div class="fg"><label class="fl">اسم المكوّن</label>'+
+        '<input type="text" id="ttc-name" value="'+(c?ttEsc(c.name):'')+'" placeholder="مثال: واجبات"></div>'+
+        '<div class="fg"><label class="fl">مجموع درجات المكوّن</label>'+
+        '<input type="number" id="ttc-max" min="1" step="0.5" value="'+(c?ttNum(c.max_score):10)+'"></div>'+
+        '<div class="fg"><label class="fl">تصنيف التقييم</label><select id="ttc-cat">'+
+        '<option value="perf"'+(c&&c.category==='perf'?' selected':'')+'>المهام الأدائية والمشاركة</option>'+
+        '<option value="exam"'+(c&&c.category==='exam'?' selected':'')+'>تقويمات شفهية وتحريرية</option>'+
+        '</select></div>'+
+        '<div class="fg"><label class="fl">طريقة التصحيح</label><select id="ttc-mode">'+
+        '<option value="bool"'+(c&&c.grade_mode==='bool'?' selected':'')+'>صح / خطأ — عدد التقييمات مفتوح</option>'+
+        '<option value="score"'+(c&&c.grade_mode==='score'?' selected':'')+'>درجات — كل تقييم يقتطع من درجة المكوّن</option>'+
+        '</select></div>'+
+        '<div style="font-size:12px;color:#64748B;margin:8px 0 14px">'+
+        'في «صح/خطأ» تُحسب درجة الطالب نسبةَ ما أصابه من التقييمات مضروبةً في درجة المكوّن. '+
+        'وفي «درجات» يُجمع ما رُصد له، ولا يُسمح بتوزيع أكثر من درجة المكوّن.</div>'+
+        '<button class="btn bp1" style="width:100%" onclick="ttSaveComp('+(cid||0)+')">حفظ</button>';
+  showCoModal(cid?'تعديل مكوّن':'إضافة مكوّن',h,'#1565C0','#0D47A1');
+}
+
+async function ttSaveComp(cid){
+  var body={subject_id:_ttData.subject.id,period:_ttData.period,
+            name:document.getElementById('ttc-name').value,
+            max_score:document.getElementById('ttc-max').value,
+            category:document.getElementById('ttc-cat').value,
+            grade_mode:document.getElementById('ttc-mode').value};
+  if(cid) body.comp_id=cid;
+  var r=await api('/web/api/tt/component/save',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(!ttOk(r,'الحفظ')) return;
+  var m=document.getElementById('co-modal'); if(m)m.remove();
+  await ttLoad(); ttDistribution();
+}
+
+/* ── إسناد مادة وحذفها ── */
+function ttNewSubject(){
+  var opts='';
+  _ttClasses.forEach(function(c){opts+='<option value="'+ttEsc(c.id)+'">'+ttEsc(c.name)+'</option>';});
+  showCoModal('إسناد مادة',
+    '<div class="fg"><label class="fl">الفصل</label><select id="tts-cls">'+opts+'</select></div>'+
+    '<div class="fg"><label class="fl">المادة</label>'+
+    '<input type="text" id="tts-name" placeholder="مثال: لغتي الخالدة"></div>'+
+    '<div style="font-size:12px;color:#64748B;margin:8px 0 14px">'+
+    'سيُنشأ توزيعٌ ابتدائي (٦٠ درجة لأعمال السنة) يمكنك تعديله بعد الإنشاء.</div>'+
+    '<button class="btn bp1" style="width:100%" onclick="ttCreateSubject()">إنشاء</button>',
+    '#1565C0','#0D47A1');
+}
+
+async function ttCreateSubject(){
+  var r=await api('/web/api/tt/subject/create',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({class_id:document.getElementById('tts-cls').value,
+                           subject:document.getElementById('tts-name').value})});
+  if(!ttOk(r,'الإنشاء')) return;
+  var m=document.getElementById('co-modal'); if(m)m.remove();
+  await ttInit();
+  var sel=document.getElementById('tt-subj'); sel.value=r.id; ttLoad();
+}
+
+async function ttDeleteSubject(){
+  var sid=document.getElementById('tt-subj').value;
+  if(!sid){alert('اختر مادةً أولاً');return;}
+  if(!confirm('حذف المادة وكل مكوّناتها وتقييماتها ودرجاتها؟ لا يمكن التراجع.')) return;
+  await api('/web/api/tt/subject/delete',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({subject_id:parseInt(sid)})});
+  document.getElementById('tt-subj').value='';
+  await ttInit(); ttLoad();
+}
+
+/* ── ملف الطالب ── */
+function ttStudent(sid){
+  var s=_ttData.students.filter(function(x){return x.id===sid;})[0];
+  if(!s) return;
+  var h='<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px">'+
+        '<div class="sc" style="flex:1;min-width:120px"><div class="v">'+(s.total==null?'—':s.total)+'</div><div class="l">الدرجة من ١٠٠</div></div>'+
+        '<div class="sc" style="flex:1;min-width:120px"><div class="v">'+(s.attendance==null?'—':s.attendance+'٪')+'</div><div class="l">نسبة الحضور</div></div>'+
+        '</div><div class="tw"><table><thead><tr><th>المكوّن</th><th>النتيجة</th><th>من</th></tr></thead><tbody>';
+  (_ttData.components||[]).forEach(function(c){
+    var v=s.components[String(c.id)];
+    h+='<tr><td style="text-align:right">'+ttEsc(c.name)+'</td><td>'+(v==null?'لم يُرصد':ttNum(v))+
+       '</td><td>'+ttNum(c.max_score)+'</td></tr>';
+  });
+  h+='</tbody></table></div>';
+  showCoModal('ملف الطالب — '+ttEsc(s.name),h,'#1565C0','#0D47A1');
+}
+
+/* ── الحضور والسلوك ── */
+function ttOptions(){
+  if(!_ttData){alert('اختر مادةً أولاً');return;}
+  var d=_ttData;
+  showCoModal('الحضور والسلوك',
+    '<div class="fg"><label class="fl">مصدر درجة الحضور</label><select id="tto-mode">'+
+    '<option value="system"'+(d.att_mode==='system'?' selected':'')+'>من النظام — تُحسب من سجل غياب المدرسة</option>'+
+    '<option value="manual"'+(d.att_mode==='manual'?' selected':'')+'>يدوي — أرصدها بنفسي</option>'+
+    '</select></div>'+
+    '<div class="fg"><label class="fl">درجة الحضور (صفر = بلا درجة، تُعرض نسبةً فقط)</label>'+
+    '<input type="number" id="tto-amax" min="0" step="0.5" value="'+ttNum(d.att_max)+'"></div>'+
+    '<div class="fg"><label class="fl">درجة السلوك (صفر = بلا درجة)</label>'+
+    '<input type="number" id="tto-bmax" min="0" step="0.5" value="'+ttNum(d.beh_max)+'"></div>'+
+    '<div class="tt-step">في الوضع الآلي تُحسب درجة الحضور من نسبة حضور الطالب في سجل المدرسة. '+
+    'ودرجة السلوك تبدأ كاملةً للجميع ويُحسم منها بكل مخالفة تُسجَّل.</div>'+
+    '<button class="btn bp1" style="width:100%" onclick="ttSaveOptions()">حفظ</button>',
+    '#1565C0','#0D47A1');
+}
+
+async function ttSaveOptions(){
+  var r=await api('/web/api/tt/subject/options',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({subject_id:_ttData.subject.id,
+      attendance_mode:document.getElementById('tto-mode').value,
+      attendance_max:document.getElementById('tto-amax').value,
+      behavior_max:document.getElementById('tto-bmax').value})});
+  if(!ttOk(r,'الحفظ')) return;
+  var m=document.getElementById('co-modal'); if(m)m.remove();
+  ttLoad();
+}
+
+function ttAttCell(sid){
+  var s=_ttData.students.filter(function(x){return x.id===sid;})[0];
+  var raw=prompt('درجة الحضور من '+ttNum(_ttData.att_max)+' — '+s.name+
+                 '\n(نسبة حضوره في سجل المدرسة: '+(s.attendance==null?'—':s.attendance+'٪')+')'+
+                 '\nاتركه فارغاً لمسح الرصد:', s.att_score==null?'':s.att_score);
+  if(raw===null) return;
+  raw=raw.trim();
+  var v=(raw==='')?null:parseFloat(raw);
+  if(raw!=='' && isNaN(v)){alert('أدخل رقماً صحيحاً');return;}
+  api('/web/api/tt/attendance-mark',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({subject_id:_ttData.subject.id,period:_ttData.period,
+                         student_id:sid,value:v})}).then(function(r){
+    if(!ttOk(r,'الرصد')) return;
+    ttLoad();
+  });
+}
+
+function ttBehavior(sid){
+  var s=_ttData.students.filter(function(x){return x.id===sid;})[0];
+  api('/web/api/tt/behavior/list?subject_id='+_ttData.subject.id+
+      '&student_id='+encodeURIComponent(sid)+'&period='+_ttData.period).then(function(d){
+    if(!d||!d.ok) return;
+    var rem=(s.beh_score==null)?0:s.beh_score;      // المتبقي = الدرجة الحالية
+    var h='<div class="tt-step">درجة السلوك الحالية: <b>'+ttNum(rem)+
+          '</b> من '+ttNum(_ttData.beh_max)+' — المتبقي للحسم <b>'+ttNum(rem)+'</b></div>';
+    if(rem<=0)
+      h+='<div class="ab aw" style="margin-bottom:10px">نفدت درجة السلوك. '+
+         'المخالفة تُسجَّل في السجل بلا حسم إضافي.</div>';
+    h+='<div style="display:grid;gap:6px">';
+    (d.kinds||[]).forEach(function(k){
+      var eff=Math.min(k.deduct,rem);               // الحسم الفعلي بعد التقييد
+      h+='<button class="btn bp2" style="justify-content:space-between" '+
+         'onclick="ttAddBehavior(\''+sid+'\',\''+k.kind+'\','+k.deduct+')">'+
+         '<span><i class="fas '+k.icon+'"></i> '+ttEsc(k.kind)+'</span>'+
+         '<span style="color:'+(eff<k.deduct?'#94A3B8':'#B91C1C')+'">−'+ttNum(eff)+
+         (eff<k.deduct?' <span style="font-size:10px">(من −'+k.deduct+')</span>':'')+
+         '</span></button>';
+    });
+    h+='</div>';
+    if((d.rows||[]).length){
+      h+='<div class="st" style="margin:14px 0 6px">المخالفات المسجَّلة</div><div class="tw"><table>'+
+         '<thead><tr><th>المخالفة</th><th>الحسم</th><th>التاريخ</th><th></th></tr></thead><tbody>';
+      d.rows.forEach(function(r){
+        h+='<tr><td style="text-align:right">'+ttEsc(r.kind)+
+           (r.note?'<div style="font-size:11px;color:#64748B">'+ttEsc(r.note)+'</div>':'')+'</td>'+
+           '<td>−'+ttNum(r.deduct)+'</td><td style="font-size:11px">'+ttEsc((r.created_at||'').slice(0,10))+'</td>'+
+           '<td><button class="btn bsm" style="background:#FEE2E2;color:#991B1B" '+
+           'onclick="ttDelBehavior('+r.id+',\''+sid+'\')">حذف</button></td></tr>';
+      });
+      h+='</tbody></table></div>';
+    }else{
+      h+='<div class="tt-step" style="margin-top:12px">لا توجد مخالفات مسجَّلة.</div>';
+    }
+    showCoModal('المخالفات السلوكية — '+ttEsc(s.name),h,'#EA580C','#9A3412');
+  });
+}
+
+async function ttAddBehavior(sid,kind,deduct){
+  var note=prompt('ملاحظة (اختياري) — '+kind+':','');
+  if(note===null) return;
+  var r=await api('/web/api/tt/behavior/add',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({subject_id:_ttData.subject.id,period:_ttData.period,
+                         student_id:sid,kind:kind,note:note,deduct:deduct})});
+  if(!ttOk(r,'التسجيل')) return;
+  if(r.capped)
+    alert('سُجّلت المخالفة، وحُسم '+ttNum(r.deduct)+' بدل '+ttNum(r.requested)+
+          '.\n\nدرجة السلوك ('+ttNum(r.max)+') لا يُحسم منها أكثر من قيمتها.');
+  await ttLoad(); ttBehavior(sid);
+}
+
+async function ttDelBehavior(bid,sid){
+  await api('/web/api/tt/behavior/delete',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({subject_id:_ttData.subject.id,behavior_id:bid})});
+  await ttLoad(); ttBehavior(sid);
+}
+
+/* ── عجلة الأسماء ── */
+var _ttWheelNames=[], _ttWheelAngle=0, _ttWheelSpinning=false;
+var _TT_PAL=['#EF4444','#F59E0B','#10B981','#3B82F6','#8B5CF6','#EC4899','#14B8A6','#F97316'];
+
+function ttWheel(){
+  if(!_ttData||!_ttData.students.length){alert('اختر مادةً فيها طلاب أولاً');return;}
+  _ttWheelNames=_ttData.students.map(function(s){return s.name;});
+  _ttWheelAngle=0; _ttWheelSpinning=false;
+  var m=document.getElementById('co-modal'); if(m)m.remove();
+  showCoModal('🎯 عجلة الأسماء',
+    '<div style="text-align:center">'+
+    '<div style="position:relative;display:inline-block">'+
+      '<canvas id="tt-wc" width="340" height="340" style="max-width:100%"></canvas>'+
+      '<div style="position:absolute;top:-4px;left:50%;transform:translateX(-50%);width:0;height:0;'+
+      'border-left:12px solid transparent;border-right:12px solid transparent;'+
+      'border-top:24px solid #DC2626;filter:drop-shadow(0 2px 3px rgba(0,0,0,.3))"></div>'+
+    '</div>'+
+    '<div id="tt-wout" style="font-size:22px;font-weight:900;color:#0D47A1;min-height:34px;margin:10px 0">'+
+    'أدر العجلة لاختيار طالب</div>'+
+    '<div style="display:flex;gap:8px">'+
+      '<button class="btn bp1" style="flex:1" id="tt-wbtn" onclick="ttSpin()">أدر العجلة</button>'+
+      '<button class="btn bp2" onclick="ttWheelReset()">إعادة الأسماء</button>'+
+    '</div></div>','#F59E0B','#DC2626');
+  setTimeout(ttDrawWheel,60);
+}
+
+function ttDrawWheel(){
+  var c=document.getElementById('tt-wc'); if(!c) return;
+  var x=c.getContext('2d'), n=_ttWheelNames.length, R=c.width/2;
+  x.clearRect(0,0,c.width,c.height);
+  if(!n){ x.font='16px Tajawal,Arial,sans-serif'; x.fillStyle='#94A3B8'; x.textAlign='center';
+          x.fillText('انتهت الأسماء — اضغط «إعادة الأسماء»',R,R); return; }
+  var step=2*Math.PI/n;
+  for(var i=0;i<n;i++){
+    var a0=_ttWheelAngle+i*step;
+    x.beginPath(); x.moveTo(R,R); x.arc(R,R,R-5,a0,a0+step); x.closePath();
+    x.fillStyle=_TT_PAL[i%_TT_PAL.length]; x.fill();
+    x.strokeStyle='#fff'; x.lineWidth=1.5; x.stroke();
+    x.save(); x.translate(R,R); x.rotate(a0+step/2);
+    x.textAlign='right'; x.fillStyle='#fff';
+    x.font='bold '+(n>20?9:(n>13?11:13))+'px Tajawal,Arial,sans-serif';
+    var nm=_ttWheelNames[i]; if(nm.length>17) nm=nm.slice(0,16)+'…';
+    x.fillText(nm,R-18,4); x.restore();
+  }
+  x.beginPath(); x.arc(R,R,27,0,2*Math.PI); x.fillStyle='#1E293B'; x.fill();
+  x.strokeStyle='#fff'; x.lineWidth=3; x.stroke();
+}
+
+function ttSpin(){
+  if(_ttWheelSpinning||!_ttWheelNames.length) return;
+  _ttWheelSpinning=true;
+  var btn=document.getElementById('tt-wbtn'); if(btn) btn.disabled=true;
+  var n=_ttWheelNames.length, step=2*Math.PI/n;
+  var start=_ttWheelAngle, target=start+(5+Math.random()*3)*2*Math.PI;
+  var t0=performance.now(), dur=3800, done=false;
+
+  function finish(){
+    if(done) return; done=true;
+    _ttWheelAngle=target; ttDrawWheel();
+    _ttWheelSpinning=false; if(btn) btn.disabled=false;
+    // المؤشر أعلى العجلة، أي الزاوية ‎−90°‎ في إحداثيات الرسم
+    var norm=((-Math.PI/2-target)%(2*Math.PI)+2*Math.PI)%(2*Math.PI);
+    var idx=Math.floor(norm/step)%n;
+    var out=document.getElementById('tt-wout');
+    if(out) out.textContent='🎉 '+_ttWheelNames[idx];
+    _ttWheelNames.splice(idx,1);      // لا يُسأل الطالب مرتين في الحصة نفسها
+    setTimeout(ttDrawWheel,800);
+  }
+
+  function frame(t){
+    if(done) return;
+    var p=Math.min(1,(t-t0)/dur);
+    _ttWheelAngle=start+(target-start)*(1-Math.pow(1-p,3));   // تباطؤ تدريجي
+    ttDrawWheel();
+    if(p<1) requestAnimationFrame(frame); else finish();
+  }
+  requestAnimationFrame(frame);
+  // المتصفح يوقف requestAnimationFrame في التبويب المخفي. بلا هذه الشبكة
+  // تبقى العجلة معلّقةً والزر معطّلاً بلا نتيجة إن غاب الرسم.
+  setTimeout(finish, dur+250);
+}
+
+function ttWheelReset(){
+  if(!_ttData) return;
+  _ttWheelNames=_ttData.students.map(function(s){return s.name;});
+  _ttWheelAngle=0; ttDrawWheel();
+  var out=document.getElementById('tt-wout');
+  if(out) out.textContent='أُعيدت الأسماء ('+_ttWheelNames.length+')';
+}
+
+/* الورقة تُبنى في الخادم لا في المتصفح: الترويسة والشعار واسم المدير
+   تُقرأ من إعدادات المدرسة، وهي غير متاحة لجافاسكربت اللوحة. */
+function ttPrint(){
+  if(!_ttData){alert('اختر مادةً أولاً');return;}
+  window.open('/web/api/tt/print?subject_id='+_ttData.subject.id+
+              '&period='+_ttData.period,'_blank');
+}
+
 /* ── TEACHER REFERRALS (تحويل طالب) ── */
 async function loadRefStudents(){
   var d=await api('/web/api/students');if(!d||!d.ok)return;
@@ -7291,6 +8269,61 @@ async function analyzeStudent(forcedSid){
   } else {
       document.getElementById('an-pts-section').style.display = 'none';
   }
+
+  ttLoadStudentGradebook(sid);
+}
+
+/* ── دفتر المتابعة داخل صفحة تحليل الطالب ──
+   يعبر حدود المعلّم: هذه صفحة الطالب لا صفحة المادة، فتجمع مواده كلها. */
+async function ttLoadStudentGradebook(sid){
+  var host=document.getElementById('an-tt-section');
+  if(!host){
+    host=document.createElement('div');
+    host.id='an-tt-section';
+    host.className='section';
+    host.style.marginTop='20px';
+    document.getElementById('an-result').appendChild(host);
+  }
+  host.innerHTML='<div class="st">دفتر المتابعة</div><div class="loading">⏳</div>';
+  var d=await api('/web/api/tt/student-across?student_id='+encodeURIComponent(sid));
+  if(!d||!d.ok||!(d.rows||[]).length){
+    host.innerHTML='<div class="st">دفتر المتابعة</div>'+
+      '<div class="ab ai">لا يوجد رصدٌ لهذا الطالب في دفاتر المعلمين بعد.</div>';
+    return;
+  }
+  var h='<div class="st">دفتر المتابعة — '+d.subjects+' مواد · المعدل '+
+        (d.average==null?'—':d.average)+'</div>'+
+        '<div class="tw"><table><thead><tr><th>المادة</th><th>المعلم</th><th>الفترة</th>'+
+        '<th>الدرجة</th><th>متوسط الفصل</th><th>التصنيف</th><th>الحضور</th>'+
+        '<th>مخالفات</th></tr></thead><tbody>';
+  (d.rows||[]).forEach(function(r){
+    h+='<tr><td style="text-align:right">'+ttEsc(r.subject)+'</td>'+
+       '<td style="font-size:12px">'+ttEsc(r.teacher||'—')+'</td>'+
+       '<td>'+r.period+'</td>'+
+       '<td><b>'+(r.total==null?'—':r.total)+'</b></td>'+
+       '<td style="color:#64748B">'+(r.class_avg==null?'—':r.class_avg)+'</td>'+
+       '<td><span class="tt-tier" style="background:'+r.tier_bg+';color:'+r.tier_color+'">'+
+       ttEsc(r.tier)+'</span></td>'+
+       '<td>'+(r.attendance==null?'—':r.attendance+'٪')+'</td>'+
+       '<td>'+(r.behavior||0)+'</td></tr>';
+  });
+  h+='</tbody></table></div>';
+
+  var flags=[], acts=[];
+  (d.rows||[]).forEach(function(r){
+    (r.flags||[]).forEach(function(f){flags.push(r.subject+': '+f);});
+    (r.actions||[]).forEach(function(a){acts.push(a);});
+  });
+  acts=acts.filter(function(v,i,s){return s.indexOf(v)===i;});
+  if(flags.length){
+    h+='<div class="st" style="margin:14px 0 8px">ما لوحظ</div>'+
+       flags.map(function(f){return '<span class="tt-flag">'+ttEsc(f)+'</span>';}).join('');
+  }
+  if(acts.length){
+    h+='<div class="st" style="margin:14px 0 8px">المعالجة المقترحة</div>'+
+       acts.map(function(a){return '<span class="tt-act">'+ttEsc(a)+'</span>';}).join('');
+  }
+  host.innerHTML=h;
 }
 
 function renderStudentCharts(data){
@@ -11509,6 +12542,61 @@ async def web_parent_call_stats(request: Request, date_from: str = None,
     return JSONResponse({"ok": True, "count": len(rows), "rows": rows})
 
 
+def _portal_gradebook_card(student_id: str) -> str:
+    """
+    بطاقة دفتر المتابعة في بوابة ولي الأمر الحيّة.
+
+    تُعرض الدرجة ومتوسط الفصل والمستوى والملاحظات. **ولا تُعرض المعالجة
+    المقترحة**: تلك اقتراحاتٌ للمعلّم («تحويل للموجّه»، «عقد سلوكي») لم
+    تقرّرها المدرسة، وعرضُها على الوالد يجعلها وعداً لم يُقطع.
+
+    تُخفى كلها بـ portal_show_gradebook=false في config.json.
+    """
+    try:
+        if not load_config().get("portal_show_gradebook", True):
+            return ""
+        data = _tt.student_across_subjects(str(student_id))
+    except Exception:
+        return ""
+    if not data.get("ok") or not data.get("rows"):
+        return ""
+
+    rows = ""
+    for r in data["rows"]:
+        tot = "—" if r["total"] is None else r["total"]
+        avg = "—" if r["class_avg"] is None else r["class_avg"]
+        rows += (
+            '<div class="absence-item">'
+            '<span><b>%s</b> <span style="font-size:11px;opacity:.6">ف%s</span></span>'
+            '<span style="display:flex;align-items:center;gap:8px">'
+            '<span style="font-size:11px;color:#64748B">الفصل %s</span>'
+            '<span style="background:%s;color:%s;padding:2px 8px;border-radius:9px;'
+            'font-size:11px;font-weight:700">%s</span>'
+            '<b style="font-size:15px">%s</b></span></div>'
+            % (r["subject"], r["period"], avg,
+               r["tier_bg"], r["tier_color"], r["tier"], tot))
+
+    notes, seen = "", set()
+    for r in data["rows"]:
+        for f in r.get("flags", []):
+            if (r["subject"], f) in seen:
+                continue
+            seen.add((r["subject"], f))
+            notes += ('<div style="font-size:12px;background:#FFFBEB;color:#92400E;'
+                      'border-right:3px solid #F59E0B;padding:6px 9px;border-radius:5px;'
+                      'margin:5px 0"><b>%s:</b> %s</div>' % (r["subject"], f))
+
+    avg_txt = "" if data.get("average") is None else \
+        ' — المعدل العام %s' % data["average"]
+    return (
+        '<div class="section-title"><i class="fas fa-book-open" '
+        'style="color:#0891B2"></i> الدرجات ومتابعة المعلمين</div>'
+        '<div class="card" style="padding:10px">'
+        '<p style="font-size:12px;opacity:.65;margin:0 0 8px;text-align:center">'
+        'درجات أعمال السنة كما رصدها المعلمون حتى اليوم%s — وهي غير نهائية.</p>'
+        '%s%s</div>' % (avg_txt, rows, notes))
+
+
 @router.get("/p/{token}", response_class=HTMLResponse)
 async def web_parent_portal(token: str):
     from database import (get_student_id_by_portal_token, get_student_total_points,
@@ -11523,7 +12611,10 @@ async def web_parent_portal(token: str):
     stories = get_active_stories()
     cfg = load_config()
     school = cfg.get("school_name", "مدرسة درب")
-    
+
+    # دفتر المتابعة — الدرجات وحدها دون المعالجة المقترحة
+    gradebook_html = _portal_gradebook_card(student_id)
+
     # بناء قسم قصص المدرسة (Carousel)
     stories_html = ""
     if stories:
@@ -11686,6 +12777,8 @@ async def web_parent_portal(token: str):
         </div>
 
         {stories_html}
+
+        {gradebook_html}
 
         <div class="section-title"><i class="fas fa-history" style="color: var(--pr)"></i> آخر المسجلات</div>
         <div class="card" style="padding: 10px;">
