@@ -11,7 +11,8 @@ from constants import (DB_PATH, DATA_DIR, HOST, PORT, TZ_OFFSET,
                        STATIC_DOMAIN, BASE_DIR, BACKUP_DIR,
                        STUDENTS_JSON, TEACHERS_JSON, CONFIG_JSON,
                        now_riyadh_date, CURRENT_USER, ROLES, ROLE_TABS,
-                       APP_VERSION, INBOX_ATTACHMENTS_DIR, SCHOOL_REPORTS_DIR)
+                       APP_VERSION, INBOX_ATTACHMENTS_DIR, SCHOOL_REPORTS_DIR,
+                       monitor_allowed, strip_monitor_tabs)
 from config_manager import (load_config, save_config, get_terms,
                              logo_img_tag_from_config, render_message,
                              invalidate_config_cache)
@@ -192,7 +193,8 @@ async def web_login(req: Request):
             return JSONResponse({"ok": False, "msg": "اسم المستخدم أو كلمة المرور غير صحيحة"})
         _LOGIN_FAILS.pop(key, None)
         token        = _create_token(user["username"], user["role"], user.get("full_name", ""))
-        allowed_tabs = get_user_allowed_tabs(user["username"])
+        allowed_tabs = strip_monitor_tabs(user["role"],
+                                          get_user_allowed_tabs(user["username"]))
         resp  = JSONResponse({"ok": True, "role": user["role"],
                                "name": user.get("full_name") or user["username"],
                                "allowed_tabs": allowed_tabs})
@@ -215,7 +217,9 @@ async def web_dashboard(request: Request):
     if not user:
         from fastapi.responses import RedirectResponse
         return RedirectResponse("/web/login")
-    allowed = get_user_allowed_tabs(user["sub"])
+    # يُسقط تبويبات المراقبة للأدوار الممنوعة ولو كانت محفوظةً في
+    # صلاحيات المستخدم من قبل — الدمج في get_user_allowed_tabs يُبقيها.
+    allowed = strip_monitor_tabs(user["role"], get_user_allowed_tabs(user["sub"]))
     html    = _web_dashboard_html(user["sub"], user["role"], allowed)
     return HTMLResponse(
         content=html,
@@ -233,6 +237,8 @@ async def web_dashboard(request: Request):
 async def web_dashboard_data(request: Request, date: str = None):
     user = _get_current_user(request)
     if not user: return JSONResponse({"error": "غير مصرح"}, status_code=401)
+    if not monitor_allowed(user.get("role")):
+        return JSONResponse({"ok": False, "msg": "غير مصرح — بيانات المدرسة الشاملة"}, status_code=403)
     try:
         d       = date or now_riyadh_date()
         metrics = compute_today_metrics(d)
@@ -282,6 +288,8 @@ async def api_sync_info(request: Request):
 async def api_analytics_dashboard(request: Request, date: str = None):
     user = _get_current_user(request)
     if not user: return JSONResponse({"ok": False, "msg": "Unauthenticated"}, status_code=401)
+    if not monitor_allowed(user.get("role")):
+        return JSONResponse({"ok": False, "msg": "غير مصرح — بيانات المدرسة الشاملة"}, status_code=403)
     try:
         d = date or now_riyadh_date()
         metrics = compute_today_metrics(d)
@@ -1580,6 +1588,8 @@ async def api_monitor(request: Request, date: str = ""):
     user = _get_current_user(request)
     if not user:
         return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=401)
+    if not monitor_allowed(user.get("role")):
+        return JSONResponse({"ok": False, "msg": "غير مصرح — بيانات المدرسة الشاملة"}, status_code=403)
     try:
         from monitor_service import build_snapshot
         snap = build_snapshot(date or "")
@@ -1847,6 +1857,61 @@ async def api_messages_report(request: Request, date_from: str = None,
             message_type=message_type, class_id=class_id, status=status))
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+@router.post("/web/api/admin/reset-admin", response_class=JSONResponse)
+async def api_admin_reset(request: Request):
+    """
+    إعادة تعيين كلمة مدير المدرسة بتذكرة موقَّعة من المزوّد.
+
+    **النقطة الوحيدة في النظام التي لا تتطلّب تسجيل دخول** — ولا يمكن أن
+    تتطلّبه: هي موجودة أصلاً لأن الدخول نفسه هو المعطَّل. فحارسها توقيع
+    Ed25519 بمفتاح المزوّد، وهو أقوى من أي جلسة.
+
+    تصل عبر نفق SSH من خادم المزوّد. والرفض يخرج برسالة واحدة مبهمة
+    مهما كان السبب، فلا تُستعمل النقطة للاستكشاف.
+    """
+    try:
+        import security as _sec
+        from database import update_user_password
+        d = await request.json()
+        ticket = d.get("ticket")
+        sig = d.get("signature")
+
+        good, info = _sec.verify_admin_reset_ticket(ticket, sig)
+        if not good:
+            print(f"[RESET-ADMIN] ⛔ رُفضت تذكرة: {info}")
+            return JSONResponse({"ok": False, "msg": "تذكرة غير مقبولة"},
+                                status_code=403)
+
+        username = str(ticket.get("username") or "admin").strip() or "admin"
+        new_hash = str(ticket.get("password_hash") or "")
+        # التجزئة تُحسب عند المزوّد فلا تعبر كلمةُ المرور الشبكةَ أصلاً
+        if not new_hash.startswith("pbkdf2$"):
+            return JSONResponse({"ok": False, "msg": "تذكرة غير مقبولة"},
+                                status_code=403)
+
+        from database import get_db
+        con = get_db()
+        try:
+            cur = con.cursor()
+            cur.execute("UPDATE users SET password=?, active=1 "
+                        "WHERE username=?", (new_hash, username))
+            changed = cur.rowcount
+            con.commit()
+        finally:
+            con.close()
+        if not changed:
+            return JSONResponse({"ok": False, "msg": "تذكرة غير مقبولة"},
+                                status_code=403)
+
+        _sec.remember_reset_nonce(info)      # لا تُقبل التذكرة مرّتين
+        print(f"[RESET-ADMIN] ✅ أُعيد تعيين كلمة «{username}» بتذكرة موقَّعة")
+        return JSONResponse({"ok": True, "username": username})
+    except Exception as e:
+        print(f"[RESET-ADMIN] خطأ: {e}")
+        return JSONResponse({"ok": False, "msg": "تذكرة غير مقبولة"},
+                            status_code=403)
 
 
 @router.get("/web/api/messages-report/bad-numbers", response_class=JSONResponse)
@@ -3484,6 +3549,22 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
         <div class="fg"><label class="fl">اسم المدرسة</label><input type="text" id="ss-name"></div>
         <div class="fg"><label class="fl">نوع المدرسة</label><select id="ss-gender"><option value="boys">بنين</option><option value="girls">بنات</option></select></div>
         <div class="fg"><label class="fl">عتبة الإشعارات (أيام)</label><input type="number" id="ss-thr" value="5" min="1"></div>
+        <!-- ابتدائية البنات تضمّ أولاداً في الصفوف الأولى ولكلٍّ فصله،
+             لكن نور يُصدّرهم في فصل واحد ولا يُصدّر الجنس. مطفأ
+             افتراضياً: مدرسةٌ خالصة الجنس تشغيلُه يشطر فصولها بلا سبب. -->
+        <div class="fg" style="grid-column:1/-1">
+          <label class="fl" style="display:flex;align-items:center;gap:8px;cursor:pointer">
+            <input type="checkbox" id="ss-splitgen" style="width:16px;height:16px;cursor:pointer">
+            <!-- لا تُستعمل «الطلاب» هنا: وسيط التأنيث يحوّلها إلى
+                 «الطالبات» فتصير الجملة متناقضة في مدرسة بنات -->
+            <span>فصل الأولاد عن البنات في فصول مستقلة عند استيراد كشف نور</span>
+          </label>
+          <div style="font-size:12px;color:var(--mu);margin-top:5px;line-height:1.7">
+            للابتدائيات التي تضمّ أولاداً في الصفوف الأولى. يُستنتج الجنس من الاسم،
+            والفصل الخالص لا يُشطر. الاسم الذي لا يُعرف جنسه يبقى مع جنس المدرسة
+            ويُسجَّل في <code>data/gender_names.json</code> لتصحيحه.
+          </div>
+        </div>
         <div class="fg"><label class="fl">عدد الحصص اليومية</label><input type="number" id="ss-per" value="7" min="1" max="10"></div>
       </div>
       <button class="btn bp1" onclick="saveSchoolSettings()">💾 حفظ</button>
@@ -4484,6 +4565,15 @@ function _wantedTab(){
     var t=new URLSearchParams(location.search).get('tab')||
           (location.hash||'').replace(/^#/,'');
     if(t&&document.getElementById('tab-'+t))return t;
+  }catch(e){}
+  /* كان يسقط على 'dashboard' ثابتاً. ومنذ أن حُجبت «لوحة المراقبة» عن
+     المعلّم صار ذلك يُهبطه على تبويبٍ لا يملكه — شاشةٌ فارغة عند كل
+     دخول. فالسقوط الآن على أول تبويبٍ ظاهرٍ له فعلاً. */
+  try{
+    if(document.getElementById('tab-dashboard') &&
+       document.querySelector('.tab-btn[data-key="dashboard"]')) return 'dashboard';
+    var b=document.querySelector('.tab-btn[data-key]');
+    if(b) return b.getAttribute('data-key');
   }catch(e){}
   return 'dashboard';
 }
@@ -5824,6 +5914,8 @@ async function loadSettings(){
   var d=await api('/web/api/config');if(!d)return;
   if(d.school_name)document.getElementById('ss-name').value=d.school_name;
   if(d.school_gender)document.getElementById('ss-gender').value=d.school_gender;
+  var _sg=document.getElementById('ss-splitgen');
+  if(_sg) _sg.checked = !!d.split_classes_by_gender;
   if(d.alert_absence_threshold)document.getElementById('ss-thr').value=d.alert_absence_threshold;
   if(d.message_template)document.getElementById('ss-abs-tpl').value=d.message_template;
   if(d.tardiness_message_template)document.getElementById('ss-tard-tpl').value=d.tardiness_message_template;
@@ -5844,6 +5936,7 @@ async function saveSchoolSettings(){
   var r=await fetch('/web/api/save-config',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({school_name:document.getElementById('ss-name').value,
       school_gender:document.getElementById('ss-gender').value,
+      split_classes_by_gender:!!(document.getElementById('ss-splitgen')||{}).checked,
       alert_absence_threshold:parseInt(document.getElementById('ss-thr').value)||5})});
   var d=await r.json();ss('ss-st',d.ok?'✅ تم الحفظ':'❌ '+(d.msg||'خطأ'),d.ok?'ok':'er');
 }

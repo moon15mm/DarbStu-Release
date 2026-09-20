@@ -219,3 +219,119 @@ def consume_initial_admin_password() -> str:
         return val
     except Exception:
         return ''
+
+
+# ══════════════════════════════════════════════════════════════════
+#  تذكرة إعادة تعيين كلمة مدير المدرسة (موقَّعة من المزوّد)
+# ══════════════════════════════════════════════════════════════════
+# مدرسةٌ تُنصَّب وتُكتب لها كلمة مرور في شاشة الإعداد، ثم ينساها من نصّبها
+# ⇒ لا سبيل لإنقاذها عن بُعد: المدارس بلا بايثون، ولا شيء في أداة الإدارة
+# لكلمات المرور، والدخول نفسه هو المعطَّل. (حدث في مدرسة السبطة.)
+#
+# **التوقيع ضروري لا احتياط**: خادم المدرسة يستمع على شبكتها المحلية،
+# فنقطةٌ بلا توقيع يستدعيها أي معلّم على الشبكة فيصير مديراً.
+#
+# وثلاثة قيود فوق التوقيع، كلٌّ يسدّ ثغرةً مختلفة:
+#   • الصلاحية القصيرة — تذكرة مسرَّبة لا تنفع بعد دقائق
+#   • الرقم لمرة واحدة — تذكرة مستعملة لا تُعاد
+#   • ربط المدرسة     — تذكرة مدرسةٍ لا تعمل في أخرى
+_RESET_NONCE_FILE = os.path.join(BASE_DIR, '.darb_reset_used')
+_RESET_MAX_AGE_SEC = 15 * 60
+
+
+def _reset_used_nonces() -> set:
+    try:
+        if os.path.exists(_RESET_NONCE_FILE):
+            with open(_RESET_NONCE_FILE, 'r', encoding='utf-8') as f:
+                d = json.load(f)
+            if isinstance(d, list):
+                return set(str(x) for x in d)
+    except Exception:
+        pass
+    return set()
+
+
+def remember_reset_nonce(nonce: str):
+    """يُسجّل التذكرة مستعملةً — يُستدعى بعد نجاح إعادة التعيين."""
+    try:
+        used = _reset_used_nonces()
+        used.add(str(nonce))
+        trimmed = list(used)[-500:]     # الصلاحية القصيرة تُغني عن الأقدم
+        tmp = _RESET_NONCE_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(trimmed, f)
+        os.replace(tmp, _RESET_NONCE_FILE)
+    except Exception:
+        pass
+
+
+def school_identity() -> str:
+    """معرّف هذه المدرسة (نطاق النفق) — تُربط به التذكرة."""
+    try:
+        p = os.path.join(BASE_DIR, '.darb_tunnel.json')
+        if os.path.exists(p):
+            with open(p, 'r', encoding='utf-8') as f:
+                return str(json.load(f).get('subdomain') or '').strip()
+    except Exception:
+        pass
+    return ''
+
+
+def verify_admin_reset_ticket(ticket, signature_b64):
+    """
+    يتحقق من تذكرة إعادة التعيين. يُرجع (صالحة, السبب_أو_الرقم).
+
+    التذكرة JSON مُرتَّب المفاتيح موقَّع بـEd25519 بمفتاح المزوّد، ولا
+    تُقبل إلا بعد اجتياز الفحوص الخمسة كلها.
+    """
+    try:
+        from constants import ADMIN_RESET_PUBKEY
+    except Exception:
+        return False, 'لا مفتاح تحقق'
+    if not ADMIN_RESET_PUBKEY:
+        return False, 'لا مفتاح تحقق'
+    if not isinstance(ticket, dict) or not signature_b64:
+        return False, 'تذكرة ناقصة'
+
+    # ① التوقيع
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PublicKey)
+        payload = json.dumps(ticket, sort_keys=True, separators=(',', ':'),
+                             ensure_ascii=False).encode('utf-8')
+        pk = Ed25519PublicKey.from_public_bytes(
+            base64.b64decode(ADMIN_RESET_PUBKEY))
+        pk.verify(base64.b64decode(signature_b64), payload)
+    except Exception:
+        return False, 'توقيع غير صالح'
+
+    # ② الغرض — توقيعٌ لغرضٍ آخر لا يُعاد استعماله هنا
+    if str(ticket.get('action') or '') != 'reset_admin_password':
+        return False, 'غرض غير مطابق'
+
+    # ③ الصلاحية (ونرفض المستقبل البعيد: ساعةٌ مضبوطة خطأً لا تفتح باباً)
+    try:
+        issued = datetime.datetime.fromisoformat(str(ticket.get('issued')))
+        if issued.tzinfo is None:
+            issued = issued.replace(tzinfo=datetime.timezone.utc)
+        age = (datetime.datetime.now(datetime.timezone.utc)
+               - issued).total_seconds()
+        if age > _RESET_MAX_AGE_SEC or age < -_RESET_MAX_AGE_SEC:
+            return False, 'انتهت صلاحية التذكرة'
+    except Exception:
+        return False, 'تاريخ غير صالح'
+
+    # ④ ربط المدرسة
+    mine = school_identity()
+    want = str(ticket.get('school') or '').strip()
+    if mine and want and mine != want:
+        return False, 'التذكرة لمدرسة أخرى'
+
+    # ⑤ لمرة واحدة
+    nonce = str(ticket.get('nonce') or '')
+    if not nonce:
+        return False, 'بلا رقم تعريف'
+    if nonce in _reset_used_nonces():
+        return False, 'التذكرة مستعملة'
+
+    return True, nonce

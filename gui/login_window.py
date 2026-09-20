@@ -58,6 +58,31 @@ class LoginWindow:
         self.on_success = on_success
         self.attempts   = 0
         self._build()
+        self._check_updates_before_login()
+
+    def _check_updates_before_login(self):
+        """
+        يفحص التحديث **قبل** تسجيل الدخول.
+
+        كان الفحص الوحيد في `app_gui` بعد الدخول بخمس ثوانٍ، و`main.py`
+        يستورد الدالة ولا يستدعيها. فمدرسةٌ عجزت عن الدخول — نسيت كلمة
+        المدير مثلاً — كانت **تُحرَم من كل إصلاح إلى الأبد**: لا تدخل
+        فلا تُحدَّث، ولا تُحدَّث فلا يصلها ما يُصلح عجزها عن الدخول.
+        (حدث في مدرسة السبطة.)
+
+        صامت ومتأخر ثوانيَ حتى لا يُبطئ ظهور النافذة، ومغلَّف بـtry
+        فلا يمنع الدخول إن تعذّر — التحديث خدمةٌ لا شرط.
+        """
+        def _run():
+            try:
+                from updater import check_for_updates
+                check_for_updates(self.root, silent=True)
+            except Exception as e:
+                print(f"[LOGIN-UPDATE] تعذّر فحص التحديث: {e}")
+        try:
+            self.root.after(3000, _run)
+        except Exception:
+            pass
 
     def _build(self):
         self.root.title("تسجيل الدخول — DarbStu")

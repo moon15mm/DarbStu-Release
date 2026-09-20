@@ -2803,6 +2803,75 @@ def _detect_school_stage(all_sheets: dict) -> str:
     return get_school_stage()
 
 
+def _split_classes_by_gender(classes: dict) -> str:
+    """
+    يفصل فصول الابتدائي المختلطة إلى فصل بنات وفصل أولاد.
+
+    المدرسة الابتدائية للبنات تضمّ أولاداً في الصفوف الأولى — وهم في
+    الواقع مدرستان في مبنى واحد ولكلٍّ فصله. لكن **نور يُصدّرهم في فصل
+    واحد** ولا يُصدّر الجنس أصلاً، فالفصل يقع هنا بالاستنتاج من الاسم.
+
+    لا يعمل إلا بمفتاح `split_classes_by_gender` في الإعدادات: مدرسةٌ
+    بنينٍ خالصة أو بناتٍ خالصة لا شأن لها بهذا، وتشغيله عليها يشطر
+    فصولها بلا سبب.
+
+    ولا يُشطر فصلٌ إلا إذا **اجتمع فيه الجنسان فعلاً** — فصفوف البنات
+    الخالصة (الرابع فما فوق) تبقى كما هي بلا فصل أولاد فارغ.
+
+    والمجهول جنسُه يبقى مع جنس المدرسة: وضعُ طالبةٍ في فصل الأولاد خطأ
+    ظاهر، والعكس أهون.
+    """
+    try:
+        from config_manager import load_config
+        cfg = load_config()
+        if not cfg.get("split_classes_by_gender"):
+            return ""
+        school = "male" if cfg.get("school_gender") == "boys" else "female"
+    except Exception:
+        return ""
+
+    try:
+        from student_gender import classify_names, MALE, FEMALE
+    except Exception as e:
+        print(f"[GENDER-SPLIT] تعذّر الاستنتاج: {e}")
+        return ""
+
+    other = MALE if school == FEMALE else FEMALE
+    label = {FEMALE: "بنات", MALE: "أولاد"}
+    moved = 0
+    unknown_total = 0
+
+    for cid in list(classes.keys()):
+        c = classes[cid]
+        studs = c.get("students") or []
+        if len(studs) < 2:
+            continue
+        res, unk = classify_names([s.get("name", "") for s in studs])
+        unknown_total += len(unk)
+        mine, theirs = [], []
+        for s in studs:
+            (theirs if res.get(s.get("name", "")) == other else mine).append(s)
+        if not mine or not theirs:
+            continue          # فصلٌ بجنسٍ واحد — يبقى كما هو
+
+        base = c.get("name", cid)
+        c["students"] = mine
+        c["name"] = f"{base} / {label[school]}"
+        new_id = f"{cid}-{'B' if school == FEMALE else 'G'}"
+        classes[new_id] = {"id": new_id,
+                           "name": f"{base} / {label[other]}",
+                           "students": theirs}
+        moved += len(theirs)
+
+    if not moved:
+        return ""
+    note = f"فُصل {moved} طالباً إلى فصول {label[other]} حسب الاسم"
+    if unknown_total:
+        note += (f" · {unknown_total} اسماً لم يُعرف جنسه فبقي مع "
+                 f"{label[school]} — راجع data/gender_names.json")
+    return note
+
+
 def import_students_from_excel_sheet2_format(xlsx_path: str,
                                              dry_run: bool = False) -> Dict[str, Any]:
     """
@@ -3046,10 +3115,14 @@ def import_students_from_excel_sheet2_format(xlsx_path: str,
     if not classes:
         raise ValueError("لم يُعثر على أي طلاب في الملف — تحقق من صحة البيانات.")
 
+    _gender_note = _split_classes_by_gender(classes)
+
     # ─── تقرير الاستيراد ────────────────────────────────────────
     # النسخة المبنية بلا نافذة أوامر (console=False)، فأي print هنا
     # لا يراه أحد. التقرير يُعاد مع النتيجة لتعرضه الواجهة.
     _notes = []
+    if _gender_note:
+        _notes.append(_gender_note)
     if _skipped:
         _notes.append(f"استُبعد {_skipped} طالباً "
                       f"(صفوف/فصول مستبعدة: {', '.join(sorted(_excludes))})")
