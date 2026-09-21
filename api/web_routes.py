@@ -697,6 +697,29 @@ async def web_update_students(req: Request):
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 
+@router.post("/web/api/users/generate", response_class=JSONResponse)
+async def web_users_generate(request: Request):
+    """
+    توليد حسابات لأعضاء الطاقم الذين لا حساب لهم — نفس محرّك سطح المكتب.
+
+    كان التوليد في البرنامج المكتبي وحده، فمن يدير المدرسة عن بُعد لا
+    يبلغه. المنطق في `staff_accounts` يستعمله الاثنان من مصدر واحد.
+
+    **لا يُرسل شيئاً** ولا يمسّ حساباً قائماً — فتشغيله مرّتين لا يُبدّل
+    كلمة مرور أحد.
+    """
+    user = _get_current_user(request)
+    if not user or user.get("role") != "admin":
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        from staff_accounts import generate_staff_accounts
+        return JSONResponse(generate_staff_accounts())
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
 @router.post("/web/api/students/update", response_class=JSONResponse)
 async def web_student_update(request: Request):
     """تعديل بيانات طالب أو نقله لصف/فصل آخر — الرقم الأكاديمي لا يُمَس."""
@@ -3645,6 +3668,8 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
       <div class="st" style="margin-bottom:10px">قائمة المستخدمين</div>
       <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
         <button class="btn bp1 bsm" onclick="usOpenAdd()">➕ جديد</button>
+        <!-- التوليد كان في البرنامج المكتبي وحده، ومن يدير عن بُعد لا يبلغه -->
+        <button class="btn bp2 bsm" onclick="usGenerate()">⚙️ توليد حسابات الطاقم</button>
         <button class="btn bp2 bsm" onclick="usToggle()">🔄 تفعيل/تعطيل</button>
         <button class="btn bp2 bsm" onclick="usChangePw()">🔑 كلمة المرور</button>
         <button class="btn bp3 bsm" onclick="usDelete()">🗑 حذف</button>
@@ -5761,6 +5786,27 @@ function _usRenderTable(){
            '<td style="font-size:11px;color:#888">'+(u.last_login||'-')+'</td>'+
            '</tr>';
   }).join('')||'<tr><td colspan="6" style="color:#9CA3AF;text-align:center">لا يوجد مستخدمون</td></tr>';
+}
+/* توليد حسابات الطاقم — لا يمسّ حساباً قائماً ولا يُرسل شيئاً */
+var _US_ROLE_AR={teacher:'معلم',staff:'إداري',counselor:'موجه طلابي',
+                 health:'موجه صحي',deputy:'وكيل',admin:'مدير'};
+async function usGenerate(){
+  if(!confirm('سيُنشأ حساب بكلمة مرور عشوائية لكل عضو طاقم لا حساب له، '+
+              'ودورُه حسب وظيفته في ملف نور.\n\n'+
+              'الحسابات القائمة لا تُمَس، ولن تُرسل أي رسالة.\n\nهل تريد المتابعة؟')) return;
+  ss('us-st','⏳ جارٍ التوليد...','ai');
+  try{
+    var r=await fetch('/web/api/users/generate',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:'{}'});
+    var d=await r.json();
+    if(!d.ok){ ss('us-st','❌ '+(d.msg||'تعذّر التوليد'),'er'); return; }
+    var det=[];
+    for(var k in (d.per_role||{})) det.push((_US_ROLE_AR[k]||k)+': '+d.per_role[k]);
+    ss('us-st','✅ أُنشئ '+d.created+' حساباً'+
+       (det.length?' ('+det.join(' · ')+')':'')+
+       ' · تُخطّي '+d.skipped+' (موجود أو بياناته ناقصة)','ok');
+    loadUsers();
+  }catch(e){ ss('us-st','❌ خطأ في الاتصال','er'); }
 }
 function _usBuildTabsGrid(){
   var grid=document.getElementById('us-tabs-grid');

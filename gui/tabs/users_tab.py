@@ -554,41 +554,22 @@ class UsersTabMixin:
                 "ولكلٍّ دورُه حسب وظيفته في ملف نور (معلم / إداري / موجّه).\n"
                 "لن يتم الإرسال — استخدم زر 'إرسال بيانات الدخول' بعد ذلك.\nهل تريد المتابعة؟"):
             return
-        from database import load_teachers, create_user, save_user_allowed_tabs, get_all_users
-        from constants import ROLE_TABS, ROLES
-        import random
-
-        teachers_data = load_teachers().get("teachers", [])
-        if not teachers_data:
-            messagebox.showwarning("تنبيه", "لا يوجد طاقم. تأكد من استيراد ملف نور أولاً.")
-            return
-
-        existing_users = {u["username"] for u in get_all_users()}
-        success_count = 0
-        skip_count = 0
-        per_role = {}
+        # المنطق في `staff_accounts` — تستعمله واجهة الويب أيضاً. نسختان
+        # متطابقتان هنا وهناك كانتا ستفترقان عند أول تعديل.
+        from staff_accounts import generate_staff_accounts
+        from constants import ROLES
 
         self.root.config(cursor="wait")
         try:
-            for t in teachers_data:
-                name    = (t.get("اسم المعلم") or t.get("full_name") or "").strip()
-                phone   = (t.get("رقم الجوال") or "").strip()
-                civ_id  = (t.get("رقم الهوية") or "").strip()
-                username = civ_id if civ_id else phone
-                if not username or not name:
-                    skip_count += 1; continue
-                if username in existing_users:
-                    skip_count += 1; continue
-                role = self._role_for_job(t.get("الوظيفة", ""))
-                password = str(random.randint(100000, 999999))
-                ok, _ = create_user(username, password, role, name)
-                if ok:
-                    tabs = (self._TEACHER_TABS if role == "teacher"
-                            else list(ROLE_TABS.get(role) or self._TEACHER_TABS))
-                    save_user_allowed_tabs(username, tabs)
-                    existing_users.add(username)
-                    per_role[role] = per_role.get(role, 0) + 1
-                    success_count += 1
+            res = generate_staff_accounts()
+            if not res.get("ok"):
+                self.root.config(cursor="")
+                messagebox.showwarning("تنبيه",
+                                       res.get("msg") or "تعذّر التوليد.")
+                return
+            success_count = res.get("created", 0)
+            skip_count = res.get("skipped", 0)
+            per_role = res.get("per_role", {})
             self._users_load()
             detail = "\n".join(
                 "   • %s: %d" % (ROLES.get(r, {}).get("label", r), n)
