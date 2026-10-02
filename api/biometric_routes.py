@@ -404,6 +404,18 @@ async def bio_students(request: Request):
     """طلاب المدرسة مجمّعين بالفصول، مع الرقم الأكاديمي وعلامة التسجيل."""
     if not _auth(request):
         return _unauth()
+    try:
+        return _bio_students_payload()
+    except Exception as e:
+        # بلا هذا يردّ الخادم صفحة ٥٠٠ بـHTML، فيفشل تحليلها في الواجهة
+        # وتبقى «جارٍ التحميل…» بلا سبب — وهو ما حدث في demo2.
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"ok": False, "msg": "%s: %s"
+                             % (type(e).__name__, e)}, status_code=500)
+
+
+def _bio_students_payload():
     enrolled = get_fp_enrolled_ids()
     store = load_students()
     classes = []
@@ -533,22 +545,42 @@ async def bio_sync_device(request: Request):
                     {"ok": False,
                      "error": "لا يوجد جهاز مُفعّل — أضِفه واحفظه أولاً"})
 
+        # كل الأجهزة لا الأول وحده: مدرسةٌ بجهازين يجب أن ترى الاثنين
+        # لتتأكد أنهما متطابقان — وهو سؤالها الأول بعد نسخ البصمات
+        # بينهما. وكانت تقرأ `devices[0]` فيبقى الثاني مجهولاً تماماً.
         from biometric import make_device
-        dev = make_device(devices[0])
-        device_id = devices[0].get("device_id", "")
+        rows, users_total, fp_total, synced_total = [], 0, 0, 0
+        for d in devices:
+            did = d.get("device_id", "") or d.get("ip", "") or "?"
+            try:
+                dev = make_device(d)
+                if hasattr(dev, "get_users_and_fingerprints"):
+                    users_map, fp_ids = dev.get_users_and_fingerprints()
+                else:
+                    users_map, fp_ids = {}, set()
+                n = sync_fp_enrollments_from_device(fp_ids, device_id=did)
+                rows.append({"device_id": did, "ok": True,
+                             "users": len(users_map), "fp": len(fp_ids),
+                             "synced": n})
+                users_total += len(users_map)
+                fp_total += len(fp_ids)
+                synced_total += n
+            except Exception as de:
+                # جهازٌ مفصول لا يُسقط فحص البقية
+                rows.append({"device_id": did, "ok": False,
+                             "error": str(de)[:120]})
 
-        if hasattr(dev, "get_users_and_fingerprints"):
-            users_map, fp_user_ids = dev.get_users_and_fingerprints()
-        else:
-            users_map, fp_user_ids = {}, set()
-
-        synced_count = sync_fp_enrollments_from_device(fp_user_ids, device_id=device_id)
+        ok_rows = [r for r in rows if r.get("ok")]
+        # تطابق الأجهزة: نفس عدد البصمات على الجميع
+        same = (len({r["fp"] for r in ok_rows}) <= 1) if len(ok_rows) > 1 else None
 
         return JSONResponse({
             "ok": True,
-            "device_users_count": len(users_map),
-            "device_fp_count": len(fp_user_ids),
-            "synced_count": synced_count
+            "devices": rows, "identical": same,
+            # الأسماء القديمة تبقى للتوافق مع واجهةٍ لم تُحدَّث بعد
+            "device_users_count": ok_rows[0]["users"] if ok_rows else 0,
+            "device_fp_count": ok_rows[0]["fp"] if ok_rows else 0,
+            "synced_count": synced_total,
         })
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
@@ -1016,11 +1048,20 @@ _ENROLL_PAGE = """<!DOCTYPE html>
 
 <script>
 const $=id=>document.getElementById(id);
+function gnEscB(s){return String(s==null?'':s)
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
 async function api(path,opts){
   try {
     const r=await fetch(path,opts||{});
     if(r.status===401){location.href='/web/login';return null;}
-    return await r.json();
+    // ردٌّ غير JSON (صفحة خطأ ٥٠٠ مثلاً) كان يُبتلع في catch بلا رمز
+    // ولا نصّ، فيبدو العطل «لا شيء». نُعيد الرمز ومقتطفاً من الجسد.
+    const t=await r.text();
+    try { return JSON.parse(t); }
+    catch(e) {
+      return {ok:false, error:'HTTP '+r.status+' — '+t.slice(0,180)};
+    }
   } catch(e) {
     return {ok:false, error:String(e)};
   }
@@ -1031,7 +1072,18 @@ let QUEUE=[], QUEUE_INDEX=0, QUEUE_CLASS_NAME='', IS_BUSY=false;
 
 async function load(){
   const d=await api('/web/api/biometric/students');
-  if(!d||!d.ok) return;
+  if(!d||!d.ok){
+    // الصمت هنا كان يُبقي «جارٍ التحميل…» إلى الأبد بلا سبب ولا زرّ.
+    // حدث في demo2 بعد تحديث 3.6.56 ولم يُعرف السبب إلا بفتح النقطة
+    // يدوياً — فصار الخطأ يُعرض مع زرّ إعادة محاولة.
+    const box=$('list');
+    if(box) box.innerHTML='<div style="padding:18px 6px;color:#b91c1c">'
+      +'❌ تعذّر تحميل قائمة الطلاب.<div style="font-size:12px;color:#6b7280;'
+      +'margin:6px 0 10px;direction:ltr;text-align:right">'
+      +gnEscB((d&&(d.error||d.msg))||'لم يردّ الخادم')+'</div>'
+      +'<button class="btn o" onclick="load()">أعد المحاولة</button></div>';
+    return;
+  }
   DATA=d;
   render();
   updateProg();
@@ -1072,10 +1124,19 @@ async function syncFromDevice(){
     const d=await api('/web/api/biometric/sync-device',{method:'POST'});
     if(d&&d.ok){
       await load();
-      alert('✅ تمت المزامنة الحية مع جهاز البصمة بنجاح!\\n\\n'
-            + '• إجمالي المستخدمين على الجهاز: ' + (d.device_users_count || 0) + '\\n'
-            + '• البصمات المسجلة فعلياً في الجهاز: ' + (d.device_fp_count || 0) + '\\n'
-            + '• الطلاب الذين تم مطابقتهم وتحديث حالتهم: ' + (d.synced_count || 0));
+      var rows=d.devices||[];
+      var m='✅ تمت المزامنة.\\n\\n';
+      rows.forEach(function(r){
+        m += r.ok
+          ? ('• '+r.device_id+': '+r.users+' مستخدماً · '+r.fp+' ببصمة\\n')
+          : ('• '+r.device_id+': ❌ '+(r.error||'تعذّر الاتصال')+'\\n');
+      });
+      m += '\\nطلاب حُدّثت حالتهم: '+(d.synced_count||0);
+      // سؤال المدرسة بجهازين بعد النسخ: هل تطابقا؟ يُجاب صراحةً
+      if(d.identical===true)  m+='\\n\\n✅ الجهازان متطابقان في عدد البصمات.';
+      if(d.identical===false) m+='\\n\\n⚠️ الأجهزة غير متطابقة — أعِد النسخ '
+                                +'إلى الجهاز الناقص.';
+      alert(m);
     }else{
       alert('❌ تعذّرت المزامنة: '+((d&&d.error)||'تأكد من تشغيل الجهاز واتصاله بالشبكة.'));
     }
@@ -1094,8 +1155,11 @@ async function genNumbers(useSpan){
     if(!/^\d+$/.test(b)){ alert('اكتب رقم البداية أرقاماً فقط.'); return; }
     body.base=parseInt(b,10);
     body.force=$('spanforce').checked;
+    // تنبيه: هذه الصفحة (_ENROLL_PAGE) نصّ بايثون عادي لا خام، فسطر
+    // جديد في JS يُكتب بخطّين مائلين. الواحد تحوّله بايثون إلى سطر
+    // حقيقي داخل نصّ JS فتسقط كتلة السكربت كلها بلا أي أثر.
     if(body.force && !confirm('إعادة ترقيم الجميع تُبطل كل بصمة مسجَّلة '
-        +'على الأجهزة، ويجب إعادة تسجيلها.\n\nمتأكد؟')) return;
+        +'على الأجهزة، ويجب إعادة تسجيلها.\\n\\nمتأكد؟')) return;
   }
   const d=await api('/web/api/biometric/generate-numbers',
                     {method:'POST',body:JSON.stringify(body)});
