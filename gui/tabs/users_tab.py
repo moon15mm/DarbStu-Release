@@ -606,6 +606,8 @@ class UsersTabMixin:
         existing_users = {u["username"]: u for u in get_all_users()}
         sent_count = 0
         skip_count = 0
+        fail_count = 0
+        fail_names = []
 
         self.root.config(cursor="wait")
         try:
@@ -626,11 +628,24 @@ class UsersTabMixin:
                        f"اسم المستخدم: {username}\n"
                        f"كلمة المرور: {password}\n\n"
                        f"مع تحيات إدارة المدرسة")
-                send_whatsapp_message(phone, msg)
-                sent_count += 1
-            messagebox.showinfo("اكتمل",
-                f"✅ تم الإرسال لـ {sent_count} معلم.\n"
-                f"⏭️ تم تخطي {skip_count} (لا حساب أو لا رقم جوال).")
+                # كانت النتيجة تُهمَل ويُحسب الإرسال ناجحاً دائماً: كلمة
+                # المرور بُدّلت والرسالة لم تصل ⇒ معلّمٌ عاجز عن الدخول
+                # ولا يدري، والمدير يُطمأن بـ«تم الإرسال».
+                _ok, _why = send_whatsapp_message(phone, msg)
+                if _ok:
+                    sent_count += 1
+                else:
+                    fail_count += 1
+                    if len(fail_names) < 10:
+                        fail_names.append(name or username)
+            _m = (f"✅ تم الإرسال لـ {sent_count} معلم.\n"
+                  f"⏭️ تم تخطي {skip_count} (لا حساب أو لا رقم جوال).")
+            if fail_count:
+                _m += (f"\n\n⚠️ {fail_count} بُدّلت كلمة مروره ولم تصله "
+                       f"الرسالة — لن يستطيع الدخول حتى تُعاد المحاولة:\n"
+                       + "، ".join(fail_names))
+            (messagebox.showwarning if fail_count else messagebox.showinfo)(
+                "اكتمل", _m)
         finally:
             self.root.config(cursor="")
 
@@ -690,11 +705,17 @@ class UsersTabMixin:
         
         self.root.config(cursor="wait")
         try:
-            ok = send_whatsapp_message(phone, msg)
+            # الدالة تُرجع `(نجح, السبب)` — وأي صفٍّ غير فارغ صادق، فكان
+            # `if ok` صادقاً دائماً وفرعُ الخطأ ميتاً: الفشل يُعلَن نجاحاً
+            ok, why = send_whatsapp_message(phone, msg)
             if ok:
                 messagebox.showinfo("تم", f"تم إرسال بيانات الدخول إلى {name} بنجاح.")
             else:
-                messagebox.showerror("خطأ", "فشل إرسال الرسالة عبر الواتساب. تأكد من اتصال الهاتف.")
+                messagebox.showerror(
+                    "خطأ",
+                    f"فشل إرسال الرسالة عبر الواتساب.\n{why}\n\n"
+                    f"⚠️ كلمة مرور {name} بُدّلت بالفعل — أعد المحاولة، "
+                    f"وإلا لن يستطيع الدخول.")
         finally:
             self.root.config(cursor="")
 

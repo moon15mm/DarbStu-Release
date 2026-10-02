@@ -697,6 +697,108 @@ async def web_update_students(req: Request):
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 
+def _gender_sibling_class(class_id, classes):
+    """
+    الفصل المقابل في الجنس — «أول ابتدائي / بنات» ← «… / أولاد».
+
+    الشطر يُنشئ الفصل الثاني بمعرّف الأول + لاحقة، فالمقابلة تُستنتج من
+    المعرّف لا من الاسم: الاسم يمرّ على وسيط التأنيث في مدارس البنات
+    فيتبدّل، والمعرّف لا يتبدّل أبداً.
+    """
+    cid = str(class_id or "")
+    ids = {str(c.get("id")): c for c in classes}
+    for suffix in ("-B", "-G"):
+        if cid.endswith(suffix):                 # فصل الجنس الآخر ← الأصل
+            base = cid[: -len(suffix)]
+            if base in ids:
+                return base
+        elif (cid + suffix) in ids:               # الأصل ← فصل الجنس الآخر
+            return cid + suffix
+    return None
+
+
+@router.get("/web/api/gender-names", response_class=JSONResponse)
+async def web_gender_names(request: Request):
+    """الأسماء المشتركة التي تنتظر حسم المدرسة، ومن يحملها."""
+    user = _get_current_user(request)
+    if not user or user.get("role") not in ("admin", "deputy"):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        from student_gender import (pending_names, _load_overrides,
+                                    screen_applies)
+        # الحسم في النقطة لا في الواجهة: الصندوق يختفي من تلقائه حين
+        # تكون القائمة فارغة، فحارسٌ واحد هنا يكفي كل من يستدعيها.
+        if not screen_applies():
+            return JSONResponse({"ok": True, "applies": False,
+                                 "pending": [], "decided": {}})
+        store = load_students()
+        decided = {k: v for k, v in (_load_overrides() or {}).items() if v}
+        return JSONResponse({"ok": True, "applies": True,
+                             "pending": pending_names(store),
+                             "decided": decided})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+@router.post("/web/api/gender-names", response_class=JSONResponse)
+async def web_gender_names_set(request: Request):
+    """
+    يحسم جنس اسم، ويَنقل حامليه إلى الفصل الصحيح إن طُلب.
+
+    الحسم وحده لا يكفي: الطالب يبقى في فصله حتى الاستيراد التالي. و
+    `apply` يُغلق الحلقة فوراً — وهو ما يريده من فتح الشاشة أصلاً.
+    """
+    user = _get_current_user(request)
+    if not user or user.get("role") not in ("admin", "deputy"):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        from student_gender import set_gender, MALE, FEMALE, screen_applies
+        from database import move_or_update_student
+        # يُحرَس الحسم كما تُحرَس القراءة: نقلُ طالبٍ إلى «فصل الجنس
+        # المقابل» في مدرسةٍ غير مشطورة يضعه في فصلٍ لا وجود له.
+        if not screen_applies():
+            return JSONResponse({"ok": False,
+                                 "msg": "هذا الخيار للابتدائيات المختلطة "
+                                        "في مدارس البنات فقط"})
+        d = await request.json()
+        name = str(d.get("name") or "").strip()
+        gender = str(d.get("gender") or "").strip().lower()
+        if not name or gender not in (MALE, FEMALE):
+            return JSONResponse({"ok": False, "msg": "بيانات ناقصة"})
+        if not set_gender(name, gender):
+            return JSONResponse({"ok": False, "msg": "تعذّر الحفظ"})
+
+        moved = 0
+        if d.get("apply"):
+            cfg = load_config()
+            school = FEMALE if cfg.get("school_gender") != "boys" else MALE
+            store = load_students()
+            classes = store.get("list", []) or []
+            # يُنقل من يخالف جنسُه جنسَ المدرسة فقط — فالموافق في فصله
+            if gender != school:
+                for c in classes:
+                    sib = _gender_sibling_class(c.get("id"), classes)
+                    if not sib:
+                        continue
+                    for s in list(c.get("students", []) or []):
+                        nm = (s.get("name") or "").strip()
+                        if nm.split()[:1] == [name]:
+                            r = move_or_update_student(str(s.get("id")),
+                                                       new_class_id=sib)
+                            if r.get("ok"):
+                                moved += 1
+                if moved:
+                    load_students(force_reload=True)
+        return JSONResponse({"ok": True, "name": name,
+                             "gender": gender, "moved": moved})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
 @router.post("/web/api/users/generate", response_class=JSONResponse)
 async def web_users_generate(request: Request):
     """
@@ -714,6 +816,318 @@ async def web_users_generate(request: Request):
     try:
         from staff_accounts import generate_staff_accounts
         return JSONResponse(generate_staff_accounts())
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+def _attendance_report_params(request: Request) -> dict:
+    """يقرأ خيارات تقرير الرصد من الاستعلام — مصدرٌ واحد للنقاط الثلاث."""
+    q = request.query_params
+
+    def _i(k, d=0):
+        try:
+            return int(str(q.get(k, d)).strip() or d)
+        except Exception:
+            return d
+
+    def _b(k, d=False):
+        v = str(q.get(k, "")).strip().lower()
+        return d if v == "" else v in ("1", "true", "yes", "on")
+
+    from attendance_report import resolve_range
+    start, end = resolve_range(str(q.get("preset") or "month"),
+                               q.get("from"), q.get("to"))
+    return {
+        "start": start, "end": end,
+        "include_absence": _b("absence", True),
+        "include_tardy": _b("tardy", True),
+        "class_id": (q.get("class_id") or "").strip() or None,
+        "group_by": (q.get("group_by") or "student").strip(),
+        "min_absence": _i("min_absence"), "min_tardy": _i("min_tardy"),
+        "min_minutes": _i("min_minutes"),
+        "exclude_excused": _b("exclude_excused", False),
+        "sort": (q.get("sort") or "absence").strip(),
+        "limit": _i("limit"),
+    }
+
+
+def _roster_rows():
+    """كشف الطلاب مسطّحاً — مصدر تقرير المنضبطين، إذ لا سجلّ لهم في
+    جدولَي الغياب والتأخر أصلاً."""
+    out = []
+    for c in load_students().get("list", []):
+        for s in c.get("students", []):
+            out.append({"id": str(s.get("id") or ""),
+                        "name": s.get("name") or "",
+                        "class_id": c.get("id"),
+                        "class_name": c.get("name") or ""})
+    return out
+
+
+def _good_standing_report(request: Request):
+    from attendance_report import build_good_standing, resolve_range
+    q = request.query_params
+
+    def _i(k, d=0):
+        try:
+            return int(str(q.get(k, d)).strip() or d)
+        except Exception:
+            return d
+
+    def _b(k, d=False):
+        v = str(q.get(k, "")).strip().lower()
+        return d if v == "" else v in ("1", "true", "yes", "on")
+
+    start, end = resolve_range(str(q.get("preset") or "month"),
+                               q.get("from"), q.get("to"))
+    return build_good_standing(
+        start, end, _roster_rows(),
+        check_absence=_b("absence", True), check_tardy=_b("tardy", True),
+        max_absence=_i("max_absence"), max_tardy=_i("max_tardy"),
+        excused_ok=_b("excused_ok", True),
+        class_id=(q.get("class_id") or "").strip() or None,
+        sort=(q.get("sort") or "name").strip(), limit=_i("limit"))
+
+
+def _report_for(request: Request):
+    """يختار التقرير حسب `kind` — فتخدم نقطتا الطباعة والتصدير
+    التقريرين بلا تكرار، ولا يختلف شكل الورقة بينهما."""
+    if str(request.query_params.get("kind") or "").strip() == "good":
+        return _good_standing_report(request)
+    return _attendance_report(request)
+
+
+def _attendance_report(request: Request):
+    from attendance_report import build_report
+    p = _attendance_report_params(request)
+    start, end = p.pop("start"), p.pop("end")
+    # أعداد الكشف: مقام النسبة للفصل واليوم. لا تُستنتج من سجلّ الغياب —
+    # من لم يغب قط لا يظهر فيه فيُصغَّر المقام وتُضخَّم النسبة.
+    try:
+        store = load_students()
+        by_class, total = {}, 0
+        for c in store.get("list", []):
+            n = len(c.get("students", []))
+            by_class[c.get("id")] = n
+            total += n
+        p["roster"] = {"total": total, "by_class": by_class}
+    except Exception:
+        p["roster"] = None
+    return build_report(start, end, **p)
+
+
+@router.get("/web/api/reports/attendance", response_class=JSONResponse)
+async def web_reports_attendance(request: Request):
+    """تقرير الرصد: غياب وتأخر ودقائقه بين تاريخين، بخيارات التصفية."""
+    user = _get_current_user(request)
+    if not user or user.get("role") not in ("admin", "deputy"):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        return JSONResponse(_attendance_report(request))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+@router.get("/web/api/reports/good-standing", response_class=JSONResponse)
+async def web_reports_good_standing(request: Request):
+    """
+    الطلاب المنضبطون: من لم يغب ولم يتأخر في المدى (أو ضمن هامشٍ مسموح).
+
+    مصدره **الكشف** لا جدولا الغياب والتأخر: من لم يغب قط لا سجلّ له
+    فيهما، فقلبُ تقرير الرصد يُسقط المنضبطين جميعاً.
+    """
+    user = _get_current_user(request)
+    if not user or user.get("role") not in ("admin", "deputy"):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        return JSONResponse(_good_standing_report(request))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+@router.get("/web/api/reports/attendance-print")
+async def web_reports_attendance_print(request: Request):
+    """نسخة A4 تُفتح بنافذة جديدة وتطبع نفسها."""
+    # تُفتح بـwindow.open فتُرسل الكوكي تلقائياً، لكنها تحمل أسماء طلاب
+    # وأرقام غيابهم — فلا تُخدَم لزائرٍ غير مسجَّل.
+    user = _get_current_user(request)
+    if not user or user.get("role") not in ("admin", "deputy"):
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse("/web/login")
+    try:
+        from attendance_report import build_print_html
+        rep = _report_for(request)
+        cfg = load_config()
+        html = build_print_html(rep, cfg.get("school_name", ""),
+                                request.query_params.get("title") or "")
+        html = html.replace(
+            "</body>",
+            "<script>window.onload=function(){window.print();}</script></body>")
+        return HTMLResponse(html)
+    except Exception as e:
+        return HTMLResponse("<html dir='rtl'><body><h3>تعذّر تجهيز الطباعة: "
+                            + str(e) + "</h3></body></html>")
+
+
+@router.get("/web/api/reports/attendance-export")
+async def web_reports_attendance_export(request: Request):
+    """تصدير التقرير إلى Excel — نفس أعمدة الطباعة حرفاً."""
+    user = _get_current_user(request)
+    if not user or user.get("role") not in ("admin", "deputy"):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        from attendance_report import build_rows_for_export
+        rep = _report_for(request)
+        rows = build_rows_for_export(rep)
+
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "الرصد"
+        ws.sheet_view.rightToLeft = True          # وإلا قُرئ الجدول معكوساً
+        for r in rows:
+            ws.append(r)
+        hdr_fill = PatternFill("solid", fgColor="15616D")
+        for c in ws[1]:
+            c.font = Font(bold=True, color="FFFFFF")
+            c.fill = hdr_fill
+            c.alignment = Alignment(horizontal="center", vertical="center")
+        for col in ws.columns:
+            w = max((len(str(c.value or "")) for c in col), default=8)
+            ws.column_dimensions[col[0].column_letter].width = min(max(w + 3, 9), 34)
+        ws.freeze_panes = "A2"
+
+        import io as _io
+        buf = _io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        stem = "good_standing" if rep.get("kind") == "good" else "attendance"
+        name = "%s_%s_%s.xlsx" % (stem, rep["from"], rep["to"])
+        from fastapi.responses import StreamingResponse
+        return StreamingResponse(
+            buf,
+            media_type="application/vnd.openxmlformats-officedocument."
+                       "spreadsheetml.sheet",
+            headers={"Content-Disposition": 'attachment; filename="%s"' % name})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+def _school_public_url() -> str:
+    """
+    رابط المدرسة الذي يُرسَل للطاقم — بترتيب الأوثق فالأضعف.
+
+    ملف النفق أولاً: هو ما يعمل فعلاً للمدارس على `darbstu.com`، وهو
+    **لكل مرحلة على حدة** فلا تُرسَل المتوسطة رابط الثانوية. ثم النطاق
+    المحفوظ في الإعداد، ثم رابط السحابة للتنصيبات القديمة.
+    """
+    import json as _j
+    try:
+        from constants import STAGE_ROOT
+        p = os.path.join(STAGE_ROOT, ".darb_tunnel.json")
+        if os.path.isfile(p):
+            with open(p, encoding="utf-8") as f:
+                u = (_j.load(f) or {}).get("public_url", "").strip()
+            if u:
+                return u.rstrip("/")
+    except Exception:
+        pass
+    try:
+        if STATIC_DOMAIN:
+            return STATIC_DOMAIN.rstrip("/")
+    except Exception:
+        pass
+    try:
+        cfg = load_config()
+        u = (cfg.get("cloud_url_internal") or cfg.get("cloud_url") or "").strip()
+        return u.rstrip("/")
+    except Exception:
+        return ""
+
+
+@router.post("/web/api/users/send-credentials", response_class=JSONResponse)
+async def web_users_send_credentials(request: Request):
+    """
+    يولّد كلمة مرور جديدة ويُرسلها عبر الواتساب — للطاقم كلهم أو لواحد.
+
+    كان هذا في البرنامج المكتبي وحده (تبويب المستخدمين)، فمن يدير مدرسةً
+    عن بُعد لا يبلغه.
+
+    ⚠️ **يُبدّل كلمة المرور فعلاً.** من غيّر كلمته لن تعمل القديمة بعدها،
+    فالإرسال الجماعي يسأل تأكيداً في الواجهة. و`scope=one` موجود لهذا:
+    نسيان معلّمٍ واحد لا يستدعي تبديل كلمات أربعين.
+    """
+    user = _get_current_user(request)
+    if not user or user.get("role") != "admin":
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        import random
+        from database import (load_teachers, get_all_users,
+                              update_user_password)
+        from whatsapp_service import send_whatsapp_message
+
+        body = await request.json() if await request.body() else {}
+        scope = str(body.get("scope") or "all").strip()
+        only = str(body.get("username") or "").strip()
+
+        base = _school_public_url()
+        if not base:
+            return JSONResponse({"ok": False, "msg":
+                "لا يوجد رابط عام للمدرسة بعد — تأكد من عمل الربط، أو "
+                "اكتب الرابط في إعدادات المدرسة."})
+
+        existing = {u["username"]: u for u in get_all_users()}
+        staff = load_teachers().get("teachers", [])
+        if not staff:
+            return JSONResponse({"ok": False, "msg": "لا يوجد طاقم في الملف."})
+
+        sent, skipped, reasons = 0, 0, []
+        for t in staff:
+            name = (t.get("اسم المعلم") or t.get("full_name") or "").strip()
+            phone = str(t.get("رقم الجوال") or "").strip()
+            civ = str(t.get("رقم الهوية") or "").strip()
+            username = civ or phone
+            if scope == "one" and username != only:
+                continue
+            if not username or username not in existing:
+                skipped += 1
+                if len(reasons) < 8:
+                    reasons.append("%s: لا حساب" % (name or username or "—"))
+                continue
+            if not phone:
+                skipped += 1
+                if len(reasons) < 8:
+                    reasons.append("%s: لا رقم جوال" % (name or username))
+                continue
+            password = str(random.randint(100000, 999999))
+            update_user_password(username, password)
+            msg = ("مرحباً أستاذ %s\n\n"
+                   "بيانات دخولك للنظام:\n\n"
+                   "الرابط: %s/web/login\n"
+                   "اسم المستخدم: %s\n"
+                   "كلمة المرور: %s\n\n"
+                   "مع تحيات إدارة المدرسة" % (name, base, username, password))
+            ok_sent, why = send_whatsapp_message(phone, msg)
+            if ok_sent:
+                sent += 1
+            else:
+                # كلمة المرور بُدّلت والرسالة لم تصل — يجب أن يُقال
+                # صراحةً وإلا بقي صاحبها عاجزاً عن الدخول بلا أن يدري
+                skipped += 1
+                if len(reasons) < 8:
+                    reasons.append("%s: بُدّلت ولم تُرسَل (%s)"
+                                   % (name or username, why))
+        return JSONResponse({"ok": True, "sent": sent, "skipped": skipped,
+                             "reasons": reasons, "url": base})
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -2687,37 +3101,134 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
 <div id="tab-reports_print">
   <h2 class="pt"><i class="fas fa-print"></i> التقارير والطباعة</h2>
   <div class="it">
-    <button class="itb active" onclick="si('reports_print','rp-mo')">الشهرية</button>
-    <button class="itb" onclick="si('reports_print','rp-cl')">حسب الفصل</button>
-    <button class="itb" onclick="si('reports_print','rp-st')">حسب الطالب</button>
+    <button class="itb active" onclick="si('reports_print','rp-mon');arInit()">رصد الغياب والتأخر</button>
+    <button class="itb" onclick="si('reports_print','rp-good');gdInit()">الطلاب المنضبطون</button>
   </div>
-  <div id="rp-mo" class="ip active">
+
+  <!-- ══ الرصد الشامل: غياب وتأخر ودقائق معاً ══
+       التقارير الثلاثة أعلاه غيابٌ وحده، ووكيل شؤون الطلاب يرصد
+       الاثنين معاً — ومجموعُهما يكشف من لا يبلغ عتبة أيٍّ منهما. -->
+  <div id="rp-mon" class="ip active">
     <div class="section">
-      <button class="btn bp1 bsm" onclick="loadReports()" style="margin-bottom:12px">تحميل</button>
-      <div class="tw"><table><thead><tr><th>الشهر</th><th>أيام الدراسة</th><th>إجمالي الغياب</th><th>الطلاب المتأثرون</th></tr></thead>
-      <tbody id="rep-table"></tbody></table></div>
-    </div>
-  </div>
-  <div id="rp-cl" class="ip">
-    <div class="section">
-      <div class="fg2">
-        <div class="fg"><label class="fl">الفصل</label><select id="rp-cls"><option value="">اختر</option></select></div>
-        <div class="fg"><label class="fl">من تاريخ</label><input type="date" id="rp-from"></div>
-        <div class="fg"><label class="fl">إلى تاريخ</label><input type="date" id="rp-to"></div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
+        <button class="btn bp2 bsm" onclick="arPreset('today')">اليوم</button>
+        <button class="btn bp2 bsm" onclick="arPreset('yesterday')">أمس</button>
+        <button class="btn bp2 bsm" onclick="arPreset('week')">هذا الأسبوع</button>
+        <button class="btn bp2 bsm" onclick="arPreset('last_week')">الأسبوع الماضي</button>
+        <button class="btn bp2 bsm" onclick="arPreset('month')">هذا الشهر</button>
+        <button class="btn bp2 bsm" onclick="arPreset('last_month')">الشهر الماضي</button>
+        <button class="btn bp2 bsm" onclick="arPreset('term')">الفصل الدراسي</button>
       </div>
-      <button class="btn bp1" onclick="loadClassReport()">إنشاء</button>
-      <div id="rp-cls-res" style="margin-top:14px"></div>
-    </div>
-  </div>
-  <div id="rp-st" class="ip">
-    <div class="section">
+
       <div class="fg2">
-        <div class="fg"><label class="fl">الفصل</label><select id="rp-sc" onchange="loadClsForRp()"><option value="">اختر</option></select></div>
-        <div class="fg"><label class="fl">الطالب</label><select id="rp-ss"><option value="">اختر</option></select></div>
+        <div class="fg"><label class="fl">من تاريخ</label>
+          <input type="date" id="ar-from"></div>
+        <div class="fg"><label class="fl">إلى تاريخ</label>
+          <input type="date" id="ar-to"></div>
+        <div class="fg"><label class="fl">الفصل</label>
+          <select id="ar-cls"><option value="">جميع الفصول</option></select></div>
+        <div class="fg"><label class="fl">التجميع حسب</label>
+          <select id="ar-grp">
+            <option value="student">الطالب</option>
+            <option value="class">الفصل</option>
+            <option value="day">اليوم</option>
+          </select></div>
+        <div class="fg"><label class="fl">الترتيب</label>
+          <select id="ar-sort">
+            <option value="absence">الأكثر غياباً</option>
+            <option value="tardy">الأكثر تأخراً</option>
+            <option value="minutes">الأكثر دقائق</option>
+            <option value="total">الأكثر إجمالاً</option>
+            <option value="name">الاسم</option>
+          </select></div>
+        <div class="fg"><label class="fl">أعلى عدد صفوف (0 = الكل)</label>
+          <input type="number" id="ar-limit" value="0" min="0"></div>
       </div>
-      <button class="btn bp1" onclick="loadStuReport()">إنشاء تقرير الطالب</button>
-      <div id="rp-st-res" style="margin-top:14px"></div>
+
+      <div style="display:flex;gap:18px;flex-wrap:wrap;margin:10px 0 4px">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+          <input type="checkbox" id="ar-abs" checked> الغياب</label>
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+          <input type="checkbox" id="ar-tdy" checked> التأخر ودقائقه</label>
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+          <input type="checkbox" id="ar-exc"> استبعاد الغياب بعذر</label>
+      </div>
+
+      <div class="fg2">
+        <div class="fg"><label class="fl">لا يقل الغياب عن</label>
+          <input type="number" id="ar-mina" value="0" min="0"></div>
+        <div class="fg"><label class="fl">لا يقل التأخر عن</label>
+          <input type="number" id="ar-mint" value="0" min="0"></div>
+        <div class="fg"><label class="fl">لا تقل الدقائق عن</label>
+          <input type="number" id="ar-minm" value="0" min="0"></div>
+      </div>
+
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+        <button class="btn bp1" onclick="arRun()">📊 إنشاء التقرير</button>
+        <button class="btn bp2" onclick="arOpen('print')">🖨️ طباعة</button>
+        <button class="btn bp2" onclick="arOpen('export')">⬇️ تصدير Excel</button>
+      </div>
+      <div id="ar-st" style="margin-top:10px;font-size:13px"></div>
     </div>
+    <div id="ar-res"></div>
+  </div>
+  <!-- ══ المنضبطون: مرآة الرصد الشامل ══
+       الرصد يُظهر من كثُر غيابه، وهذا يُظهر من لم يغب — وهما سؤالان
+       مختلفان: الأول للمعالجة والثاني للتكريم. ولا يُستخرج الثاني من
+       الأول بالقلب: من لا سجلّ له أصلاً لا يظهر في تقرير الغياب. -->
+  <div id="rp-good" class="ip">
+    <div class="section">
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
+        <button class="btn bp2 bsm" onclick="gdPreset('week')">هذا الأسبوع</button>
+        <button class="btn bp2 bsm" onclick="gdPreset('last_week')">الأسبوع الماضي</button>
+        <button class="btn bp2 bsm" onclick="gdPreset('month')">هذا الشهر</button>
+        <button class="btn bp2 bsm" onclick="gdPreset('last_month')">الشهر الماضي</button>
+        <button class="btn bp2 bsm" onclick="gdPreset('term')">الفصل الدراسي</button>
+      </div>
+
+      <div class="fg2">
+        <div class="fg"><label class="fl">من تاريخ</label>
+          <input type="date" id="gd-from"></div>
+        <div class="fg"><label class="fl">إلى تاريخ</label>
+          <input type="date" id="gd-to"></div>
+        <div class="fg"><label class="fl">الفصل</label>
+          <select id="gd-cls"><option value="">جميع الفصول</option></select></div>
+        <div class="fg"><label class="fl">الترتيب</label>
+          <select id="gd-sort">
+            <option value="name">الاسم</option>
+            <option value="class">الفصل</option>
+            <option value="clean">الأقلّ غياباً وتأخراً</option>
+          </select></div>
+      </div>
+
+      <div style="display:flex;gap:18px;flex-wrap:wrap;margin:10px 0 4px">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+          <input type="checkbox" id="gd-abs" checked> انضباط الحضور (لا غياب)</label>
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+          <input type="checkbox" id="gd-tdy" checked> انضباط الوقت (لا تأخر)</label>
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+          <input type="checkbox" id="gd-exc" checked> اعتبار الغياب بعذر انضباطاً</label>
+      </div>
+
+      <!-- التسامح: «لا غياب إطلاقاً» قد يُفرّغ القائمة في مدرسة كبيرة،
+           فيُسمح بهامشٍ يختاره الوكيل. صفرٌ = الانضباط التام -->
+      <div class="fg2">
+        <div class="fg"><label class="fl">يُتسامح مع غياب حتى</label>
+          <input type="number" id="gd-maxa" value="0" min="0"></div>
+        <div class="fg"><label class="fl">يُتسامح مع تأخر حتى</label>
+          <input type="number" id="gd-maxt" value="0" min="0"></div>
+        <div class="fg"><label class="fl">أعلى عدد صفوف (0 = الكل)</label>
+          <input type="number" id="gd-limit" value="0" min="0"></div>
+      </div>
+
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+        <button class="btn bp1" onclick="gdRun()">🏅 إنشاء القائمة</button>
+        <button class="btn bp2" onclick="gdOpen('print')">🖨️ طباعة</button>
+        <button class="btn bp2" onclick="gdOpen('export')">⬇️ تصدير Excel</button>
+      </div>
+      <div id="gd-st" style="margin-top:10px;font-size:13px"></div>
+    </div>
+    <div id="gd-res"></div>
   </div>
 </div>
 
@@ -3189,6 +3700,18 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
 
 <div id="tab-student_mgmt">
   <h2 class="pt"><i class="fas fa-graduation-cap"></i> إدارة الطلاب</h2>
+  <!-- الأسماء المشتركة بين الجنسين: تظهر وحدها عند وجودها، وتختفي
+       تماماً في المدارس التي لا يعنيها الأمر. الحسم يُحفظ في
+       gender_names.json فيبقى بعد كل استيراد — بخلاف نقلٍ يدوي يضيع. -->
+  <div class="section" id="gn-box" style="display:none;border-right:4px solid #B45309">
+    <div class="st" style="margin-bottom:6px">⚖️ أسماء تحتاج تحديد الجنس</div>
+    <div style="font-size:12.5px;color:var(--mu);margin-bottom:12px;line-height:1.8">
+      هذه أسماء يتسمّى بها الجنسان، فلم يُخمّنها النظام ووضع أصحابها مع جنس المدرسة.
+      حدّد الجنس مرّة واحدة — <b>يبقى محفوظاً بعد كل استيراد</b>.
+    </div>
+    <div id="gn-list"></div>
+    <div id="gn-st" style="margin-top:10px;font-size:13px"></div>
+  </div>
   <div class="section">
     <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:14px">
       <div class="fg" style="flex:1;min-width:200px"><label class="fl">بحث</label><input type="text" id="sm-q" placeholder="اسم أو رقم الطالب..." oninput="filterStudents()"></div>
@@ -3670,6 +4193,10 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
         <button class="btn bp1 bsm" onclick="usOpenAdd()">➕ جديد</button>
         <!-- التوليد كان في البرنامج المكتبي وحده، ومن يدير عن بُعد لا يبلغه -->
         <button class="btn bp2 bsm" onclick="usGenerate()">⚙️ توليد حسابات الطاقم</button>
+        <!-- الإرسال كان في المكتبي وحده كذلك. زرّان لا زرّ: نسيان
+             معلّمٍ واحد لا يستدعي تبديل كلمات أربعين -->
+        <button class="btn bp2 bsm" onclick="usSendCreds('one')">📤 إرسال للمحدَّد</button>
+        <button class="btn bp2 bsm" onclick="usSendCreds('all')">📨 إرسال للجميع</button>
         <button class="btn bp2 bsm" onclick="usToggle()">🔄 تفعيل/تعطيل</button>
         <button class="btn bp2 bsm" onclick="usChangePw()">🔑 كلمة المرور</button>
         <button class="btn bp3 bsm" onclick="usDelete()">🗑 حذف</button>
@@ -4675,7 +5202,7 @@ function showTab(key){
     'tardiness':loadTardiness,'excuses':loadExcuses,'permissions':loadPermissions,
     'logs':function(){fillSel('lg-cls');},
     'absence_mgmt':function(){fillSel('am-cls');fillSel('am-bc');},
-    'reports_print':function(){loadReports();fillSel('rp-cls');fillSel('rp-sc');},
+    'reports_print':function(){arInit();},
     'admin_report':generateAdminReport,
     'student_analysis':function(){fillSel('an-class');},
     'top_absent':loadTopAbsent,'alerts':loadAlerts,
@@ -5533,12 +6060,6 @@ function renderAnCharts(data){
 }
 
 /* ── REPORTS ── */
-async function loadReports(){
-  var d=await api('/web/api/stats-monthly');if(!d||!d.ok)return;
-  document.getElementById('rep-table').innerHTML=d.rows.map(function(r){
-    return '<tr><td>'+r.month+'</td><td>'+r.school_days+'</td><td><span class="badge br">'+r.total_abs+'</span></td><td>'+r.unique_students+'</td></tr>';
-  }).join('')||'<tr><td colspan="4" style="color:#9CA3AF">لا يوجد</td></tr>';
-}
 async function loadTopAbsent(){
   var d=await api('/web/api/top-absent');if(!d||!d.ok)return;
   document.getElementById('top-table').innerHTML=d.rows.map(function(r,i){
@@ -5612,6 +6133,49 @@ async function loadStudents(){
   var all=[];d.classes.forEach(function(c){c.students.forEach(function(s){all.push(Object.assign({},s,{class_name:c.name,class_id:c.id}));});});
   window._students=all;renderStuTbl(all);renderPhoTbl(all);
   var sm=document.getElementById('sm-sum');if(sm)sm.innerHTML='<span class="badge bb">'+all.length+' طالب إجمالاً</span>';
+  loadGenderNames();
+}
+
+/* ── الأسماء المشتركة بين الجنسين ── */
+function gnEsc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+async function loadGenderNames(){
+  var box=document.getElementById('gn-box');if(!box)return;
+  var d=await api('/web/api/gender-names');
+  if(!d||!d.ok||!(d.pending||[]).length){box.style.display='none';return;}
+  box.style.display='block';
+  var h='';
+  d.pending.forEach(function(p){
+    var who=p.students.map(function(s){
+      return gnEsc(s.full_name)+' <span style="color:var(--mu)">('+gnEsc(s.class_name)+')</span>';
+    }).join('، ');
+    var n=gnEsc(p.name), nj=p.name.replace(/'/g,"\\'");
+    h+='<div style="border:1px solid var(--line);border-radius:10px;padding:11px 13px;margin-bottom:9px">'+
+       '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">'+
+       '<b style="font-size:15px">'+n+'</b>'+
+       '<span class="badge bb">'+p.count+'</span>'+
+       '<span style="flex:1"></span>'+
+       '<button class="btn bp1 bsm" onclick="gnSet(\''+nj+'\',\'male\')">👦 ولد</button>'+
+       '<button class="btn bp2 bsm" onclick="gnSet(\''+nj+'\',\'female\')">👧 بنت</button>'+
+       '</div>'+
+       '<div style="font-size:12px;color:#475569;margin-top:7px;line-height:1.9">'+who+'</div>'+
+       '</div>';
+  });
+  document.getElementById('gn-list').innerHTML=h;
+}
+async function gnSet(name,gender){
+  var lbl=(gender==='male')?'ولد':'بنت';
+  if(!confirm('سيُحفظ «'+name+'» كـ'+lbl+' نهائياً، ويُنقل حاملوه إلى الفصل المناسب إن وُجد.\n\nهل تريد المتابعة؟')) return;
+  ss('gn-st','⏳ جارٍ الحفظ...','ai');
+  try{
+    var r=await fetch('/web/api/gender-names',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:name,gender:gender,apply:true})});
+    var d=await r.json();
+    if(!d.ok){ss('gn-st','❌ '+(d.msg||'خطأ'),'er');return;}
+    ss('gn-st','✅ حُفظ «'+name+'» كـ'+lbl+
+       (d.moved?(' · نُقل '+d.moved+' طالباً إلى الفصل المناسب'):' · لا نقل مطلوب'),'ok');
+    loadStudents();
+  }catch(e){ss('gn-st','❌ خطأ في الاتصال','er');}
 }
 function filterStudents(){
   var phTab=document.getElementById('tab-phones');
@@ -5808,6 +6372,231 @@ async function usGenerate(){
     loadUsers();
   }catch(e){ ss('us-st','❌ خطأ في الاتصال','er'); }
 }
+/* ══ الرصد الشامل: غياب + تأخر + دقائق ══ */
+var _arPreset='month';
+
+function arInit(){
+  fillSel('ar-cls');
+  var el=document.getElementById('ar-cls');
+  if(el&&el.options.length)el.options[0].textContent='جميع الفصول';
+  if(!document.getElementById('ar-from').value) arPreset('month');
+}
+
+function arQuery(){
+  function v(id){var e=document.getElementById(id);return e?e.value:'';}
+  function c(id){var e=document.getElementById(id);return e&&e.checked?'1':'0';}
+  var q='preset='+encodeURIComponent(_arPreset);
+  // التواريخ تُرسَل دائماً: المستخدم قد يعدّلها يدوياً بعد اختصارٍ،
+  // و`custom` وحده يقرؤها فنُبدّل الاختصار عند أي تعديل يدوي
+  q+='&from='+encodeURIComponent(v('ar-from'))+'&to='+encodeURIComponent(v('ar-to'));
+  q+='&absence='+c('ar-abs')+'&tardy='+c('ar-tdy')+'&exclude_excused='+c('ar-exc');
+  q+='&class_id='+encodeURIComponent(v('ar-cls'));
+  q+='&group_by='+encodeURIComponent(v('ar-grp'))+'&sort='+encodeURIComponent(v('ar-sort'));
+  q+='&min_absence='+(v('ar-mina')||0)+'&min_tardy='+(v('ar-mint')||0);
+  q+='&min_minutes='+(v('ar-minm')||0)+'&limit='+(v('ar-limit')||0);
+  return q;
+}
+
+function arPreset(p){ _arPreset=p; arRun(); }
+
+// تعديل تاريخٍ يدوياً يعني «مخصص» — وإلا تجاهله الخادم وبقي الاختصار
+document.addEventListener('change',function(e){
+  if(e.target&&(e.target.id==='ar-from'||e.target.id==='ar-to')) _arPreset='custom';
+});
+
+async function arRun(){
+  ss('ar-st','⏳ جارٍ الحساب...','ai');
+  try{
+    var d=await api('/web/api/reports/attendance?'+arQuery());
+    if(!d||!d.ok){ ss('ar-st','❌ '+((d&&d.msg)||'تعذّر إنشاء التقرير'),'er'); return; }
+    // التواريخ من الخادم لا من المتصفح: ساعتُه قد تكون مضبوطة خطأً
+    document.getElementById('ar-from').value=d.from;
+    document.getElementById('ar-to').value=d.to;
+    ss('ar-st','','');
+    arRender(d);
+  }catch(e){ ss('ar-st','❌ خطأ في الاتصال','er'); }
+}
+
+function arFmtMin(m){
+  m=parseInt(m||0,10);
+  return m<60?(m+' د'):(Math.floor(m/60)+' س '+(m%60)+' د');
+}
+
+function arRender(d){
+  var box=document.getElementById('ar-res');
+  var GRP={student:'الطالب',"class":'الفصل',day:'اليوم'};
+  var h='<div class="stat-cards">';
+  if(d.include_absence) h+=crd(d.totals.absence,'#C62828','إجمالي أيام الغياب','🔴');
+  if(d.include_tardy){
+    h+=crd(d.totals.tardy,'#E65100','إجمالي أيام التأخر','⏰');
+    h+=crd(arFmtMin(d.totals.minutes),'#7c3aed','مجموع دقائق التأخر','⏳');
+  }
+  h+=crd(d.school_days,'#1565C0','أيام الدراسة في المدى','📅');
+  // جمعٌ لا مفرد: «12 الطالب» كانت تقرأ خطأً، ووسيط التأنيث يجعلها
+  // «12 الطالبة» في مدارس البنات فتزداد سوءاً
+  var CNT={student:'عدد الطلاب',"class":'عدد الفصول',day:'عدد الأيام'};
+  h+=crd(d.totals.rows,'#0f766e',CNT[d.group_by]||'عدد البنود','👥');
+  h+='</div>';
+
+  var cols=[['#','idx'],[GRP[d.group_by]||'البند','name']];
+  if(d.group_by==='student') cols.push(['الفصل','class_name']);
+  if(d.include_absence){
+    cols.push(['أيام الغياب','absence']);
+    // بلا مقام لا نسبة — وعمودٌ من الشُّرَط أسوأ من غيابه
+    if(d.has_pct) cols.push(['النسبة','pct']);
+    if(d.exclude_excused) cols.push(['بعذر','excused']);
+    if(d.group_by!=='day') cols.push(['آخر غياب','last_absence']);
+  }
+  if(d.include_tardy){
+    cols.push(['أيام التأخر','tardy'],['مجموع الدقائق','minutes'],
+              ['متوسط الدقائق','avg_minutes']);
+    if(d.group_by!=='day') cols.push(['آخر تأخر','last_tardy']);
+  }
+  if(d.include_absence&&d.include_tardy) cols.push(['المجموع','total']);
+
+  h+='<div class="section"><div class="st">النتائج — من '+d.from+' إلى '+d.to+'</div>';
+  if(!d.rows.length){
+    h+='<p class="muted" style="padding:18px 4px">لا توجد سجلات مطابقة لهذه الخيارات.</p></div>';
+    box.innerHTML=h; return;
+  }
+  h+='<div class="tw"><table><thead><tr>'+
+     cols.map(function(c){return '<th>'+c[0]+'</th>';}).join('')+
+     '</tr></thead><tbody>';
+  d.rows.forEach(function(r,i){
+    h+='<tr>'+cols.map(function(c){
+      var k=c[1];
+      if(k==='idx') return '<td>'+(i+1)+'</td>';
+      if(k==='minutes') return '<td>'+arFmtMin(r.minutes)+'</td>';
+      if(k==='pct') return '<td>'+(r.pct==null?'—':r.pct.toFixed(1)+'%')+'</td>';
+      var val=r[k];
+      return '<td>'+gnEsc(val===null||val===undefined?'':val)+'</td>';
+    }).join('')+'</tr>';
+  });
+  h+='</tbody></table></div></div>';
+  box.innerHTML=h;
+}
+
+function arOpen(kind){
+  var path=(kind==='print')?'attendance-print':'attendance-export';
+  window.open('/web/api/reports/'+path+'?'+arQuery(),'_blank');
+}
+
+/* ══ الطلاب المنضبطون ══ */
+var _gdPreset='month';
+
+function gdInit(){
+  fillSel('gd-cls');
+  var el=document.getElementById('gd-cls');
+  if(el&&el.options.length)el.options[0].textContent='جميع الفصول';
+  if(!document.getElementById('gd-from').value) gdPreset('month');
+}
+
+function gdQuery(){
+  function v(id){var e=document.getElementById(id);return e?e.value:'';}
+  function c(id){var e=document.getElementById(id);return e&&e.checked?'1':'0';}
+  var q='kind=good&preset='+encodeURIComponent(_gdPreset);
+  q+='&from='+encodeURIComponent(v('gd-from'))+'&to='+encodeURIComponent(v('gd-to'));
+  q+='&absence='+c('gd-abs')+'&tardy='+c('gd-tdy')+'&excused_ok='+c('gd-exc');
+  q+='&class_id='+encodeURIComponent(v('gd-cls'))+'&sort='+encodeURIComponent(v('gd-sort'));
+  q+='&max_absence='+(v('gd-maxa')||0)+'&max_tardy='+(v('gd-maxt')||0);
+  q+='&limit='+(v('gd-limit')||0);
+  return q;
+}
+
+function gdPreset(p){ _gdPreset=p; gdRun(); }
+
+document.addEventListener('change',function(e){
+  if(e.target&&(e.target.id==='gd-from'||e.target.id==='gd-to')) _gdPreset='custom';
+});
+
+async function gdRun(){
+  ss('gd-st','⏳ جارٍ الحساب...','ai');
+  try{
+    var d=await api('/web/api/reports/good-standing?'+gdQuery());
+    if(!d||!d.ok){ ss('gd-st','❌ '+((d&&d.msg)||'تعذّر إنشاء القائمة'),'er'); return; }
+    document.getElementById('gd-from').value=d.from;
+    document.getElementById('gd-to').value=d.to;
+    ss('gd-st','','');
+    gdRender(d);
+  }catch(e){ ss('gd-st','❌ خطأ في الاتصال','er'); }
+}
+
+function gdRender(d){
+  var box=document.getElementById('gd-res'), t=d.totals;
+  var pct=t.scanned?Math.round(t.rows*100/t.scanned):0;
+  var h='<div class="stat-cards">'+
+    crd(t.rows,'#15803d','عدد المنضبطين','🏅')+
+    crd(t.perfect,'#0f766e','بلا غياب ولا تأخر','✨')+
+    crd(t.scanned,'#1565C0','من أصل','👥')+
+    crd(pct+'%','#7c3aed','نسبة الانضباط','📊')+
+    crd(d.school_days,'#E65100','أيام الدراسة في المدى','📅')+
+    '</div>';
+
+  // الأعمدة الرقمية تظهر فقط حين يُسمح بهامش — وإلا كانت أصفاراً
+  var f=d.filters||{};
+  var cols=[['#','idx'],['الطالب','name'],['الفصل','class_name']];
+  if(d.include_absence&&f.max_absence) cols.push(['أيام الغياب','absence']);
+  if(d.include_tardy&&f.max_tardy) cols.push(['أيام التأخر','tardy'],['مجموع الدقائق','minutes']);
+  if(d.excused_ok) cols.push(['غياب بعذر','excused']);
+
+  h+='<div class="section"><div class="st">المنضبطون — من '+d.from+' إلى '+d.to+'</div>';
+  if(!d.rows.length){
+    h+='<p class="muted" style="padding:18px 4px">لا يوجد طالب مطابق. '
+      +'جرّب رفع هامش التسامح أو توسيع المدة.</p></div>';
+    box.innerHTML=h; return;
+  }
+  h+='<div class="tw"><table><thead><tr>'+
+     cols.map(function(c){return '<th>'+c[0]+'</th>';}).join('')+
+     '</tr></thead><tbody>';
+  d.rows.forEach(function(r,i){
+    h+='<tr>'+cols.map(function(c){
+      var k=c[1];
+      if(k==='idx') return '<td>'+(i+1)+'</td>';
+      if(k==='minutes') return '<td>'+arFmtMin(r.minutes)+'</td>';
+      // نجمةٌ لمن لا غياب له ولا تأخر — تُميّزه عمّن دخل بالهامش
+      if(k==='name') return '<td>'+(r.perfect?'✨ ':'')+gnEsc(r.name)+'</td>';
+      return '<td>'+gnEsc(r[k]==null?'':r[k])+'</td>';
+    }).join('')+'</tr>';
+  });
+  h+='</tbody></table></div></div>';
+  box.innerHTML=h;
+}
+
+function gdOpen(kind){
+  var path=(kind==='print')?'attendance-print':'attendance-export';
+  window.open('/web/api/reports/'+path+'?'+gdQuery()
+              +'&title='+encodeURIComponent('قائمة الطلاب المنضبطين'),'_blank');
+}
+
+async function usSendCreds(scope){
+  var body={scope:scope};
+  if(scope==='one'){
+    if(!_usSelected){ ss('us-st','اختر مستخدماً من القائمة أولاً','er'); return; }
+    body.username=_usSelected.username;
+    if(!confirm('سيُولَّد كلمة مرور جديدة لـ«'+_usSelected.full_name+'» '+
+                'وتُرسَل له عبر الواتساب.\n\n'+
+                'كلمته الحالية لن تعمل بعدها.\n\nهل تريد المتابعة؟')) return;
+  } else {
+    if(!confirm('سيُولَّد كلمة مرور جديدة لكل عضو في الطاقم وتُرسَل عبر '+
+                'الواتساب.\n\n'+
+                '⚠️ كلمات المرور الحالية كلها لن تعمل بعدها، ومن غيّر '+
+                'كلمته سيفقدها.\n\nهل أنت متأكد؟')) return;
+  }
+  ss('us-st','⏳ جارٍ الإرسال... قد يستغرق دقائق','ai');
+  try{
+    var r=await fetch('/web/api/users/send-credentials',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    var d=await r.json();
+    if(!d.ok){ ss('us-st','❌ '+(d.msg||'تعذّر الإرسال'),'er'); return; }
+    var m='✅ أُرسل لـ'+d.sent+(d.skipped?(' · تُخطّي '+d.skipped):'');
+    // الأسباب تُعرض لا تُبتلع: «بُدّلت ولم تُرسَل» تعني معلّماً عاجزاً
+    // عن الدخول ولا يدري
+    if(d.reasons && d.reasons.length) m+='<br><span style="font-size:12px">'+
+      d.reasons.join(' · ')+'</span>';
+    ss('us-st',m, d.sent?'ok':'er');
+  }catch(e){ ss('us-st','❌ خطأ في الاتصال','er'); }
+}
+
 function _usBuildTabsGrid(){
   var grid=document.getElementById('us-tabs-grid');
   grid.innerHTML=_US_ALL_TABS.map(function(t){
@@ -8756,24 +9545,6 @@ async function loadClassReport(){
     html+='</tbody></table></div></div>';
     if(box)box.innerHTML=html;
   }catch(e){ss('tr-st','❌ خطأ في الاتصال','er');if(box)box.innerHTML='';}
-}
-async function loadStuReport(){
-  var sid=document.getElementById('rp-ss').value;
-  if(!sid){alert('اختر طالباً');return;}
-  var d=await api('/web/api/student-analysis/'+sid);
-  if(!d||!d.ok){alert('❌ فشل التحميل');return;}
-  var a=d.data||{};
-  var html='<div class="section"><div class="st">تقرير الطالب: '+(a.name||'')+'</div>'+
-    '<p><strong>الفصل:</strong> '+(a.class_name||'—')+'</p>'+
-    '<p><strong>أيام الغياب:</strong> '+(a.total_absences||0)+'</p>'+
-    '<p><strong>مرات التأخر:</strong> '+(a.total_tardiness||0)+'</p></div>';
-  var box=document.getElementById('rp-res');if(box)box.innerHTML=html;else alert('✅');
-}
-async function loadClsForRp(){
-  var cid=document.getElementById('rp-sc').value;if(!cid)return;
-  var d=await api('/web/api/class-students/'+cid);if(!d||!d.ok)return;
-  document.getElementById('rp-ss').innerHTML='<option value="">اختر طالباً</option>'+
-    d.students.map(function(s){return '<option value="'+s.id+'">'+s.name+'</option>';}).join('');
 }
 async function addStudentManual(){
   var id=document.getElementById('as-id').value.trim();
@@ -13216,8 +13987,10 @@ async def wa_reset_session(request: Request):
         return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
     try:
         import shutil
-        from constants import BASE_DIR
-        auth_path = os.path.join(BASE_DIR, "my-whatsapp-server", ".wwebjs_auth")
+        # جلسة رقم هذه المرحلة وحدها — الحذف المشترك كان يقطع الرقم
+        # الآخر عن مرحلته بلا أن يطلب أحد ذلك
+        from whatsapp_service import wa_file
+        auth_path = wa_file(".wwebjs_auth")
         if os.path.exists(auth_path):
             shutil.rmtree(auth_path, ignore_errors=True)
         return JSONResponse({"ok": True, "msg": "تم حذف الجلسة — يرجى تشغيل الخادم من جديد"})

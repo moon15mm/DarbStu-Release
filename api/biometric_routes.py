@@ -273,17 +273,127 @@ async def bio_unenroll(request: Request):
 
 
 # ── توليد الأرقام الأكاديمية ──────────────────────────────────────
-@router.post("/web/api/biometric/generate-numbers", response_class=JSONResponse)
-async def bio_generate_numbers(request: Request):
+@router.get("/web/api/biometric/number-plan", response_class=JSONResponse)
+async def bio_number_plan(request: Request):
     """
-    يولّد رقماً أكاديمياً مبنياً على السنة الميلادية (≤٩ خانات) لكل طالب
-    لا يملكه — يبقى ثابتاً معه حتى التخرج. idempotent: لا يمسّ رقماً قائماً.
+    حالة الأرقام الأكاديمية على هذا الجهاز: مدى كل مرحلة، وأي تصادم قائم،
+    وبدايةُ مدىً مقترحة خالية للمرحلة الحالية.
     """
     if not _auth(request):
         return _unauth()
     try:
-        res = assign_academic_numbers(force=False)
+        from database import (academic_numbers_by_stage, suggest_academic_base,
+                              academic_slot, load_students)
+        from constants import STAGE_ID
+        by_stage = academic_numbers_by_stage()
+        stages = []
+        for sid, nums in sorted(by_stage.items()):
+            vals = sorted(int(n) for n in nums if str(n).isdigit())
+            stages.append({
+                "stage": sid, "is_current": (sid == (STAGE_ID or "")),
+                "count": len(nums),
+                "first": vals[0] if vals else None,
+                "last": vals[-1] if vals else None,
+            })
+
+        # تصادمٌ قائم الآن — بالرقم أو بخانة الجهاز
+        seen_num, seen_slot, clashes = {}, {}, []
+        for sid, nums in sorted(by_stage.items()):
+            for an, nm in nums.items():
+                if an in seen_num and seen_num[an][0] != sid:
+                    clashes.append({"kind": "number", "number": an,
+                                    "a": seen_num[an], "b": [sid, nm]})
+                else:
+                    seen_num[an] = [sid, nm]
+                sl = academic_slot(an)
+                if sl in seen_slot and seen_slot[sl][0] != sid \
+                        and seen_slot[sl][2] != an:
+                    clashes.append({"kind": "slot", "slot": sl,
+                                    "a": seen_slot[sl], "b": [sid, nm, an]})
+                else:
+                    seen_slot[sl] = [sid, nm, an]
+
+        total = sum(len(c.get("students", []))
+                    for c in load_students().get("list", []))
+        return JSONResponse({
+            "ok": True, "stages": stages, "current": STAGE_ID or "",
+            "students": total,
+            "clashes": clashes[:20], "clashes_total": len(clashes),
+            "suggested_base": suggest_academic_base(max(total, 1)),
+        })
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@router.post("/web/api/biometric/generate-numbers", response_class=JSONResponse)
+async def bio_generate_numbers(request: Request):
+    """
+    يولّد رقماً أكاديمياً (≤٩ خانات) لكل طالب لا يملكه — يبقى ثابتاً معه
+    حتى التخرج. idempotent افتراضياً: لا يمسّ رقماً قائماً.
+
+    `base`  : بدايةُ مدىً يدوية بدل معادلة السنة. لمدرسةٍ بمرحلتين تتشارك
+              أجهزة البصمة: تبقى مرحلةٌ على أرقامها وتُعطى الأخرى مدىً
+              خاصاً، وإلا حمل طالبان الرقم نفسه فسُجّلت البصمة للخطأ.
+    `force` : يُعيد توليد أرقام **كل** الطلاب. يُبطل تسجيلات الأجهزة
+              القائمة، فلا يُستعمل إلا قبل التسجيل أو بإعادة تسجيل كاملة.
+    """
+    if not _auth(request):
+        return _unauth()
+    try:
+        from database import check_academic_span, load_students
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        force = bool(body.get("force"))
+        base = body.get("base")
+
+        if base not in (None, ""):
+            try:
+                base = int(str(base).strip())
+            except Exception:
+                return JSONResponse(
+                    {"ok": False, "error": "بداية المدى يجب أن تكون رقماً."},
+                    status_code=400)
+
+            # كم رقماً سيُولَّد؟ بـforce الكلّ، وإلا الناقصون وحدهم.
+            need = 0
+            for c in load_students(force_reload=True).get("list", []):
+                for s in c.get("students", []):
+                    if force or not str(s.get("academic_no") or "").strip():
+                        need += 1
+            if not need:
+                return JSONResponse({"ok": True, "assigned": 0,
+                                     "total": 0, "already": 0})
+
+            chk = check_academic_span(base, need)
+            if not chk["ok"]:
+                # الرفض قبل الكتابة: بعد التوليد تكون البصمات قد رُبطت
+                # بأرقامٍ متصادمة، ولا يكشفها شيء إلا غيابٌ خاطئ
+                if chk["over_limit"]:
+                    msg = "المدى يتجاوز ٩ خانات — اختر بدايةً أصغر."
+                elif chk["conflicts"]:
+                    c0 = chk["conflicts"][0]
+                    msg = ("الرقم %s مستعمَل في مرحلة «%s» (%s) — و%d رقماً "
+                           "آخر. اختر بدايةً أخرى."
+                           % (c0["number"], c0["stage"], c0["name"],
+                              chk["conflicts_total"]))
+                else:
+                    c0 = chk["slot_conflicts"][0]
+                    msg = ("رقمٌ مختلف لكنه يقع في خانة الجهاز نفسها: %s في "
+                           "مرحلة «%s» (%s) يصطدم بـ%s. جهاز البصمة يفهرس "
+                           "بباقي القسمة على 65536، فاختر بدايةً تبعد عنها "
+                           "بغير مضاعفٍ لـ65536."
+                           % (c0["number"], c0["stage"], c0["name"],
+                              c0["mine"]))
+                return JSONResponse({"ok": False, "error": msg, "check": chk},
+                                    status_code=400)
+
+        res = assign_academic_numbers(force=force,
+                                      base=(base if base != "" else None))
         return JSONResponse({"ok": True, **res})
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
@@ -867,6 +977,22 @@ _ENROLL_PAGE = """<!DOCTYPE html>
   <button class="btn o" onclick="genNumbers()">توليد الأرقام الأكاديمية</button>
 </div>
 
+<!-- مدى يدوي: لمدرسةٍ بمرحلتين تتشارك أجهزة البصمة. تظهر وحدها حين
+     يوجد أكثر من مرحلة على الجهاز، فلا تُربك مدرسةً بمرحلة واحدة. -->
+<div class="bar" id="spanbar" style="display:none;flex-wrap:wrap;gap:8px">
+  <div style="flex:1 1 100%;font-size:13px;color:#334155" id="spantxt">—</div>
+  <div id="spanwarn" style="flex:1 1 100%;display:none;font-size:13px;
+       background:#FEF2F2;color:#991B1B;border:1px solid #FECACA;
+       border-radius:8px;padding:8px 11px"></div>
+  <label class="muted" style="font-size:13px">ابدأ الترقيم من:</label>
+  <input class="search" id="spanbase" style="max-width:150px" inputmode="numeric"
+         placeholder="مثال 100001">
+  <label class="muted" style="font-size:13px">
+    <input type="checkbox" id="spanforce"> إعادة ترقيم الجميع
+  </label>
+  <button class="btn o" onclick="genNumbers(true)">ولّد بهذا المدى</button>
+</div>
+
 <div id="list"><p class="muted">جارٍ التحميل...</p></div>
 
 <div class="modal" id="modal">
@@ -961,13 +1087,58 @@ async function syncFromDevice(){
   }
 }
 
-async function genNumbers(){
-  const d=await api('/web/api/biometric/generate-numbers',{method:'POST'});
+async function genNumbers(useSpan){
+  var body={};
+  if(useSpan){
+    var b=($('spanbase').value||'').trim();
+    if(!/^\d+$/.test(b)){ alert('اكتب رقم البداية أرقاماً فقط.'); return; }
+    body.base=parseInt(b,10);
+    body.force=$('spanforce').checked;
+    if(body.force && !confirm('إعادة ترقيم الجميع تُبطل كل بصمة مسجَّلة '
+        +'على الأجهزة، ويجب إعادة تسجيلها.\n\nمتأكد؟')) return;
+  }
+  const d=await api('/web/api/biometric/generate-numbers',
+                    {method:'POST',body:JSON.stringify(body)});
   if(d&&d.ok){
-    await load();
-    alert(d.assigned ? ('تم توليد '+d.assigned+' رقماً جديداً.')
+    await load(); await loadPlan();
+    alert(d.assigned ? ('تم توليد '+d.assigned+' رقماً — من '+d.first
+                        +' إلى '+d.last+'.')
                      : 'كل الطلاب لديهم أرقام بالفعل — لا جديد.');
   } else { alert('تعذّر التوليد: '+((d&&d.error)||'')); }
+}
+
+// حالة الأرقام عبر مراحل هذا الجهاز. جهاز البصمة لا يعرف المراحل،
+// فطلابها كلهم في خانةٍ واحدة عنده — ولذلك يُعرض المدى لا العدد وحده.
+async function loadPlan(){
+  var d=null;
+  try{ d=await api('/web/api/biometric/number-plan'); }catch(e){ return; }
+  if(!d||!d.ok) return;
+  if(!d.stages || d.stages.length<2){
+    $('spanbar').style.display='none';
+    return;
+  }
+  $('spanbar').style.display='flex';
+  var parts=d.stages.map(function(s){
+    var r=(s.first!=null)?(s.first+'–'+s.last):'بلا أرقام';
+    return (s.is_current?'▸ ':'') + s.stage + ': ' + r
+           + ' (' + s.count + ')';
+  });
+  $('spantxt').innerHTML='هذا الجهاز عليه أكثر من مرحلة، وأجهزة البصمة '
+    +'تفهرس الطلاب برقم واحد — فلا يجوز أن يتكرر رقم بين مرحلتين.<br>'
+    +'<b>المدى الحالي:</b> '+parts.join(' &nbsp;|&nbsp; ');
+  var w=$('spanwarn');
+  if(d.clashes_total){
+    var c=d.clashes[0];
+    w.style.display='block';
+    w.innerHTML='⚠️ يوجد '+d.clashes_total+' تصادماً الآن. مثال: '
+      +(c.kind==='number'
+        ? ('الرقم '+c.number+' عند «'+c.a[1]+'» ('+c.a[0]+') و«'+c.b[1]+'» ('+c.b[0]+').')
+        : ('رقمان مختلفان في خانة الجهاز نفسها ('+c.slot+'): '+c.a[2]
+           +' و'+c.b[2]+'.'))
+      +' أعِد ترقيم إحدى المرحلتين قبل تسجيل البصمات.';
+  } else { w.style.display='none'; }
+  if(d.suggested_base && !$('spanbase').value)
+    $('spanbase').value=d.suggested_base;
 }
 
 function updateProg(){
@@ -1168,6 +1339,8 @@ document.addEventListener('keydown', (e)=>{
   }
 });
 
-window.onload=load;
+// ‏loadPlan منفصلة ومتسامحة: مدرسةٌ بمرحلة واحدة لا يعنيها الأمر،
+// وسقوطها يجب ألا يمنع ظهور قائمة الطلاب
+window.onload=function(){ load(); loadPlan(); };
 </script>
 </body></html>"""

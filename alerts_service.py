@@ -1094,8 +1094,10 @@ def send_permission_request(pid: int) -> tuple:
 def _save_pending_permission(phone: str, data: dict):
     """يحفظ الطلب في pending_excuses.json للبوت."""
     import json as _j
-    pf = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                      "my-whatsapp-server","pending_excuses.json")
+    # دفتر الأعذار موسومٌ بمنفذ رقم هذه المرحلة — مرحلتان برقمين لهما
+    # دفتران، وبرقم واحد دفتر واحد
+    from whatsapp_service import wa_file
+    pf = wa_file("pending_excuses.json")
     try:
         pending = {}
         if os.path.exists(pf):

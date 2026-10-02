@@ -22,9 +22,25 @@ import random
 import sys
 import threading
 
-from constants import DATA_DIR
+from constants import BASE_DIR, DATA_DIR
 
-STATE_FILE = os.path.join(DATA_DIR, ".wa_limits.json")
+# ── موضع الدفاتر: مع الرقم لا مع المرحلة ─────────────────────────────
+# السقف يحمي **رقم واتساب**، وخادم الواتساب وجلسته في جذر البرنامج
+# مشتركان بين المراحل عمداً — رقم واحد يكفي مدرستين على جهاز واحد.
+# فدفترٌ تحت `stages/<id>/data` يمنح الرقم الواحد سقفين مستقلّين: ٣٠٠
+# رقم جديد في يومٍ على رقمٍ واحد، وهو بالضبط ما يستدعي الحظر.
+#
+# والدفتر مفتوحٌ بالمنفذ داخلياً (`_entry`)، فالموضع المشترك يخدم
+# الحالتين معاً: رقمٌ واحد للمرحلتين ⇒ مفتاح واحد وسقف واحد، ورقمٌ لكل
+# مرحلة ⇒ مفتاحان وسقفان مستقلّان بحقّ.
+#
+# ⚠️ `BASE_DIR/data` لا `BASE_DIR`: لمدرسة بمرحلة واحدة يتطابق الأول مع
+# `DATA_DIR` حرفاً بحرف، فلا يتغيّر شيء. ولو نُقل إلى الجذر لفقدت كل
+# مدرسة قائمة دفتر أرقامها المعروفة، فعاد كل ولي أمر «جديداً» واستُهلك
+# سقف الأرقام الجديدة في ساعة — تعطّلٌ صامت في كل مدرسة معاً.
+_LEDGER_DIR = os.path.join(BASE_DIR, "data")
+
+STATE_FILE = os.path.join(_LEDGER_DIR, ".wa_limits.json")
 _LOCK = threading.Lock()
 
 # السقف اليومي حسب عمر الرقم. الرقم الجديد هو الأكثر عرضة للحظر،
@@ -68,7 +84,7 @@ _MAX_KNOWN_DAILY = 800
 
 # دفتر جهات الاتصال المعروفة — ملف مستقل عن حالة اليوم عمداً: حالة اليوم
 # تُكتب مع كل رسالة، والدفتر لا يُكتب إلا حين يُعرف رقمٌ جديد (نادر).
-CONTACTS_FILE = os.path.join(DATA_DIR, ".wa_contacts.json")
+CONTACTS_FILE = os.path.join(_LEDGER_DIR, ".wa_contacts.json")
 
 # يُنسى الرقم بعد هذه المدة بلا مراسلة فيعود «جديداً» — وهو الصحيح:
 # ولي أمر لم يصله شيء منذ نصف عام لم يعد يعرف الرقم.
@@ -288,6 +304,37 @@ def _seed_from_history() -> dict:
     return out
 
 
+def _merge_stage_contacts() -> dict:
+    """
+    يدمج دفاتر الأرقام التي كانت تحت `stages/<id>/data` قبل توحيد الموضع.
+
+    يُقرأ مرةً واحدة: بعد أول دمج يوجد الدفتر المشترك فلا يُستدعى. ولا
+    تُحذف الدفاتر القديمة — تركُها يُبقي للرجوع سبيلاً إن سقط الدمج.
+    """
+    out = {}
+    try:
+        import glob
+        pat = os.path.join(BASE_DIR, "stages", "*", "data", ".wa_contacts.json")
+        for p in glob.glob(pat):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    seen = (json.load(f) or {}).get("seen")
+                if not isinstance(seen, dict):
+                    continue
+                for ph, d in seen.items():
+                    # الأحدث يفوز: الرقم معروفٌ لدى الرقم المشترك إن
+                    # راسلته أيٌّ من المرحلتين
+                    if str(d or "") > str(out.get(ph, "")):
+                        out[ph] = d
+            except Exception:
+                continue
+        if out:
+            print(f"[WA-LIMITS] دُمج دفتر الأرقام من المراحل: {len(out)} رقماً")
+    except Exception:
+        pass
+    return out
+
+
 def _load_contacts() -> dict:
     global _contacts
     if _contacts is not None:
@@ -302,7 +349,12 @@ def _load_contacts() -> dict:
     except Exception:
         data = None
     if data is None:                       # أول تشغيل بعد التحديث
-        data = _seed_from_history()
+        # مدرسة بمرحلتين كانت تحفظ دفتراً لكل مرحلة قبل توحيد الموضع.
+        # يُدمج الدفتران بأحدث تاريخ لكل رقم — وإغفاله يعيد كل ولي أمر
+        # «جديداً» فيُستهلك سقف الأرقام الجديدة في ساعة.
+        data = _merge_stage_contacts()
+        if not data:
+            data = _seed_from_history()
         _contacts = data
         # لا يُكتب دفترٌ فارغ: قد تكون القاعدة كانت مقفلة لحظة القراءة
         # (نسخة احتياطية تعمل مثلاً) فنُثبّت فراغاً كاذباً إلى الأبد.
@@ -317,7 +369,7 @@ def _load_contacts() -> dict:
 
 def _save_contacts():
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
+        os.makedirs(_LEDGER_DIR, exist_ok=True)
         tmp = CONTACTS_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"seen": _contacts or {}}, f, indent=0)
@@ -386,7 +438,7 @@ def _load() -> dict:
 
 def _save(d: dict):
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
+        os.makedirs(_LEDGER_DIR, exist_ok=True)
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(d, f, ensure_ascii=False, indent=2)

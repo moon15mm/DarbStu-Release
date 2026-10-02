@@ -1312,16 +1312,39 @@ def get_biometric_enrollments():
         con.close()
 
 
-def assign_academic_numbers(force=False, year=2027):
-    """
-    يولّد رقماً أكاديمياً مُهيكلاً بالسنة الميلادية لكل طالب لا يملكه.
+# ── قيد جهاز البصمة: ١٦ بت ───────────────────────────────────────────
+# ‏`zk_device.set_user` و`enroll_student` يكتبان `uid=int(n) & 0xFFFF`
+# بينما يحفظان الرقم الكامل نصّاً في `user_id`. فالخانة الداخلية في
+# الجهاز ٦٥٥٣٦ خانة لا أكثر، ورقمان يفترقان بمضاعفٍ لها يقعان في
+# الخانة نفسها **فيمحو الثاني تسجيل الأول بلا رسالة خطأ**.
+# لذلك لا يكفي أن تختلف الأرقام؛ يجب أن تختلف بباقي القسمة على ٦٥٥٣٦.
+DEVICE_UID_MOD = 0x10000                              # 65536
+ACADEMIC_MAX = 999999999                              # ٩ خانات — حدّ الجهاز
 
-    المعادلة: (آخر خانتين من السنة) × ١٠٠٠٠ + تسلسل عام.
+
+def academic_slot(n) -> int:
+    """خانة الجهاز الداخلية لرقمٍ أكاديمي — بها يقع التصادم لا بالرقم."""
+    try:
+        return int(str(n).strip()) % DEVICE_UID_MOD
+    except Exception:
+        return -1
+
+
+def assign_academic_numbers(force=False, year=2027, base=None):
+    """
+    يولّد رقماً أكاديمياً مُهيكلاً لكل طالب لا يملكه.
+
+    المعادلة الافتراضية: (آخر خانتين من السنة) × ١٠٠٠٠ + تسلسل عام.
     مثال: أول طالب في ٢٠٢٧ يصير 270001 — ثابت معه حتى التخرج.
 
-    لماذا: رقم الهوية ١٠ خانات، وجهاز البصمة يقبل ٩ فقط — فلا يُكتب في
-    الجهاز. نُسند رقماً مبنياً على السنة (٦ خانات ≤ ٩) يبقى ثابتاً مع
-    الطالب مهما انتقل بين الفصول أو ارتقى للمستوى التالي.
+    `base`: بداية مدى يدوية تُلغي المعادلة. سببها مدرسة بمرحلتين تتشارك
+    أجهزة بصمة: المرحلتان تولّدان مستقلّتين من البذرة نفسها فتبدأ كلتاهما
+    عند 270001، فيحمل طالبان مختلفان الرقم نفسه على جهاز واحد وتُسجَّل
+    البصمة للطالب الخطأ. فتُترك مرحلة على أرقامها ويُعطى الأخرى مدى
+    خاصاً بها. **والمدى يُختار بباقي القسمة على ٦٥٥٣٦ لا بالرقم** — انظر
+    `DEVICE_UID_MOD` أعلاه — ويحرسه `check_academic_span`.
+
+    لماذا رقم قصير أصلاً: رقم الهوية ١٠ خانات، وجهاز البصمة يقبل ٩.
 
     idempotent: لا يمسّ رقماً موجوداً أبداً (البصمات على الأجهزة مربوطة
     به). يملأ الناقص فقط. force=True يُعيد توليد الكل (للطوارئ فقط —
@@ -1339,12 +1362,19 @@ def assign_academic_numbers(force=False, year=2027):
                     used.add(an)
 
     assigned = 0
-    if year is not None:
-        year_short = int(year) % 100
+    if base is not None:
+        base = int(base)
+        if base < 1 or base > ACADEMIC_MAX:
+            raise ValueError("بداية المدى خارج الحدّ المسموح (١ إلى %d)"
+                             % ACADEMIC_MAX)
     else:
-        year_short = datetime.datetime.now().year % 100
-    base = year_short * 10000                         # مثال: 270000
+        if year is not None:
+            year_short = int(year) % 100
+        else:
+            year_short = datetime.datetime.now().year % 100
+        base = year_short * 10000                     # مثال: 270000
     k = 1
+    lo = hi = None
     for c in classes:
         for s in c.get("students", []):
             if not force and str(s.get("academic_no") or "").strip():
@@ -1352,9 +1382,13 @@ def assign_academic_numbers(force=False, year=2027):
             # أوّل رقم حرّ في مدى هذه السنة
             while str(base + k) in used:
                 k += 1
+            if base + k > ACADEMIC_MAX:
+                raise ValueError("تجاوز المدى حدّ ٩ خانات عند %d" % (base + k))
             an = str(base + k)
             s["academic_no"] = an
             used.add(an)
+            lo = base + k if lo is None else min(lo, base + k)
+            hi = base + k if hi is None else max(hi, base + k)
             assigned += 1
             k += 1
 
@@ -1366,7 +1400,104 @@ def assign_academic_numbers(force=False, year=2027):
             pass
     total = sum(len(c.get("students", [])) for c in classes)
     return {"assigned": assigned, "total": total,
-            "already": total - assigned}
+            "already": total - assigned,
+            "base": base, "first": lo, "last": hi}
+
+
+def academic_numbers_by_stage() -> dict:
+    """
+    ‏{معرّف المرحلة: {رقم أكاديمي: اسم الطالب}} لكل مراحل هذا الجهاز.
+
+    قراءةٌ عابرةٌ للمراحل **عن قصد**، وهي الاستثناء الوحيد لعزلها: جهاز
+    البصمة لا يعرف المراحل، فطلاب المرحلتين يدخلون خانةً واحدة فيه.
+    فالتحقق من التفرّد لا يمكن أن يتم داخل مرحلةٍ واحدة. تقرأ الأرقام
+    والأسماء فقط، ولا تكتب شيئاً في مرحلةٍ أخرى أبداً.
+
+    مدرسةٌ بمرحلة واحدة: لا مجلد `stages` فتُرجع مرحلةً واحدة مفتاحها ''.
+    """
+    import glob as _glob
+    out = {}
+
+    def _read(path):
+        m = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for c in data.get("classes", []):
+                for s in c.get("students", []):
+                    an = str(s.get("academic_no") or "").strip()
+                    if an:
+                        m[an] = s.get("name", "")
+        except Exception:
+            pass
+        return m
+
+    root = os.path.join(constants.BASE_DIR, "stages")
+    if os.path.isdir(root):
+        for p in _glob.glob(os.path.join(root, "*", "data", "students.json")):
+            sid = os.path.basename(os.path.dirname(os.path.dirname(p)))
+            out[sid] = _read(p)
+    else:
+        out[""] = _read(STUDENTS_JSON)
+    return out
+
+
+def check_academic_span(base, count, stage_id=None) -> dict:
+    """
+    يفحص مدى `[base+1 .. base+count]` قبل توليده.
+
+    يردّ على سببين، وكلاهما يُفسد البصمة صامتاً:
+      • تصادم الرقم نفسه مع مرحلة أخرى
+      • تصادم **خانة الجهاز** (باقي القسمة على ٦٥٥٣٦) ولو اختلف الرقم
+    الثاني هو الخفيّ: 270001 و335537 رقمان مختلفان تماماً، وخانتهما في
+    الجهاز واحدة (7857)، فيمحو تسجيلُ أحدهما الآخر.
+    """
+    base, count = int(base), int(count)
+    if stage_id is None:
+        stage_id = getattr(constants, "STAGE_ID", "") or ""
+
+    mine = set(str(base + i) for i in range(1, count + 1))
+    my_slots = {academic_slot(n): n for n in mine}
+
+    hits_num, hits_slot = [], []
+    for sid, nums in academic_numbers_by_stage().items():
+        if sid == stage_id:
+            continue
+        for an, nm in nums.items():
+            if an in mine:
+                hits_num.append({"stage": sid, "number": an, "name": nm})
+            else:
+                sl = academic_slot(an)
+                if sl in my_slots:
+                    hits_slot.append({"stage": sid, "number": an, "name": nm,
+                                      "slot": sl, "mine": my_slots[sl]})
+
+    over = (base + count) > ACADEMIC_MAX
+    return {
+        "ok": not hits_num and not hits_slot and not over,
+        "base": base, "count": count,
+        "first": base + 1, "last": base + count,
+        "over_limit": over,
+        "conflicts": hits_num[:20], "conflicts_total": len(hits_num),
+        "slot_conflicts": hits_slot[:20],
+        "slot_conflicts_total": len(hits_slot),
+    }
+
+
+def suggest_academic_base(count, stage_id=None) -> int:
+    """
+    يقترح بدايةَ مدى خالية للمرحلة الحالية.
+
+    يبدأ من ١٠٠٠٠٠ ويقفز بمقدار ٦٥٥٣٦ (عرض خانات الجهاز) فلا يقترح مدىً
+    يصطدم بخانةٍ مشغولة لمجرّد أنه بعيدٌ بالرقم.
+    """
+    count = max(1, int(count))
+    b = 100000
+    while b + count <= ACADEMIC_MAX:
+        if check_academic_span(b, count, stage_id)["ok"]:
+            return b
+        b += DEVICE_UID_MOD
+    return 0
 
 
 def get_academic_map():

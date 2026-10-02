@@ -51,13 +51,45 @@ def random_delay(min_sec=5, max_sec=15):
     delay = random.uniform(min_sec, max_sec)
     time.sleep(delay)
 
-def check_whatsapp_server_status() -> bool:
-    """يفحص إذا كان خادم الواتساب يعمل ويستجيب"""
+def check_whatsapp_server_status(port=None) -> bool:
+    """يفحص إذا كان خادم الواتساب يعمل ويستجيب.
+
+    بلا منفذ: منفذ هذه المرحلة من إعداداتها — و`wa_servers` الفارغة تعني
+    3000 كما كان، فمدرسة المرحلة الواحدة لا يتغيّر سلوكها.
+    """
+    if port is None:
+        try:
+            port = get_wa_servers()[0].get("port", 3000)
+        except Exception:
+            port = 3000
     try:
-        response = requests.get("http://127.0.0.1:3000/status", timeout=5)
+        response = requests.get(f"http://127.0.0.1:{port}/status", timeout=5)
         return response.status_code == 200
     except:
         return False
+
+def wa_file(name: str, port=None) -> str:
+    """
+    مسار ملفٍ من ملفات خادم الواتساب الخاصة برقمٍ بعينه.
+
+    مجلد الخادم مشترك بين المراحل، فملفاته تُوسم بالمنفذ حين يكون لكل
+    مرحلة رقمها. والمنفذ 3000 بلا لاحقة عمداً — نفس ما في `server.js`،
+    وتغييره يُفقد كل مدرسة عاملة جلستها وسجل أعذارها.
+    """
+    if port is None:
+        try:
+            port = get_wa_servers()[0].get("port", 3000)
+        except Exception:
+            port = 3000
+    try:
+        port = int(port)
+    except Exception:
+        port = 3000
+    if port != 3000:
+        stem, ext = os.path.splitext(name)
+        name = f"{stem}_{port}{ext}"
+    return os.path.join(WHATS_PATH, name)
+
 
 def get_wa_servers() -> list:
     """يُرجع قائمة خوادم واتساب المتاحة (منفذ واحد أو أكثر)."""
@@ -456,16 +488,40 @@ def start_whatsapp_server():
         else:
             args = ["npm", "start"]
             use_shell = True
-            
-        kwargs = {
-            "cwd": WHATS_PATH,
-            "shell": use_shell,
-            "creationflags": subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-            "start_new_session": True
-        }
-        
-        subprocess.Popen(args, **kwargs)
-        print("[WA] بدأ تشغيل خادم الواتساب في الخلفية.")
+
+        # ── خادمٌ لكل رقم تستعمله هذه المرحلة ─────────────────────
+        # المرحلتان على منفذ واحد ⇒ رقم واحد مشترك: الأولى تُقلعه
+        # والثانية تجده حياً فلا تُقلع ثانياً. وإقلاع خادمين على منفذ
+        # واحد يفشل في الربط ويتنازع الاثنان على ملف الجلسة نفسه.
+        try:
+            ports = [int(s.get("port", 3000)) for s in get_wa_servers()]
+        except Exception:
+            ports = [3000]
+        ports = list(dict.fromkeys(p for p in ports if p)) or [3000]
+
+        started, alive = [], []
+        for p in ports:
+            if check_whatsapp_server_status(p):
+                alive.append(p)
+                continue
+            kwargs = {
+                "cwd": WHATS_PATH,
+                "shell": use_shell,
+                "creationflags": subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                "start_new_session": True,
+                # المنفذ يبلغه بالبيئة لا بمعامل: `npm start` لا يمرّر
+                # المعاملات إلى server.js بلا `--` فتضيع صامتةً.
+                "env": dict(os.environ, WA_PORT=str(p)),
+            }
+            subprocess.Popen(args, **kwargs)
+            started.append(p)
+
+        if started:
+            print("[WA] بدأ تشغيل خادم الواتساب في الخلفية — منفذ "
+                  + "، ".join(str(p) for p in started))
+        if alive:
+            print("[WA] يعمل أصلاً على منفذ "
+                  + "، ".join(str(p) for p in alive) + " — لم يُقلع ثانياً")
 
     except Exception as e:
         import threading as _th

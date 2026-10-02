@@ -51,6 +51,14 @@ CLEAR = ["cloudflare_domain", "cloud_token", "cloud_url",
 SKIP_FILES = {".darb_keys.json", "license.dat", ".darb_license",
               ".darb_trial", ".darb_init_admin", "config.json"}
 SKIP_DIRS = {".wwebjs_auth", ".wwebjs_cache", "__pycache__"}
+# مدرسةٌ برقمٍ لكل مرحلة تحمل `.wwebjs_auth_3001` وما بعده — والمطابقة
+# بالاسم الكامل كانت تنقل جلستها إلى الجهاز الجديد، فتُسلَّم جلسةٌ بائتة
+# تدور في حلقة «فشل المصادقة» بلا أن يُعرض رمز استجابة.
+_SKIP_PREFIXES = (".wwebjs_auth", ".wwebjs_cache")
+
+
+def _skip_dir(name: str) -> bool:
+    return name in SKIP_DIRS or name.startswith(_SKIP_PREFIXES)
 
 
 def guess_old_install():
@@ -74,7 +82,7 @@ def _copytree(src, dst, log):
     """نسخ مجلد مع تخطي ما لا يُنقل. يُرجع عدد الملفات."""
     n = 0
     for root, dirs, files in os.walk(src):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        dirs[:] = [d for d in dirs if not _skip_dir(d)]
         rel = os.path.relpath(root, src)
         target = dst if rel == "." else os.path.join(dst, rel)
         os.makedirs(target, exist_ok=True)
@@ -181,7 +189,7 @@ def do_restore(backup_dir, new_dir, log, keep_old_templates=False):
     n = 0
     if os.path.isdir(src_data):
         for root, dirs, files in os.walk(src_data):
-            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            dirs[:] = [d for d in dirs if not _skip_dir(d)]
             rel = os.path.relpath(root, src_data)
             target = new_data if rel == "." else os.path.join(new_data, rel)
             os.makedirs(target, exist_ok=True)

@@ -184,6 +184,101 @@ def guess_gender(full_name: str, overrides=None) -> str:
     return UNKNOWN
 
 
+def set_gender(first_name: str, gender: str) -> bool:
+    """يحسم جنس اسمٍ في قائمة المدرسة. القرار يبقى بعد كل استيراد."""
+    f = (first_name or "").strip().split()
+    if not f:
+        return False
+    g = str(gender or "").strip().lower()
+    if g not in (MALE, FEMALE, ""):
+        return False
+    try:
+        with _contacts_guard():
+            ov = _load_overrides()
+            ov[f[0]] = g
+            _save_overrides(ov)
+        return True
+    except Exception as e:
+        print(f"[GENDER] تعذّر الحفظ: {e}")
+        return False
+
+
+class _contacts_guard:
+    """قفلٌ خفيف — كتابتان متزامنتان من الويب تُفسدان الملف."""
+    _lock = None
+
+    def __enter__(self):
+        import threading
+        if _contacts_guard._lock is None:
+            _contacts_guard._lock = threading.Lock()
+        _contacts_guard._lock.acquire()
+        return self
+
+    def __exit__(self, *a):
+        try:
+            _contacts_guard._lock.release()
+        except Exception:
+            pass
+        return False
+
+
+def screen_applies(cfg=None) -> bool:
+    """
+    هل تعني شاشةُ حسم الأسماء المشتركة هذه المدرسةَ أصلاً؟
+
+    العلّة التي تعالجها الشاشة لا توجد إلا في **ابتدائية بنات**: هي
+    وحدها التي يضمّها نور أولاداً وبنات في كشفٍ واحد بلا عمود جنس.
+    مدرسةُ بنين لا أولادَ غرباء فيها، ومتوسطةٌ وثانويةٌ خالصتان —
+    فظهور الشاشة فيها إرباكٌ محض، وقد ظهرت في متوسطة الشقيق فعلاً.
+
+    **الشرطان معاً ولا ثالث**: ابتدائي وبنات. كان هنا فرعٌ ثالث يقبل أي
+    مرحلةٍ بناتٍ فعَّلت `split_classes_by_gender`، فأظهر الشاشة في
+    متوسطة بنات أثناء تجربة الديمو — وهو نفس صنف المفاجأة التي اشتكى
+    منها ماهر. الأضيق أصحّ: إن احتاجته مدرسةٌ خارج هذا الوصف فستُطلَب
+    صراحةً، أما ظهورُه حيث لا يُنتظر فيُفقد الثقة بالشاشة كلها.
+
+    متسامحة عمداً: تعذّرت قراءة الإعداد ⇒ لا تُعرض. إخفاءُ شاشةٍ
+    إضافية أهون من عرضها لمدرسةٍ لا شأن لها بها.
+    """
+    try:
+        if cfg is None:
+            from config_manager import load_config
+            cfg = load_config() or {}
+        return (str(cfg.get("school_gender") or "boys").strip() == "girls"
+                and str(cfg.get("school_stage") or "").strip() == "ابتدائي")
+    except Exception:
+        return False
+
+
+def pending_names(students_store) -> list:
+    """
+    الأسماء التي لا يُعرف جنسها في كشف الطلاب الحالي، ومن يحملها.
+
+    تُعرض على المدرسة لتحسمها — ومعها **الطلاب المتأثّرون وفصولهم**،
+    فالقرار يحتاج سياقاً: «لادن» وحده لا يعني شيئاً، و«لادن محمد في أول
+    ابتدائي/بنات» يعني كل شيء.
+    """
+    ov = _load_overrides()
+    buckets = {}
+    for c in (students_store or {}).get("list", []) or []:
+        for s in c.get("students", []) or []:
+            nm = (s.get("name") or "").strip()
+            if not nm:
+                continue
+            if guess_gender(nm, overrides=ov) != UNKNOWN:
+                continue
+            first = nm.split()[0]
+            b = buckets.setdefault(first, {"name": first, "students": []})
+            b["students"].append({
+                "id": s.get("id"), "full_name": nm,
+                "class_id": c.get("id"), "class_name": c.get("name", ""),
+            })
+    out = sorted(buckets.values(), key=lambda x: -len(x["students"]))
+    for b in out:
+        b["count"] = len(b["students"])
+    return out
+
+
 def classify_names(names):
     """
     يصنّف قائمة أسماء ويُرجع (خريطة, المجهولة).
