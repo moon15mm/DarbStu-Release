@@ -168,10 +168,21 @@ async def bio_test(request: Request):
             "comm_key": int(d.get("comm_key") or 0),
             "device_id": d.get("device_id", "test"),
         })
+        # تشخيصٌ بطبقات إن توفّر: «timed out» وحدها لا تدلّ على عمل
+        if hasattr(dev, "diagnose"):
+            r = dev.diagnose()
+            return JSONResponse({"ok": bool(r.get("ok")), "info": r.get("info") or {},
+                                 "stage": r.get("stage", ""),
+                                 "reason": r.get("reason", ""),
+                                 "hint": r.get("hint", ""),
+                                 "counts": r.get("counts") or {},
+                                 "server_ip": r.get("server_ip", ""),
+                                 "same_subnet": r.get("same_subnet"),
+                                 "error": "" if r.get("ok") else r.get("reason", "")})
         info = dev.test_connection()
         return JSONResponse({"ok": True, "info": info})
     except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)})
+        return JSONResponse({"ok": False, "error": str(e), "reason": str(e)})
 
 
 # ── البحث في الشبكة ───────────────────────────────────────────────
@@ -767,6 +778,16 @@ _PAGE = r"""<!doctype html>
     <div class="kpi"><u id="k-present" style="color:#1B7C3D">—</u><span>حاضر بالوقت</span></div>
     <div class="kpi"><u id="k-unmatched" style="color:#C0392B">—</u><span>بلا مطابقة</span></div>
   </div>
+<div id="wz" style="display:none;position:fixed;inset:0;background:rgba(15,23,42,.45);align-items:center;justify-content:center;z-index:50;padding:16px">
+  <div style="background:#fff;border-radius:14px;padding:18px 20px;max-width:620px;width:100%;max-height:88vh;overflow:auto;box-shadow:0 10px 40px rgba(0,0,0,.25)">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+      <b style="flex:1">🧭 معالج إعداد أجهزة البصمة</b>
+      <button class="btn gh sm" onclick="wzClose()">إغلاق</button>
+    </div>
+    <div id="wz-body"></div>
+  </div>
+</div>
+
   <div class="row" style="margin-top:10px">
     <span id="poll-dot" class="dot off"></span>
     <span id="poll-txt" class="muted">الخيط: —</span>
@@ -808,6 +829,7 @@ _PAGE = r"""<!doctype html>
       <h2>الأجهزة</h2>
       <p class="d">جهاز البصمة يجلس على شبكة المدرسة. أدخِل عنوانه أو ابحث عنه، ثم افحص الاتصال قبل الحفظ.</p>
       <button class="btn gh sm" onclick="scan()">🔍 بحث في الشبكة</button>
+      <button class="btn o sm" onclick="wzOpen()">🧭 معالج إعداد الأجهزة</button>
       <span id="scan-msg" class="muted"></span>
       <div id="devlist" style="margin-top:11px"></div>
       <button class="btn gh sm" onclick="addDevice()">+ إضافة جهاز يدوياً</button>
@@ -892,11 +914,124 @@ function renderDevices(){
 function upd(i,k,v){DEVICES[i][k]=(k==='port'||k==='comm_key')?parseInt(v||0):v;}
 function addDevice(){DEVICES.push({device_id:'gate'+(DEVICES.length+1),protocol:'zk',ip:'',port:4370,comm_key:0,enabled:true});renderDevices();}
 function delDev(i){DEVICES.splice(i,1);renderDevices();}
+/* ══ معالج إعداد الأجهزة ══
+   خطوةٌ خطوة: كم جهازاً، ثم عنوان كلٍّ مع فحصٍ يقول السبب والعلاج.
+   وجوده لأن إعداد الأجهزة كان يتطلّب معرفةَ ما يعنيه «المنفذ» و«مفتاح
+   الاتصال»، ومن يُنصّب في المدرسة لا يعرفهما غالباً. */
+var WZ={n:0, devs:[], step:1};
+
+function wzOpen(){
+  WZ={n:0, devs:[], step:1};
+  $('wz').style.display='flex';
+  wzRender();
+}
+function wzClose(){ $('wz').style.display='none'; }
+
+function wzPick(n){
+  WZ.n=n;
+  WZ.devs=[];
+  for(var i=0;i<n;i++)
+    WZ.devs.push({device_id:'gate'+(i+1),protocol:'zk',ip:'',
+                  port:4370,comm_key:0,enabled:true,_res:null});
+  WZ.step=2; wzRender();
+}
+
+function wzSet(i,k,v){ WZ.devs[i][k]=v; }
+
+async function wzTest(i){
+  var el=$('wz-r-'+i);
+  el.innerHTML='⏳ جارٍ الفحص...';
+  WZ.devs[i].ip=($('wz-ip-'+i).value||'').trim();
+  WZ.devs[i].port=parseInt($('wz-pt-'+i).value||4370);
+  WZ.devs[i].comm_key=parseInt($('wz-ck-'+i).value||0);
+  var d=await api('/web/api/biometric/test',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(WZ.devs[i])});
+  WZ.devs[i]._res=d;
+  el.innerHTML=devResultHtml(d);
+  var okAll=WZ.devs.every(function(x){return x._res&&x._res.ok;});
+  var b=$('wz-save'); if(b) b.disabled=false;
+  var w=$('wz-warn');
+  if(w) w.style.display=okAll?'none':'block';
+}
+
+function wzRender(){
+  var h='';
+  if(WZ.step===1){
+    h+='<h3 style="margin:0 0 6px">كم جهاز بصمة لديكم؟</h3>'
+      +'<p class="muted" style="margin:0 0 14px">الجهاز الذي يبصم عليه '
+      +'الطلاب عند الدخول. إن كان لديكم بوابتان فجهازان.</p>'
+      +'<div style="display:flex;gap:8px;flex-wrap:wrap">';
+    [1,2,3,4].forEach(function(n){
+      h+='<button class="btn bp1" style="min-width:64px" onclick="wzPick('+n+')">'+n+'</button>';
+    });
+    h+='</div>';
+  } else {
+    h+='<h3 style="margin:0 0 6px">عناوين الأجهزة</h3>'
+      +'<p class="muted" style="margin:0 0 12px">عنوان الجهاز يظهر في شاشته: '
+      +'<b>القائمة ← الشبكة ← IP</b>. اضغط «فحص» لكل جهاز قبل الحفظ.</p>';
+    WZ.devs.forEach(function(dv,i){
+      h+='<div style="border:1px solid #E2E8F0;border-radius:10px;padding:10px;margin-bottom:10px">'
+        +'<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">'
+        +'<div><label class="muted">الاسم</label><br>'
+        +'<input id="wz-id-'+i+'" value="'+dv.device_id+'" style="width:90px" '
+        +'oninput="wzSet('+i+',\'device_id\',this.value)"></div>'
+        +'<div><label class="muted">العنوان (IP)</label><br>'
+        +'<input id="wz-ip-'+i+'" value="'+dv.ip+'" placeholder="192.168.1.201" style="width:150px"></div>'
+        +'<div><label class="muted">المنفذ</label><br>'
+        +'<input id="wz-pt-'+i+'" value="'+dv.port+'" style="width:70px"></div>'
+        +'<div><label class="muted">مفتاح الاتصال</label><br>'
+        +'<input id="wz-ck-'+i+'" value="'+dv.comm_key+'" style="width:70px"></div>'
+        +'<button class="btn gh" onclick="wzTest('+i+')">فحص</button>'
+        +'</div>'
+        +'<div id="wz-r-'+i+'" style="margin-top:8px;font-size:13px;line-height:1.8">—</div>'
+        +'</div>';
+    });
+    h+='<div id="wz-warn" style="display:none;background:#FFFBEB;color:#92400E;'
+      +'border:1px solid #FDE68A;border-radius:8px;padding:9px 11px;'
+      +'font-size:13px;margin-bottom:10px">'
+      +'لم تنجح كل الأجهزة. تستطيع الحفظ على أي حال وإصلاح الباقي لاحقاً — '
+      +'لكن الجهاز الذي لا يتصل لن تُسحب منه بصمات.</div>'
+      +'<div style="display:flex;gap:8px">'
+      +'<button class="btn bp1" id="wz-save" onclick="wzSave()" disabled>حفظ الأجهزة</button>'
+      +'<button class="btn gh" onclick="WZ.step=1;wzRender()">رجوع</button>'
+      +'</div>';
+  }
+  $('wz-body').innerHTML=h;
+}
+
+async function wzSave(){
+  // تُستبدل القائمة بما أعدّه المعالج — وهو ما يقصده من فتحه
+  DEVICES=WZ.devs.map(function(d){
+    return {device_id:d.device_id,protocol:'zk',ip:d.ip,
+            port:d.port,comm_key:d.comm_key,enabled:true};
+  });
+  renderDevices();
+  await saveConfig();
+  wzClose();
+}
+
+function devResultHtml(d){
+  // السبب والإرشاد معاً: «تعذّر الاتصال» وحدها لا تدلّ على عمل
+  if(d&&d.ok){
+    var n=d.info||{}, c=d.counts||{};
+    var s='✅ '+(n.name||'جهاز')+' · '+(n.serial||'')+' · '+(n.firmware||'');
+    if(c.records!=null) s+='<br><span style="color:#475569">سجلّ الجهاز '
+      +c.records+' · مستخدمون '+(c.users||0)+' · بصمات '+(c.fingers||0)+'</span>';
+    return s;
+  }
+  var r=(d&&(d.reason||d.error))||'تعذّر الاتصال';
+  var h=(d&&d.hint)||'';
+  var st=(d&&d.stage)?('<b>['+d.stage+']</b> '):'';
+  return '❌ '+st+gnEscD(r)+(h?('<br><span style="color:#92400e">↳ '+gnEscD(h)+'</span>'):'');
+}
+function gnEscD(s){return String(s==null?'':s)
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
 async function testDev(i){
-  const el=$('dt-'+i); el.textContent='جارٍ الفحص...';
+  const el=$('dt-'+i); el.innerHTML='⏳ جارٍ الفحص...';
   const d=await api('/web/api/biometric/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(DEVICES[i])});
-  if(d&&d.ok){const n=d.info||{};el.textContent='✅ '+(n.name||'جهاز')+' · '+(n.serial||'')+' · '+(n.firmware||'');}
-  else{el.textContent='❌ '+((d&&d.error)||'تعذّر الاتصال');}
+  el.innerHTML=devResultHtml(d);
 }
 async function saveConfig(){
   const body={enabled:$('c-enabled').checked,mode:$('c-mode').value,

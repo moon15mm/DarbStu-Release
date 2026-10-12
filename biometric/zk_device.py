@@ -307,6 +307,121 @@ class ZKDevice:
         finally:
             self.disconnect()
 
+    # ── التشخيص ──────────────────────────────────────────────────────────────
+    def diagnose(self) -> dict:
+        """
+        يفحص الاتصال **بطبقات** ويقول أين انقطع ولماذا وما العمل.
+
+        «تعذّر الاتصال: timed out» لا يُصلح شيئاً — السبب قد يكون عنواناً
+        خاطئاً، أو جهازاً مطفأً، أو منفذاً مغلقاً، أو مفتاح اتصال غير
+        مطابق، أو — وهو الأكثر في المدارس — أن الجهاز في شبكةٍ فرعية
+        غير شبكة الخادم فلا طريق بينهما أصلاً.
+
+        يُرجع: {ok, stage, reason, hint, info}
+        """
+        import ipaddress
+        out = {"ok": False, "stage": "", "reason": "", "hint": "", "info": {}}
+
+        # ① صيغة العنوان
+        ip = (self.ip or "").strip()
+        if not ip:
+            out.update(stage="العنوان", reason="لم يُدخَل عنوان الجهاز",
+                       hint="اكتب عنوان الجهاز كما يظهر في شاشته "
+                            "(قائمة الشبكة)، مثل 192.168.1.201")
+            return out
+        try:
+            addr = ipaddress.ip_address(ip)
+        except Exception:
+            out.update(stage="العنوان",
+                       reason="«%s» ليس عنواناً صحيحاً" % ip,
+                       hint="العنوان أربعة أرقام بينها نقاط، "
+                            "مثل 192.168.1.201")
+            return out
+
+        # ② الشبكة: أهو في شبكة الخادم أصلاً؟
+        srv = ""
+        try:
+            from constants import local_ip
+            srv = local_ip()
+        except Exception:
+            pass
+        same_subnet = None
+        if srv and srv != "127.0.0.1":
+            try:
+                same_subnet = (ipaddress.ip_address(srv).packed[:3]
+                               == addr.packed[:3])
+            except Exception:
+                same_subnet = None
+        out["server_ip"] = srv
+        out["same_subnet"] = same_subnet
+
+        # ③ هل المنفذ مفتوح؟ (يفصل «الجهاز مطفأ» عن «لا طريق إليه»)
+        import socket as _s
+        sock = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+        sock.settimeout(3)
+        try:
+            sock.connect((ip, self.port))
+            port_open = True
+            err = ""
+        except _s.timeout:
+            port_open, err = False, "timeout"
+        except ConnectionRefusedError:
+            port_open, err = False, "refused"
+        except OSError as e:
+            port_open, err = False, (str(e)[:80] or "unreachable")
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+        if not port_open:
+            if err == "refused":
+                out.update(stage="المنفذ",
+                           reason="الجهاز موجود لكنه رفض المنفذ %d" % self.port,
+                           hint="تأكد أن المنفذ في إعدادات الجهاز 4370، "
+                                "وأن خدمة الشبكة فيه مفعّلة.")
+            elif same_subnet is False:
+                out.update(stage="الشبكة",
+                           reason="لا طريق إلى %s — الخادم في شبكة %s "
+                                  "والجهاز في شبكة أخرى" % (ip, srv),
+                           hint="ضع جهاز البصمة وجهاز المدرسة على نفس "
+                                "الشبكة (نفس الراوتر)، أو اطلب من فنّي "
+                                "الشبكة فتح المسار بينهما.")
+            else:
+                out.update(stage="الوصول",
+                           reason="لا ردّ من %s على المنفذ %d (%s)"
+                                  % (ip, self.port, err),
+                           hint="تأكد أن الجهاز مُشغَّل وسلك الشبكة موصول، "
+                                "وأن العنوان هو ما يظهر في شاشة الجهاز.")
+            return out
+
+        # ④ المنفذ مفتوح — تبقى مصافحة البروتوكول
+        try:
+            info = self.test_connection()
+            out.update(ok=True, stage="تمّ", reason="الاتصال سليم",
+                       info=info or {})
+            try:
+                out["counts"] = self.counts()
+            except Exception:
+                pass
+            return out
+        except Exception as e:
+            msg = str(e)[:120]
+            low = msg.lower()
+            if "unauthen" in low or "auth" in low or "key" in low:
+                out.update(stage="مفتاح الاتصال",
+                           reason="الجهاز رفض الاتصال: مفتاح غير مطابق",
+                           hint="مفتاح الاتصال (COMM KEY) في شاشة الجهاز "
+                                "يجب أن يساوي ما هنا — وأغلب الأجهزة صفر.")
+            else:
+                out.update(stage="البروتوكول",
+                           reason="المنفذ مفتوح لكن الجهاز لم يستجب "
+                                  "لبروتوكول ZK: %s" % msg,
+                           hint="تأكد أن العنوان لجهاز بصمة فعلاً لا "
+                                "لجهازٍ آخر على الشبكة، وأن المنفذ 4370.")
+            return out
+
     # ── سحب البصمات ──────────────────────────────────────────────────────────
     def counts(self) -> dict:
         """
