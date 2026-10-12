@@ -22,6 +22,36 @@ _RIYADH = datetime.timedelta(hours=3)
 _thread = None
 _stop = threading.Event()
 poller_lock = threading.Lock()
+
+# آخر عدد سجلات رأيناه على كل جهاز. في الذاكرة عمداً: بعد إعادة التشغيل
+# تُنزَّل الدورة الأولى كاملةً ثم يسري التسريع — ولا خطر في ذلك، بخلاف
+# حفظه فيصير مصدرَ حقيقةٍ ثانياً قد يُفوّت بصمات لو انحرف.
+_seen_records = {}
+
+# ── تقدّم السحب — تقرؤه الواجهة أثناء العملية ────────────────────────
+# السحب طلبٌ واحد يحجب حتى ينتهي، وقد يطول (اتصالٌ بكل جهاز ثم قراءة
+# سجلّه). فبلا هذا لا تعرف الواجهة إلا «انتهى» — فتبدو متجمّدة.
+# قاموسٌ بسيط يُقرأ بلا قفل: الكتابة ذرّية في بايثون، وقراءةُ قيمةٍ
+# قديمة بجزء من الثانية لا تضرّ شريط تقدّم.
+_progress = {"running": False, "pct": 0, "stage": "", "detail": "",
+             "idx": 0, "total": 0, "started": None, "finished": None}
+
+
+def get_progress() -> dict:
+    return dict(_progress)
+
+
+def _prog(pct=None, stage=None, detail=None, idx=None, total=None):
+    if pct is not None:
+        _progress["pct"] = max(0, min(100, int(pct)))
+    if stage is not None:
+        _progress["stage"] = stage
+    if detail is not None:
+        _progress["detail"] = detail
+    if idx is not None:
+        _progress["idx"] = idx
+    if total is not None:
+        _progress["total"] = total
 _last_status = {"running": False, "last_run": None, "last_error": "",
                 "devices": []}
 
@@ -187,15 +217,33 @@ def _pull_devices(cfg):
     new_total = 0
     dev_status = []
 
-    for dcfg in devices:
-        if not dcfg.get("enabled", True):
-            continue
+    _active = [d for d in devices if d.get("enabled", True)]
+    _prog(total=len(_active), idx=0)
+    for _i, dcfg in enumerate(_active, 1):
         did = str(dcfg.get("device_id") or dcfg.get("ip") or "dev")
         entry = {"device_id": did, "ok": False, "new": 0, "error": ""}
+        # ٨٠٪ من الشريط للأجهزة، والباقي للمعالجة
+        _prog(pct=int((_i - 1) * 80.0 / max(1, len(_active))),
+              stage="يتصل بالجهاز", detail=did, idx=_i)
         try:
             dev = make_device(dcfg)
             after = get_last_punch_utc(did)
-            punches = dev.read_punches(after_utc=after)
+            # المرحلة تُعلَن **قبل** القراءة لا بعدها: القراءة هي الجزء
+            # الطويل، وإعلانُها بعد انتهائها يصف ما فرغ لا ما يجري.
+            _prog(stage="يقرأ سجلّ الجهاز", detail=did)
+            # عدّ آخر دورة: إن لم يتغيّر فلا تنزيل للسجلّ كاملاً
+            try:
+                punches = dev.read_punches(
+                    after_utc=after, known_records=_seen_records.get(did))
+            except TypeError:
+                # محاكٍ أو جهاز لا يعرف المعامل الجديد
+                punches = dev.read_punches(after_utc=after)
+            cnt = getattr(dev, "last_counts", None) or {}
+            if cnt:
+                _seen_records[did] = cnt.get("records")
+                entry["records"] = cnt.get("records")
+                entry["users"] = cnt.get("users")
+                entry["fingers"] = cnt.get("fingers")
             for p in punches:
                 uid = p["uid"]
                 sid = ""
@@ -220,6 +268,9 @@ def _pull_devices(cfg):
             entry["ok"] = True
         except Exception as e:
             entry["error"] = str(e)
+        _prog(pct=int(_i * 80.0 / max(1, len(_active))),
+              detail="%s — %s" % (did, ("جديد %d" % entry["new"]) if entry["ok"]
+                                  else "تعذّر الاتصال"))
         dev_status.append(entry)
 
     _last_status["devices"] = dev_status
@@ -230,11 +281,23 @@ def run_once(cfg=None):
     """دورة واحدة كاملة: سحب ثم معالجة. تُرجع (عدد_جديد, إحصاء)."""
     with poller_lock:
         from config_manager import load_config
-        cfg = cfg or load_config()
-        new = _pull_devices(cfg)
-        stat = process_pending(cfg)
-        _last_status["last_run"] = _now_local().isoformat(timespec="seconds")
-        return new, stat
+        _progress.update({"running": True, "pct": 0, "stage": "يبدأ",
+                          "detail": "", "idx": 0, "total": 0,
+                          "started": _now_local().isoformat(timespec="seconds"),
+                          "finished": None})
+        try:
+            cfg = cfg or load_config()
+            new = _pull_devices(cfg)
+            _prog(pct=85, stage="يطابق البصمات بالطلاب", detail="")
+            stat = process_pending(cfg)
+            _prog(pct=100, stage="اكتمل",
+                  detail="%d بصمة جديدة" % new if new else "لا جديد")
+            _last_status["last_run"] = _now_local().isoformat(timespec="seconds")
+            return new, stat
+        finally:
+            # الشريط يُغلق مهما كان المآل — وإلا بقي «يعمل» إلى الأبد
+            _progress["running"] = False
+            _progress["finished"] = _now_local().isoformat(timespec="seconds")
 
 
 def _loop(interval):

@@ -4074,34 +4074,98 @@ def student_has_excuse(student_id, date_str):
 # ═══════════════════════════════════════════════════════════════
 # النسخ الاحتياطية
 # ═══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
+#  بيان النسخة الاحتياطية — مصدرٌ واحد للنسخ وللاستعادة
+# ══════════════════════════════════════════════════════════════════
+# افتراقُهما هو العطل بعينه: كان `create_backup` يضع `school_reports`
+# و`inbox_attachments` في الحزمة، والاستعادة تستخرج القاعدة وثلاثة
+# ملفات JSON وحدها — فتُنسخ الوسائط سنةً كاملة ولا تعود أبداً.
+_BACKUP_JSONS = ("students.json", "teachers.json", "config.json",
+                 # قرارات المدرسة في الأسماء المشتركة، وخريطة صفوف نور:
+                 # يحرّرهما من يعرف مدرسته، وفقدُهما يُعيد السؤال من أوله
+                 "gender_names.json", "noor_levels.json")
+
+# مجلدات الوسائط. `attachments` تحوي مرفقات التعاميم في مجلد فرعي،
+# فتُمشى بالعمق لا بسردٍ مسطّح.
+_BACKUP_DIRS = ("school_reports", "inbox_attachments",
+                "attachments", "school_stories")
+
+# أسرارٌ لا تُوضع في حزمةٍ تُرفع إلى تلجرام: مفتاح البوت الذي يرفعها
+# أخطرها — من يحصل على نسخة واحدة يملك مفتاح القناة التي فيها كل
+# النسخ. و`cloud_token` مفتاح مدير المدرسة. تُستعاد فارغةً:
+# `load_config` يولّد cloud_token جديداً، ومفتاح تلجرام يُعاد إدخاله.
+_BACKUP_REDACT = ("telegram_backup_token", "telegram_backup_chat",
+                  "cloud_token")
+
+
+def _backup_slug() -> str:
+    """
+    معرّفٌ قصير يُوسم به اسم الملف. بلا هذا كانت كل النسخ تُسمّى
+    `backup_<وقت>.zip` — فملفٌّ منفصل عن مجلده لا يُعرف لأي مدرسة هو،
+    ولا لأي مرحلة في مدرسةٍ بمرحلتين.
+    """
+    try:
+        sid = (getattr(constants, "STAGE_ID", "") or "").strip()
+        if sid:
+            return sid
+        dom = (load_config().get("cloudflare_domain") or "").strip()
+        if dom:
+            lab = dom.split(".")[0].strip()
+            if re.match(r"^[A-Za-z0-9_-]{1,40}$", lab):
+                return lab
+    except Exception:
+        pass
+    return "school"
+
+
+def _redacted_config_bytes():
+    """نسخة `config.json` بلا الأسرار — أو الملف كما هو إن تعذّر."""
+    try:
+        with open(CONFIG_JSON, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        for k in _BACKUP_REDACT:
+            if k in cfg:
+                cfg[k] = ""
+        cfg["_backup_note"] = ("أُزيلت المفاتيح السرية من هذه النسخة: "
+                               + "، ".join(_BACKUP_REDACT))
+        return json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8")
+    except Exception:
+        return None
+
+
 def create_backup(target_dir=None):
-    """ينشئ نسخة احتياطية مضغوطة من DB + JSON."""
+    """ينشئ نسخة احتياطية مضغوطة من DB + JSON + الوسائط."""
     if target_dir is None:
         target_dir = BACKUP_DIR
     os.makedirs(target_dir, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = os.path.join(target_dir, f"backup_{ts}.zip")
+    filename = os.path.join(target_dir, "backup_%s_%s.zip" % (_backup_slug(), ts))
     try:
         with zipfile.ZipFile(filename, "w", zipfile.ZIP_DEFLATED) as zf:
             # قاعدة البيانات
             if os.path.exists(DB_PATH):
                 zf.write(DB_PATH, os.path.basename(DB_PATH))
-            # ملفات JSON
-            for jf in [STUDENTS_JSON, TEACHERS_JSON, CONFIG_JSON]:
-                if os.path.exists(jf):
-                    zf.write(jf, os.path.basename(jf))
-            # مجلد تقارير المدرسة
-            if os.path.isdir(SCHOOL_REPORTS_DIR):
-                for _fn in os.listdir(SCHOOL_REPORTS_DIR):
-                    _fp = os.path.join(SCHOOL_REPORTS_DIR, _fn)
-                    if os.path.isfile(_fp):
-                        zf.write(_fp, os.path.join("school_reports", _fn))
-            # مرفقات الرسائل الداخلية
-            if os.path.isdir(INBOX_ATTACHMENTS_DIR):
-                for _fn in os.listdir(INBOX_ATTACHMENTS_DIR):
-                    _fp = os.path.join(INBOX_ATTACHMENTS_DIR, _fn)
-                    if os.path.isfile(_fp):
-                        zf.write(_fp, os.path.join("inbox_attachments", _fn))
+            # ملفات JSON — و`config.json` منقّى من الأسرار
+            for jn in _BACKUP_JSONS:
+                jf = os.path.join(DATA_DIR, jn)
+                if not os.path.exists(jf):
+                    continue
+                if jn == "config.json":
+                    blob = _redacted_config_bytes()
+                    if blob is not None:
+                        zf.writestr(jn, blob)
+                        continue
+                zf.write(jf, jn)
+            # مجلدات الوسائط — بالعمق: مرفقات التعاميم في مجلد فرعي
+            for dn in _BACKUP_DIRS:
+                dp = os.path.join(DATA_DIR, dn)
+                if not os.path.isdir(dp):
+                    continue
+                for root, _dirs, files in os.walk(dp):
+                    for _fn in files:
+                        _fp = os.path.join(root, _fn)
+                        rel = os.path.relpath(_fp, DATA_DIR).replace(os.sep, "/")
+                        zf.write(_fp, rel)
         size_kb = os.path.getsize(filename) // 1024
         # سجّل في قاعدة البيانات
         con = get_db(); cur = con.cursor()
@@ -4114,11 +4178,65 @@ def create_backup(target_dir=None):
     except Exception as e:
         return False, str(e), 0
 
+def restore_backup(zip_path):
+    """
+    يستعيد حزمةً أنشأها `create_backup` — **كل ما فيها** لا القاعدة وحدها.
+
+    مصدرُه `_BACKUP_JSONS` و`_BACKUP_DIRS` نفسها، فلا يفترق عمّا يُنسخ.
+    ولا يُستخرج إلا ما يُعرف اسمه: حزمةٌ من مصدرٍ غريب لا تكتب مساراتٍ
+    خارج `data` (`zip slip`).
+
+    يُرجع (نجح، رسالة، عدد الملفات المستعادة).
+    """
+    try:
+        restored = 0
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            names = zf.namelist()
+            if "absences.db" in names:
+                zf.extract("absences.db", os.path.dirname(DB_PATH))
+                restored += 1
+            for jn in _BACKUP_JSONS:
+                if jn in names:
+                    zf.extract(jn, DATA_DIR)
+                    restored += 1
+            for n in names:
+                if n.endswith("/"):
+                    continue
+                top = n.split("/")[0]
+                if top not in _BACKUP_DIRS:
+                    continue
+                # مسارٌ صاعد أو مطلق = حزمة معبوثٌ بها
+                if ".." in n.split("/") or os.path.isabs(n):
+                    continue
+                dest = os.path.join(DATA_DIR, *n.split("/"))
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with zf.open(n) as src, open(dest, "wb") as dst:
+                    dst.write(src.read())
+                restored += 1
+        try:
+            constants.STUDENTS_STORE = None
+        except Exception:
+            pass
+        try:
+            from config_manager import invalidate_config_cache
+            invalidate_config_cache()
+        except Exception:
+            pass
+        return True, "استُعيد %d ملفاً" % restored, restored
+    except Exception as e:
+        return False, str(e), 0
+
+
 def _cleanup_old_backups(backup_dir, keep=30):
-    files = sorted(
-        [f for f in os.listdir(backup_dir) if f.startswith("backup_") and f.endswith(".zip")],
-        reverse=True
-    )
+    # الترتيب بوقت التعديل لا بالاسم: الاسم صار يحمل معرّف المدرسة قبل
+    # الوقت، فالترتيب الأبجدي يخلط القديم بالجديد عند تغيّر المعرّف.
+    try:
+        files = [f for f in os.listdir(backup_dir)
+                 if f.startswith("backup_") and f.endswith(".zip")]
+        files.sort(key=lambda f: os.path.getmtime(os.path.join(backup_dir, f)),
+                   reverse=True)
+    except Exception:
+        return
     for old in files[keep:]:
         try: os.remove(os.path.join(backup_dir, old))
         except Exception: pass

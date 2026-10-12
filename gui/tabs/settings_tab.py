@@ -686,20 +686,21 @@ class SettingsTabMixin:
             # نسخة احتياطية من الوضع الحالي قبل الاستعادة
             self._create_term_backup("قبل_استعادة")
 
-            with zipfile.ZipFile(fpath, "r") as zf:
-                # استعد DB
-                if "absences.db" in zf.namelist():
-                    zf.extract("absences.db", os.path.dirname(DB_PATH))
-                # استعد JSON
-                for jname in ["students.json", "teachers.json", "config.json"]:
-                    if jname in zf.namelist():
-                        zf.extract(jname, DATA_DIR)
+            # بيانٌ واحد مع `create_backup` — كان هنا سردٌ مستقل يترك
+            # الوسائط في الحزمة بلا استعادة
+            from database import restore_backup
+            _ok, _msg, _n = restore_backup(fpath)
+            if not _ok:
+                messagebox.showerror("خطأ", f"تعذّرت الاستعادة:\n{_msg}")
+                return
 
             global STUDENTS_STORE
             STUDENTS_STORE = None
             invalidate_config_cache()
 
-            messagebox.showinfo("تم", f"✅ تمت الاستعادة بنجاح من:\n{fname}\n\nأعد تشغيل البرنامج لتطبيق التغييرات.")
+            messagebox.showinfo("تم", f"✅ تمت الاستعادة بنجاح من:\n{fname}\n"
+                                      f"({_msg})\n\n"
+                                      f"أعد تشغيل البرنامج لتطبيق التغييرات.")
             try:
                 self.update_all_tabs_after_data_change()
             except Exception:

@@ -11000,21 +11000,14 @@ async def web_restore_backup(req: Request):
         # نسخة من الوضع الحالي قبل الاستعادة
         create_backup()
 
-        import zipfile as _zf
-        with _zf.ZipFile(fpath, "r") as zf:
-            names = zf.namelist()
-            if "absences.db" in names:
-                zf.extract("absences.db", os.path.dirname(DB_PATH))
-            for jname in ["students.json", "teachers.json", "config.json"]:
-                if jname in names:
-                    zf.extract(jname, DATA_DIR)
-
-        import constants as _c
-        _c.STUDENTS_STORE = None
-        from config_manager import invalidate_config_cache
-        invalidate_config_cache()
+        # بيانٌ واحد مع `create_backup`: كان هنا سردٌ مستقل يستخرج القاعدة
+        # وثلاثة JSON، فتبقى الوسائط في الحزمة ولا تعود أبداً.
+        from database import restore_backup
+        ok, msg, n = restore_backup(fpath)
+        if not ok:
+            return JSONResponse({"ok": False, "msg": msg}, status_code=500)
         load_students(force_reload=True)
-        return JSONResponse({"ok": True})
+        return JSONResponse({"ok": True, "restored": n, "msg": msg})
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 

@@ -230,6 +230,8 @@ class ZKDevice:
 
         self._zk_inst = None   # كائن pyzk ZK
         self.conn = None        # الاتصال المفتوح pyzk
+        # آخر عدّ قُرئ من الجهاز — يملؤه `read_punches` ويعرضه السحب
+        self.last_counts = {}
         self._sock = None       # سوكيت احتياطي
         self._session = 0
         self._reply = 0
@@ -306,9 +308,61 @@ class ZKDevice:
             self.disconnect()
 
     # ── سحب البصمات ──────────────────────────────────────────────────────────
-    def read_punches(self, after_utc=None) -> list:
+    def counts(self) -> dict:
+        """
+        عدّ ما على الجهاز **بلا تنزيل سجلّه**: مستخدمون، بصمات، سجلات.
+
+        أمرٌ واحد صغير (`read_sizes`) مقابل تنزيل السجلّ كاملاً. وقيمته
+        تشخيصية قبل أن تكون أداءً: «الجهاز فيه صفر سجلّ» جوابٌ صريح عن
+        «لماذا لا يُسحب شيء»، بدل صمتٍ يُفهَم عطلاً في البرنامج.
+        """
         self.connect()
         try:
+            try:
+                self.conn.read_sizes()
+            except Exception:
+                pass
+            return {
+                "users": int(getattr(self.conn, "users", 0) or 0),
+                "fingers": int(getattr(self.conn, "fingers", 0) or 0),
+                "records": int(getattr(self.conn, "records", 0) or 0),
+            }
+        finally:
+            self.disconnect()
+
+    def read_punches(self, after_utc=None, known_records=None) -> list:
+        """
+        يقرأ البصمات الجديدة. يُرجع قائمة، ويضع العدّ في `self.last_counts`.
+
+        ⚠️ بروتوكول ZK لا يملك «أعطني ما بعد وقتٍ ما»: `get_attendance`
+        يُنزّل **سجلّ الجهاز كاملاً** ثم نُرشّح نحن. فمدرسةٌ مضى عليها
+        شهور تُنزّل عشرات الآلاف من السجلات في كل دورة — وهو سبب البطء،
+        ويزداد كل يوم.
+
+        فنقرأ العدّ أولاً: إن لم يتغيّر عن آخر مرة فلا جديد، ولا داعي
+        للتنزيل إطلاقاً. والعدّاد يزيد مع كل بصمة، فتساويه يعني يقيناً
+        ألّا جديد — لا تخميناً.
+        """
+        self.connect()
+        try:
+            try:
+                self.conn.read_sizes()
+            except Exception:
+                pass
+            cnt = {
+                "users": int(getattr(self.conn, "users", 0) or 0),
+                "fingers": int(getattr(self.conn, "fingers", 0) or 0),
+                "records": int(getattr(self.conn, "records", 0) or 0),
+            }
+            self.last_counts = cnt
+
+            # لا سجلّ على الجهاز ⇒ لا تنزيل ولا التباس
+            if cnt["records"] == 0:
+                return []
+            # العدّ كما كان ⇒ لا بصمة جديدة منذ آخر دورة
+            if known_records is not None and cnt["records"] == known_records:
+                return []
+
             after_dt = None
             if after_utc:
                 try:

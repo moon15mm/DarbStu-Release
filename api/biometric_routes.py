@@ -220,6 +220,23 @@ async def bio_punches(request: Request, date: str = ""):
     return JSONResponse({"ok": True, "rows": rows})
 
 
+@router.get("/web/api/biometric/progress", response_class=JSONResponse)
+async def bio_progress(request: Request):
+    """
+    تقدّم السحب الجاري. تقرؤها الواجهة كل جزءٍ من الثانية أثناء العملية.
+
+    **لا تأخذ قفل المُشغّل** عمداً: القفل محجوزٌ طوال السحب، فطلبُه هنا
+    يجعل شريط التقدّم ينتظر انتهاء ما يُفترض أن يعرضه.
+    """
+    if not _auth(request):
+        return _unauth()
+    try:
+        from biometric import poller
+        return JSONResponse({"ok": True, **poller.get_progress()})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
 @router.post("/web/api/biometric/run", response_class=JSONResponse)
 async def bio_run(request: Request):
     if not _auth(request):
@@ -227,7 +244,11 @@ async def bio_run(request: Request):
     try:
         from biometric import poller
         new, stat = poller.run_once()
-        return JSONResponse({"ok": True, "new": new, "stat": stat})
+        # حالة كل جهاز وعدّ سجلّه: بها يُفرَّق بين «لا بصمات على
+        # الجهاز» و«لم نستطع الوصول إليه» — وكانا يبدوان سواءً.
+        devs = (getattr(poller, "_last_status", {}) or {}).get("devices", [])
+        return JSONResponse({"ok": True, "new": new, "stat": stat,
+                             "devices": devs})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
@@ -721,6 +742,13 @@ _PAGE = r"""<!doctype html>
   .msg.ok{background:#E4F6EA;color:#1B7C3D;display:block}
   .msg.er{background:#FDE7E7;color:#C0392B;display:block}
   .devbox{border:1px solid var(--line);border-radius:10px;padding:11px;margin-bottom:10px;background:#FbFdff}
+  .ptrack{background:#E2E8F0;height:10px;border-radius:5px;overflow:hidden}
+  .pfill2{background:var(--org);height:100%;width:0;transition:width .35s;
+          border-radius:5px}
+  .runmsg{margin-top:8px;padding:9px 12px;border-radius:8px;font-size:13px;line-height:1.7}
+  .runmsg.ai{background:#EFF6FF;color:#1E40AF;border:1px solid #BFDBFE}
+  .runmsg.ok{background:#ECFDF5;color:#065F46;border:1px solid #A7F3D0}
+  .runmsg.er{background:#FEF2F2;color:#991B1B;border:1px solid #FECACA}
   .muted{color:var(--mu);font-size:12px}
   .switch{display:flex;align-items:center;gap:8px}
 </style></head><body>
@@ -743,9 +771,15 @@ _PAGE = r"""<!doctype html>
     <span id="poll-dot" class="dot off"></span>
     <span id="poll-txt" class="muted">الخيط: —</span>
     <span style="flex:1"></span>
-    <button class="btn o sm" onclick="runNow()">↻ سحب ومعالجة الآن</button>
+    <button class="btn o sm" id="runbtn" onclick="runNow(event)">↻ سحب ومعالجة الآن</button>
   </div>
   <div id="dev-status" class="muted" style="margin-top:6px"></div>
+  <!-- ما كان ينقص: مكانٌ يقول ماذا يحدث وماذا حدث -->
+  <div id="runbar" style="display:none;margin-top:8px">
+    <div class="ptrack"><div class="pfill2" id="runfill"></div></div>
+    <div class="muted" id="runstage" style="margin-top:4px">—</div>
+  </div>
+  <div id="runmsg" class="runmsg" style="display:none"></div>
 </div>
 
 <div class="grid">
@@ -881,9 +915,75 @@ async function scan(){
   d.found.forEach(ip=>{if(!DEVICES.some(v=>v.ip===ip))DEVICES.push({device_id:'gate'+(DEVICES.length+1),protocol:'zk',ip:ip,port:4370,comm_key:0,enabled:true});});
   renderDevices();
 }
-async function runNow(){
-  const d=await api('/web/api/biometric/run',{method:'POST'});
-  if(d&&d.ok){await loadStatus();await loadPunches();}
+async function runNow(ev){
+  // كان الزرّ يصمت تماماً: لا مؤشّر أثناء السحب ولا رسالة عند الفشل.
+  // والسحب قد يطول (ينزّل سجلّ الجهاز)، فتبدو الصفحة متجمّدة فيُضغط
+  // ثانيةً وثالثة. الآن: يُعطَّل الزرّ، ويُقال ما يحدث، ويُقال السبب.
+  const btn=(ev&&ev.target)||document.getElementById('runbtn');
+  const old=btn?btn.innerHTML:'';
+  if(btn){ btn.disabled=true; btn.innerHTML='⏳ جارٍ السحب من الأجهزة...'; }
+  const box=document.getElementById('runmsg');
+  if(box){ box.style.display='block'; box.className='runmsg ai';
+           box.textContent='⏳ يتصل بالأجهزة ويقرأ سجلّها — قد يستغرق دقيقة.'; }
+
+  // شريط يتقدّم فعلاً: الخادم يكتب تقدّمه ونحن نقرؤه كل نصف ثانية.
+  // طلب السحب يحجب حتى ينتهي، فلا سبيل لمعرفة ما يجري إلا بسؤال مستقل.
+  const bar=document.getElementById('runbar');
+  const fill=document.getElementById('runfill');
+  const stg=document.getElementById('runstage');
+  if(bar){ bar.style.display='block'; }
+  if(fill){ fill.style.width='2%'; }
+  if(stg){ stg.textContent='يبدأ...'; }
+  let poll=setInterval(async function(){
+    try{
+      const p=await api('/web/api/biometric/progress');
+      if(!p||!p.ok) return;
+      if(fill) fill.style.width=(p.pct||0)+'%';
+      if(stg){
+        var t=p.stage||'';
+        if(p.total>1 && p.idx) t+=' ('+p.idx+' من '+p.total+')';
+        if(p.detail) t+=' — '+p.detail;
+        stg.textContent=t||'—';
+      }
+    }catch(e){}
+  }, 500);
+
+  try{
+    const d=await api('/web/api/biometric/run',{method:'POST'});
+    if(!d||!d.ok){
+      if(box){ box.className='runmsg er';
+        box.textContent='❌ تعذّر السحب: '+((d&&(d.error||d.msg))||'لم يردّ الخادم'); }
+      return;
+    }
+    await loadStatus(); await loadPunches();
+    if(box){
+      var n=d.new||0, st=d.stat||{}, devs=d.devices||[];
+      var parts=[];
+      devs.forEach(function(x){
+        if(!x.ok){ parts.push('❌ '+x.device_id+': '+(x.error||'تعذّر الاتصال')); return; }
+        // العدّ من الجهاز نفسه — يفصل «لا بصمات عندهم» عن «عطل عندنا»
+        var r=(x.records==null)?'':(' · سجلّ الجهاز '+x.records);
+        parts.push('✅ '+x.device_id+': جديد '+(x.new||0)+r);
+      });
+      var line='تمّ السحب — '+n+' بصمة جديدة.';
+      if(n===0) line='لم تُسحب بصمات جديدة.';
+      if(st.tardy||st.present||st.unmatched)
+        line+=' (تأخر '+(st.tardy||0)+' · بالوقت '+(st.present||0)
+             +' · بلا مطابقة '+(st.unmatched||0)+')';
+      box.className='runmsg '+(n?'ok':'ai');
+      box.innerHTML=line+(parts.length?('<br><span style="font-size:12px">'
+                   +parts.join('<br>')+'</span>'):'');
+    }
+  }catch(e){
+    if(box){ box.className='runmsg er'; box.textContent='❌ خطأ في الاتصال: '+e; }
+  }finally{
+    // يُوقَف الاستطلاع مهما كان المآل — وإلا بقي يسأل الخادم إلى الأبد
+    clearInterval(poll);
+    if(fill) fill.style.width='100%';
+    if(stg) stg.textContent='اكتمل';
+    setTimeout(function(){ if(bar) bar.style.display='none'; }, 1200);
+    if(btn){ btn.disabled=false; btn.innerHTML=old; }
+  }
 }
 async function loadEnroll(){
   const d=await api('/web/api/biometric/enrollments'); if(!d||!d.ok)return;
