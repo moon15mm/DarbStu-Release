@@ -41,6 +41,36 @@ def get_progress() -> dict:
     return dict(_progress)
 
 
+# ── العلامة المائية: كم يوماً نُعيد عرضه احتياطاً ───────────────────
+# سحبُ ما بعد «آخر بصمة خزّنّاها» وحده يترك ثغرتين تُضيّعان يوماً كاملاً
+# بلا أي أثر:
+#   ① **ساعة الجهاز تنحرف.** بصمةٌ واحدة بتاريخٍ مستقبلي ترفع العلامة
+#      إلى ذلك التاريخ، فتُهمَل كل بصمةٍ حقيقية بعدها **إلى الأبد**.
+#   ② إخفاقٌ عابر في إدخال بصمةٍ وسط دفعة يرفع العلامة فوقها فلا تعود.
+# والإعادة آمنة تماماً: `UNIQUE(device_id, device_uid, punch_utc)` يرفض
+# المكرر، فإعادة العرض لا تُنتج سجلاً زائداً ولا إشعاراً مكرراً.
+_WATERMARK_BACKTRACK_DAYS = 3
+
+
+def _safe_watermark(after_utc):
+    """يُرجع علامةً يُوثق بها: تُهمَل المستقبلية، ويُطرح هامش أيام."""
+    if not after_utc:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(
+            str(after_utc).replace("Z", "").strip())
+    except Exception:
+        return None
+    now = datetime.datetime.utcnow()
+    if dt > now:
+        # علامةٌ من المستقبل = ساعة جهازٍ منحرفة. تُهمَل كلياً فيُعاد
+        # فحص السجلّ من أوله — والمكرر يرفضه القيد.
+        print("[BIO] علامة مائية مستقبلية (%s) — أُهملت" % after_utc)
+        return None
+    return (dt - datetime.timedelta(days=_WATERMARK_BACKTRACK_DAYS)
+            ).isoformat(timespec="seconds")
+
+
 def _prog(pct=None, stage=None, detail=None, idx=None, total=None):
     if pct is not None:
         _progress["pct"] = max(0, min(100, int(pct)))
@@ -227,7 +257,7 @@ def _pull_devices(cfg):
               stage="يتصل بالجهاز", detail=did, idx=_i)
         try:
             dev = make_device(dcfg)
-            after = get_last_punch_utc(did)
+            after = _safe_watermark(get_last_punch_utc(did))
             # المرحلة تُعلَن **قبل** القراءة لا بعدها: القراءة هي الجزء
             # الطويل، وإعلانُها بعد انتهائها يصف ما فرغ لا ما يجري.
             _prog(stage="يقرأ سجلّ الجهاز", detail=did)

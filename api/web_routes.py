@@ -844,6 +844,8 @@ def _attendance_report_params(request: Request) -> dict:
         "include_absence": _b("absence", True),
         "include_tardy": _b("tardy", True),
         "class_id": (q.get("class_id") or "").strip() or None,
+        # الصفّ كامل الشعب — أخصّه الفصل عند وجودهما
+        "level": (q.get("level") or "").strip() or None,
         "group_by": (q.get("group_by") or "student").strip(),
         "min_absence": _i("min_absence"), "min_tardy": _i("min_tardy"),
         "min_minutes": _i("min_minutes"),
@@ -888,6 +890,7 @@ def _good_standing_report(request: Request):
         max_absence=_i("max_absence"), max_tardy=_i("max_tardy"),
         excused_ok=_b("excused_ok", True),
         class_id=(q.get("class_id") or "").strip() or None,
+        level=(q.get("level") or "").strip() or None,
         sort=(q.get("sort") or "name").strip(), limit=_i("limit"))
 
 
@@ -3125,8 +3128,12 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
           <input type="date" id="ar-from"></div>
         <div class="fg"><label class="fl">إلى تاريخ</label>
           <input type="date" id="ar-to"></div>
-        <div class="fg"><label class="fl">الفصل</label>
-          <select id="ar-cls"><option value="">جميع الفصول</option></select></div>
+        <!-- الصفّ ثم الشعبة: «ثاني ثانوي» كله، أو شعبة بعينها منه -->
+        <div class="fg"><label class="fl">الصف</label>
+          <select id="ar-lvl" onchange="fillSections('ar-lvl','ar-cls')">
+            <option value="">كل الصفوف</option></select></div>
+        <div class="fg"><label class="fl">الشعبة</label>
+          <select id="ar-cls"><option value="">جميع الشعب</option></select></div>
         <div class="fg"><label class="fl">التجميع حسب</label>
           <select id="ar-grp">
             <option value="student">الطالب</option>
@@ -3191,8 +3198,11 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
           <input type="date" id="gd-from"></div>
         <div class="fg"><label class="fl">إلى تاريخ</label>
           <input type="date" id="gd-to"></div>
-        <div class="fg"><label class="fl">الفصل</label>
-          <select id="gd-cls"><option value="">جميع الفصول</option></select></div>
+        <div class="fg"><label class="fl">الصف</label>
+          <select id="gd-lvl" onchange="fillSections('gd-lvl','gd-cls')">
+            <option value="">كل الصفوف</option></select></div>
+        <div class="fg"><label class="fl">الشعبة</label>
+          <select id="gd-cls"><option value="">جميع الشعب</option></select></div>
         <div class="fg"><label class="fl">الترتيب</label>
           <select id="gd-sort">
             <option value="name">الاسم</option>
@@ -6372,13 +6382,40 @@ async function usGenerate(){
     loadUsers();
   }catch(e){ ss('us-st','❌ خطأ في الاتصال','er'); }
 }
+/* ══ الصفّ والشعبة ══
+   معرّف الفصل «صفّ-شعبة» (1-101)، واسمه «أول ثانوي / 101». فالصفّ هو
+   الجزء قبل الشرطة، وعنوانه ما قبل «/» في الاسم. */
+function _lvlOf(id){ var s=String(id||''); var i=s.indexOf('-');
+                     return i<0?s:s.slice(0,i); }
+function _lvlLabel(name){ return String(name||'').split('/')[0].trim(); }
+
+function fillLevels(lvlId){
+  var el=document.getElementById(lvlId); if(!el) return;
+  var seen={}, opts='<option value="">كل الصفوف</option>';
+  (_classes||[]).forEach(function(c){
+    var L=_lvlOf(c.id);
+    if(L && !seen[L]){ seen[L]=1;
+      opts+='<option value="'+L+'">'+(_lvlLabel(c.name)||L)+'</option>'; }
+  });
+  var cur=el.value; el.innerHTML=opts; if(cur) el.value=cur;
+}
+
+function fillSections(lvlId, clsId){
+  var lv=document.getElementById(lvlId), el=document.getElementById(clsId);
+  if(!el) return;
+  var L=lv?lv.value:'';
+  // بلا صفٍّ مختار تبقى القائمة كل الفصول — فلا يُحجب شيء عمّن لا يستعمل الصفّ
+  var list=(_classes||[]).filter(function(c){ return !L || _lvlOf(c.id)===L; });
+  el.innerHTML='<option value="">'+(L?'جميع الشعب':'جميع الفصول')+'</option>'
+    + list.map(function(c){
+        return '<option value="'+c.id+'">'+c.name+'</option>'; }).join('');
+}
+
 /* ══ الرصد الشامل: غياب + تأخر + دقائق ══ */
 var _arPreset='month';
 
 function arInit(){
-  fillSel('ar-cls');
-  var el=document.getElementById('ar-cls');
-  if(el&&el.options.length)el.options[0].textContent='جميع الفصول';
+  fillLevels('ar-lvl'); fillSections('ar-lvl','ar-cls');
   if(!document.getElementById('ar-from').value) arPreset('month');
 }
 
@@ -6390,7 +6427,8 @@ function arQuery(){
   // و`custom` وحده يقرؤها فنُبدّل الاختصار عند أي تعديل يدوي
   q+='&from='+encodeURIComponent(v('ar-from'))+'&to='+encodeURIComponent(v('ar-to'));
   q+='&absence='+c('ar-abs')+'&tardy='+c('ar-tdy')+'&exclude_excused='+c('ar-exc');
-  q+='&class_id='+encodeURIComponent(v('ar-cls'));
+  q+='&class_id='+encodeURIComponent(v('ar-cls'))
+     +'&level='+encodeURIComponent(v('ar-lvl'));
   q+='&group_by='+encodeURIComponent(v('ar-grp'))+'&sort='+encodeURIComponent(v('ar-sort'));
   q+='&min_absence='+(v('ar-mina')||0)+'&min_tardy='+(v('ar-mint')||0);
   q+='&min_minutes='+(v('ar-minm')||0)+'&limit='+(v('ar-limit')||0);
@@ -6485,9 +6523,7 @@ function arOpen(kind){
 var _gdPreset='month';
 
 function gdInit(){
-  fillSel('gd-cls');
-  var el=document.getElementById('gd-cls');
-  if(el&&el.options.length)el.options[0].textContent='جميع الفصول';
+  fillLevels('gd-lvl'); fillSections('gd-lvl','gd-cls');
   if(!document.getElementById('gd-from').value) gdPreset('month');
 }
 
@@ -6497,7 +6533,9 @@ function gdQuery(){
   var q='kind=good&preset='+encodeURIComponent(_gdPreset);
   q+='&from='+encodeURIComponent(v('gd-from'))+'&to='+encodeURIComponent(v('gd-to'));
   q+='&absence='+c('gd-abs')+'&tardy='+c('gd-tdy')+'&excused_ok='+c('gd-exc');
-  q+='&class_id='+encodeURIComponent(v('gd-cls'))+'&sort='+encodeURIComponent(v('gd-sort'));
+  q+='&class_id='+encodeURIComponent(v('gd-cls'))
+     +'&level='+encodeURIComponent(v('gd-lvl'))
+     +'&sort='+encodeURIComponent(v('gd-sort'));
   q+='&max_absence='+(v('gd-maxa')||0)+'&max_tardy='+(v('gd-maxt')||0);
   q+='&limit='+(v('gd-limit')||0);
   return q;

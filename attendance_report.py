@@ -96,12 +96,45 @@ def _days_label(start, end):
 # ══════════════════════════════════════════════════════════════════
 #  التقرير
 # ══════════════════════════════════════════════════════════════════
+def _norm_cid(cid):
+    """معرّف الفصل مُطبَّعاً — نفس ما تفعله كل تقارير `report_builder`."""
+    try:
+        from database import normalize_legacy_class_id
+        return str(normalize_legacy_class_id(cid) or "").strip()
+    except Exception:
+        return str(cid or "").strip()
+
+
+def class_level(cid):
+    """
+    الصفّ من معرّف الفصل: `1-101` ⇒ `1`. وهو ما يُجمَع عليه «كل الشعب».
+
+    معرّفات نور صفٌّ ثم شرطة ثم الشعبة، فالجزء الأول هو الصفّ. وما لا
+    يتبع الصيغة يُرجَع كما هو فلا يسقط من التقارير.
+    """
+    c = _norm_cid(cid)
+    return c.split("-", 1)[0] if "-" in c else c
+
+
+def _cls_match(cid, class_id=None, level=None):
+    """هل يدخل هذا الفصل في التصفية؟ فصلٌ بعينه، أو صفٌّ بكل شعبه."""
+    c = _norm_cid(cid)
+    if class_id:
+        return c == _norm_cid(class_id)
+    if level:
+        return class_level(c) == str(level).strip()
+    return True
+
+
 def build_report(start, end, include_absence=True, include_tardy=True,
                  class_id=None, group_by="student", min_absence=0,
                  min_tardy=0, min_minutes=0, exclude_excused=False,
-                 sort="absence", limit=0, roster=None):
+                 sort="absence", limit=0, roster=None, level=None):
     """
     يبني التقرير المجمَّع. يُرجع قاموساً جاهزاً للعرض أو الطباعة.
+
+    `class_id` فصلٌ بعينه، و`level` صفٌّ كامل بكل شعبه (مثلاً كل شعب
+    «ثاني ثانوي»). والفصل أخصّ فيُقدَّم عند وجودهما معاً.
 
     `min_*` عتباتٌ **تُطبَّق بعد الجمع**: «أرني من غاب ٥ أيام فأكثر» هو
     سؤال الوكيل الأول، وتصفيتُه في الواجهة تعني نقل آلاف الصفوف ليُرمى
@@ -122,8 +155,15 @@ def build_report(start, end, include_absence=True, include_tardy=True,
         exempt = {str(r[0]) for r in
                   cur.execute("SELECT student_id FROM exempted_students")}
 
-        where_cls = " AND class_id=?" if class_id else ""
-        p_cls = [class_id] if class_id else []
+        # ⚠️ لا تُرشَّح الفصول في SQL. المخزَّن في الجداول قد يكون معرّفاً
+        # قديماً من نور (`1314-101`) بينما القائمة تعرض المُطبَّع
+        # (`1-101`) — فالمقارنة الحرفية لا تُطابق شيئاً، ويظهر التقرير
+        # فارغاً مع أن المتأخرات موجودات. (كل تقارير `report_builder`
+        # تُطبّع بعد الجلب، وهذا ما فاتني هنا.)
+        # فنجلب ثم نُطبّع ثم نُرشّح في بايثون — والتطبيع نفسه يوحّد
+        # المعرّفين القديم والجديد فلا ينشطر الفصل الواحد مجموعتين.
+        where_cls = ""
+        p_cls = []
 
         # ── الغياب ────────────────────────────────────────────
         absences = []
@@ -131,7 +171,8 @@ def build_report(start, end, include_absence=True, include_tardy=True,
             q = ("SELECT date, student_id, student_name, class_id, class_name "
                  "FROM absences WHERE date BETWEEN ? AND ?" + where_cls)
             absences = [dict(r) for r in
-                        cur.execute(q, [start, end] + p_cls)]
+                        cur.execute(q, [start, end] + p_cls)
+                        if _cls_match(r["class_id"], class_id, level)]
 
         # ── الأعذار (للاستبعاد) ───────────────────────────────
         excused = set()
@@ -147,7 +188,8 @@ def build_report(start, end, include_absence=True, include_tardy=True,
                  " COALESCE(minutes_late,0) AS mins "
                  "FROM tardiness WHERE date BETWEEN ? AND ?" + where_cls)
             tardies = [dict(r) for r in
-                       cur.execute(q, [start, end] + p_cls)]
+                       cur.execute(q, [start, end] + p_cls)
+                       if _cls_match(r["class_id"], class_id, level)]
 
         # أيام الدراسة الفعلية: التواريخ التي سُجّل فيها شيء. أدقّ من
         # عدّ أيام التقويم — العطل والإجازات لا سجلّ فيها.
@@ -168,7 +210,9 @@ def build_report(start, end, include_absence=True, include_tardy=True,
 
     def _keyof(row):
         if group_by == "class":
-            return (row.get("class_id") or "—",
+            # المُطبَّع لا الخام: القديم والجديد لفصلٍ واحد يجب أن
+            # يجتمعا في صفٍّ واحد لا صفَّين
+            return (_norm_cid(row.get("class_id")) or "—",
                     row.get("class_name") or "—", "")
         if group_by == "day":
             return (row["date"], row["date"], "")
@@ -256,7 +300,8 @@ def build_report(start, end, include_absence=True, include_tardy=True,
         "exclude_excused": exclude_excused,
         # نسبةٌ بلا مقام لا تُعرض: عمودٌ من الشُّرَط أسوأ من غيابه
         "has_pct": any(r.get("pct") is not None for r in rows),
-        "filters": {"class_id": class_id or "", "min_absence": min_absence,
+        "filters": {"class_id": class_id or "", "level": level or "",
+                    "min_absence": min_absence,
                     "min_tardy": min_tardy, "min_minutes": min_minutes},
         "totals": {
             "rows": len(rows),
@@ -275,7 +320,7 @@ def build_report(start, end, include_absence=True, include_tardy=True,
 def build_good_standing(start, end, students, check_absence=True,
                         check_tardy=True, max_absence=0, max_tardy=0,
                         excused_ok=True, class_id=None, sort="name",
-                        limit=0):
+                        limit=0, level=None):
     """
     الطلاب الذين لم يغيبوا ولم يتأخروا في المدى (أو ضمن هامشٍ مسموح).
 
@@ -336,7 +381,8 @@ def build_good_standing(start, end, students, check_absence=True,
         sid = str(s.get("id") or "")
         if not sid or sid in exempt:
             continue
-        if class_id and s.get("class_id") != class_id:
+        # يُطبَّع هنا أيضاً: كشف الطلاب قد يحمل معرّفاً، والمختار آخر
+        if not _cls_match(s.get("class_id"), class_id, level):
             continue
         scanned += 1
         a, t = n_abs.get(sid, 0), n_tdy.get(sid, 0)
@@ -371,7 +417,8 @@ def build_good_standing(start, end, students, check_absence=True,
         "include_absence": check_absence, "include_tardy": check_tardy,
         "exclude_excused": False, "has_pct": False,
         "excused_ok": excused_ok,
-        "filters": {"class_id": class_id or "", "max_absence": max_absence,
+        "filters": {"class_id": class_id or "", "level": level or "",
+                    "max_absence": max_absence,
                     "max_tardy": max_tardy},
         "totals": {
             "rows": len(rows), "scanned": scanned,
