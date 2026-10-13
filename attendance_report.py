@@ -147,6 +147,22 @@ def build_report(start, end, include_absence=True, include_tardy=True,
     if not include_absence and not include_tardy:
         include_absence = include_tardy = True      # لا تقرير بلا مصدر
 
+    # ⚠️ سجلات البصمة تُكتب بـ`class_id` **فارغ** (اسم الفصل وحده) —
+    # انظر `poller.process_pending`. فترشيحٌ بالفصل أو الصفّ لا يُطابق
+    # منها شيئاً، وتظهر «ثاني ثانوي» بطالبةٍ واحدة سُجّلت يدوياً وحدها.
+    # فنعود إلى كشف الطلاب: الطالب يعرف فصله وإن لم يعرفه السجلّ.
+    # (وهذا يُنقذ السجلات القائمة كلها، لا القادمة فقط.)
+    _by_stu = (roster or {}).get("by_student") or {}
+
+    def _row_cid(row):
+        c = _norm_cid(row.get("class_id"))
+        if c:
+            return c
+        return _norm_cid(_by_stu.get(str(row.get("student_id") or ""), ""))
+
+    def _row_match(row):
+        return _cls_match(_row_cid(row), class_id, level)
+
     con = _con()
     try:
         cur = con.cursor()
@@ -170,9 +186,10 @@ def build_report(start, end, include_absence=True, include_tardy=True,
         if include_absence:
             q = ("SELECT date, student_id, student_name, class_id, class_name "
                  "FROM absences WHERE date BETWEEN ? AND ?" + where_cls)
-            absences = [dict(r) for r in
-                        cur.execute(q, [start, end] + p_cls)
-                        if _cls_match(r["class_id"], class_id, level)]
+            # يُحوَّل إلى قاموس **قبل** الترشيح: `sqlite3.Row` بلا `.get`
+            absences = [d for d in (dict(r) for r in
+                                    cur.execute(q, [start, end] + p_cls))
+                        if _row_match(d)]
 
         # ── الأعذار (للاستبعاد) ───────────────────────────────
         excused = set()
@@ -187,9 +204,9 @@ def build_report(start, end, include_absence=True, include_tardy=True,
             q = ("SELECT date, student_id, student_name, class_id, class_name,"
                  " COALESCE(minutes_late,0) AS mins "
                  "FROM tardiness WHERE date BETWEEN ? AND ?" + where_cls)
-            tardies = [dict(r) for r in
-                       cur.execute(q, [start, end] + p_cls)
-                       if _cls_match(r["class_id"], class_id, level)]
+            tardies = [d for d in (dict(r) for r in
+                                   cur.execute(q, [start, end] + p_cls))
+                       if _row_match(d)]
 
         # أيام الدراسة الفعلية: التواريخ التي سُجّل فيها شيء. أدقّ من
         # عدّ أيام التقويم — العطل والإجازات لا سجلّ فيها.
@@ -212,7 +229,7 @@ def build_report(start, end, include_absence=True, include_tardy=True,
         if group_by == "class":
             # المُطبَّع لا الخام: القديم والجديد لفصلٍ واحد يجب أن
             # يجتمعا في صفٍّ واحد لا صفَّين
-            return (_norm_cid(row.get("class_id")) or "—",
+            return (_row_cid(row) or "—",
                     row.get("class_name") or "—", "")
         if group_by == "day":
             return (row["date"], row["date"], "")

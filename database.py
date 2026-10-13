@@ -1510,7 +1510,8 @@ def get_academic_map():
             if an:
                 m[an] = {"student_id": str(s.get("id")),
                          "name": s.get("name", ""),
-                         "class_name": c.get("name", "")}
+                         "class_name": c.get("name", ""),
+                         "class_id": c.get("id", "")}
     return m
 
 
@@ -1976,7 +1977,8 @@ def get_student_map():
     m = {}
     for c in store.get("list", []):
         for s in c.get("students", []):
-            m[s["id"]] = {"name": s["name"], "class_name": c["name"]}
+            m[s["id"]] = {"name": s["name"], "class_name": c["name"],
+                          "class_id": c.get("id", "")}
     
     _student_map_cache = {"data": m, "version": version}
     return m

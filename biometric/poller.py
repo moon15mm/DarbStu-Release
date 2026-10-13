@@ -167,7 +167,7 @@ def process_pending(cfg=None):
             stat["unmatched"] += 1
             continue
 
-        sid, sname, cname = matched
+        sid, sname, cname, ccid = matched
         if is_student_exempted(sid):
             mark_punch_processed(p["id"], "مستثنى", student_id=sid, matched=1)
             stat["exempted"] += 1
@@ -198,8 +198,11 @@ def process_pending(cfg=None):
             continue
 
         minutes_late = max(minutes_late, 0)
+        # ‏`class_id` كان يُكتب فارغاً، فلا يُطابقه ترشيحٌ بفصل أو صفّ
+        # في التقارير — وتظهر المرحلة بطالبةٍ واحدة. صار يُكتب من كشف
+        # الطلاب، ومن لا فصل له يبقى فارغاً كما كان.
         ok = insert_tardiness(
-            p["date"] or _today_local(), "", cname, sid, sname,
+            p["date"] or _today_local(), ccid or "", cname, sid, sname,
             "بوابة البصمة", 0, minutes_late)
         if not ok:
             # UNIQUE(date, student_id): سُجّل تأخره سلفاً اليوم — تكرار طبيعي

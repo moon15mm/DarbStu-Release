@@ -910,12 +910,17 @@ def _attendance_report(request: Request):
     # من لم يغب قط لا يظهر فيه فيُصغَّر المقام وتُضخَّم النسبة.
     try:
         store = load_students()
-        by_class, total = {}, 0
+        by_class, by_student, total = {}, {}, 0
         for c in store.get("list", []):
             n = len(c.get("students", []))
             by_class[c.get("id")] = n
             total += n
-        p["roster"] = {"total": total, "by_class": by_class}
+            # فصلُ كل طالب: به تُرشَّح سجلات البصمة التي لا تحمل
+            # معرّف فصل أصلاً
+            for st in c.get("students", []):
+                by_student[str(st.get("id") or "")] = c.get("id") or ""
+        p["roster"] = {"total": total, "by_class": by_class,
+                       "by_student": by_student}
     except Exception:
         p["roster"] = None
     return build_report(start, end, **p)
