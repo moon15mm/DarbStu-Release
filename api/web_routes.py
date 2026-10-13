@@ -5614,6 +5614,13 @@ async function loadClasses(){
   _classes=d.classes;
   var opts='<option value="">اختر فصلاً</option>'+d.classes.map(function(c){return '<option value="'+c.id+'" data-name="'+c.name+'">'+c.name+' ('+c.count+')</option>';}).join('');
   ['ra-class','rt-class','np-class','an-class','lb-cls','ex-cls','co-cls'].forEach(function(id){var el=document.getElementById(id);if(el)el.innerHTML=opts;});
+  // الفصول تصل بعد رسم الصفحة — وعبر النفق تتأخر. فتُحدَّث قوائم
+  // الصفّ والشعبة فور وصولها، وإلا بقيت فارغة بلا سبب ظاهر.
+  [['ar-lvl','ar-cls'],['gd-lvl','gd-cls']].forEach(function(pair){
+    if(document.getElementById(pair[0])){
+      fillLevels(pair[0]); fillSections(pair[0],pair[1]);
+    }
+  });
 }
 function fillSel(id){
   var el=document.getElementById(id);if(!el)return;
@@ -6414,7 +6421,9 @@ function fillSections(lvlId, clsId){
 /* ══ الرصد الشامل: غياب + تأخر + دقائق ══ */
 var _arPreset='month';
 
-function arInit(){
+async function arInit(){
+  // التبويب قد يُفتح قبل وصول الفصول، فننتظرها بدل أن نرسم قوائم فارغة
+  if(!(_classes||[]).length){ try{ await loadClasses(); }catch(e){} }
   fillLevels('ar-lvl'); fillSections('ar-lvl','ar-cls');
   if(!document.getElementById('ar-from').value) arPreset('month');
 }
@@ -6522,7 +6531,8 @@ function arOpen(kind){
 /* ══ الطلاب المنضبطون ══ */
 var _gdPreset='month';
 
-function gdInit(){
+async function gdInit(){
+  if(!(_classes||[]).length){ try{ await loadClasses(); }catch(e){} }
   fillLevels('gd-lvl'); fillSections('gd-lvl','gd-cls');
   if(!document.getElementById('gd-from').value) gdPreset('month');
 }
