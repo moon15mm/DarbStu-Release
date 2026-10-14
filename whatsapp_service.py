@@ -2,7 +2,7 @@
 """
 whatsapp_service.py — خدمة إرسال رسائل الواتساب
 """
-import requests, os, subprocess, sys, time, threading, base64, random
+import requests, os, json, shutil, subprocess, sys, time, threading, base64, random
 from constants import BASE_DIR, WHATS_PATH, DATA_DIR
 from config_manager import load_config, render_message
 
@@ -533,6 +533,62 @@ def _kill_stale_wa_server(port=3000):
             else "المنفذ محجوز بغير node — لم يُلمس"
     except Exception as e:
         return f"تعذّر الفحص ({e})"
+
+
+def _profile_browsers(auth_path) -> list:
+    """
+    متصفحات تحجز ملف هذه الجلسة. تُطابَق بمسار الجلسة نفسه لا بالاسم،
+    فمتصفح المعلّم الشخصي لا يُلمس.
+    """
+    if sys.platform != "win32":
+        return []
+    mark = os.path.abspath(auth_path).replace("/", "\\").lower()
+    ps = ("$r=@(Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' OR Name='msedge.exe'\" "
+          "| Select-Object ProcessId,CommandLine); ConvertTo-Json -InputObject $r -Compress")
+    ps_exe = os.path.join(os.environ.get("SystemRoot") or r"C:\Windows", "System32",
+                          "WindowsPowerShell", "v1.0", "powershell.exe")
+    try:
+        raw = subprocess.run([ps_exe, "-NoProfile", "-NonInteractive", "-Command", ps],
+                             capture_output=True, timeout=30,
+                             creationflags=subprocess.CREATE_NO_WINDOW).stdout
+        rows = json.loads(raw.decode("utf-8", "replace").strip() or "[]")
+    except Exception:
+        return []
+    if isinstance(rows, dict):
+        rows = [rows]
+    return [r.get("ProcessId") for r in rows
+            if mark in str(r.get("CommandLine") or "").replace("/", "\\").lower()]
+
+
+def reset_wa_session() -> str:
+    """
+    يُوقف خادم هذه المرحلة ويحذف جلسته، فيُقلع التشغيل التالي بلا جلسة
+    فيُطلب مسح QR جديد.
+
+    الحذف وحده لا يكفي: الخادم الحيّ يحمل الجلسة في ذاكرته، و«تشغيل الخادم»
+    يتخطّاه لأنه «يعمل أصلاً»، فلا يظهر رمز جديد أبداً. أُعيد إنتاج ذلك على
+    خادم حقيقي في المختبر: بقي معرّف العملية كما هو بعد الحذف والتشغيل.
+    """
+    try:
+        port = int(get_wa_servers()[0].get("port", 3000))
+    except Exception:
+        port = 3000
+    stopped = _kill_stale_wa_server(port)
+    auth_path = wa_file(".wwebjs_auth", port)
+    # المتصفح يخرج بعد الخادم بثوانٍ. الحذف وهو يكتب فيها يترك بقايا تُفسد
+    # التشغيل التالي (ظهر ذلك في المختبر)، فننتظر خروجه أولاً.
+    end = time.time() + 20
+    while time.time() < end and _profile_browsers(auth_path):
+        time.sleep(1)
+    for pid in _profile_browsers(auth_path):   # ما بقي بعد المهلة: نُنهيه بشجرته
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+    for _ in range(5):
+        shutil.rmtree(auth_path, ignore_errors=True)
+        if not os.path.exists(auth_path):
+            break
+        time.sleep(1)
+    return stopped
 
 
 def start_whatsapp_server():

@@ -14032,14 +14032,11 @@ async def wa_reset_session(request: Request):
     if not user or user.get("role") not in ("admin", "deputy"):
         return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
     try:
-        import shutil
-        # جلسة رقم هذه المرحلة وحدها — الحذف المشترك كان يقطع الرقم
-        # الآخر عن مرحلته بلا أن يطلب أحد ذلك
-        from whatsapp_service import wa_file
-        auth_path = wa_file(".wwebjs_auth")
-        if os.path.exists(auth_path):
-            shutil.rmtree(auth_path, ignore_errors=True)
-        return JSONResponse({"ok": True, "msg": "تم حذف الجلسة — يرجى تشغيل الخادم من جديد"})
+        # يُوقف خادم هذه المرحلة ثم يحذف جلستها وحدها: الحذف والخادم حيّ لا
+        # يكفي، و«تشغيل الخادم» يتخطّاه لأنه «يعمل أصلاً» فلا يظهر رمز جديد
+        from whatsapp_service import reset_wa_session
+        reset_wa_session()
+        return JSONResponse({"ok": True, "msg": "تم حذف الجلسة وإيقاف الخادم — اضغط «تشغيل الخادم» لطلب رمز QR جديد"})
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)})
 
