@@ -103,16 +103,23 @@ def _match_student(uid, enrollments, academic_map, student_map):
       ٣. رقم الطالب المباشر (توافق خلفي مع بيانات قديمة/تجريبية قصيرة).
     """
     uid = str(uid)
+    # كل فرع يُرجع الشكل نفسه: (رقم الطالب، الاسم، اسم الفصل، معرّف الفصل).
+    # المُستدعي يفكّ أربعة — فأي فرعٍ بثلاث قيم يُسقط المزامنة كلها.
     if uid in enrollments:
         e = enrollments[uid]
-        return e["student_id"], e.get("student_name", ""), \
-            e.get("class_name", "")
+        # سجلّ الربط اليدوي لا يحمل معرّف الفصل — فيُؤخَذ من كشف الطلاب
+        cid = e.get("class_id", "") or \
+            (student_map.get(str(e["student_id"])) or {}).get("class_id", "")
+        return (e["student_id"], e.get("student_name", ""),
+                e.get("class_name", ""), cid or "")
     if uid in academic_map:
         a = academic_map[uid]
-        return a["student_id"], a.get("name", ""), a.get("class_name", "")
+        return (a["student_id"], a.get("name", ""),
+                a.get("class_name", ""), a.get("class_id", "") or "")
     if uid in student_map:
         s = student_map[uid]
-        return uid, s.get("name", ""), s.get("class_name", "")
+        return (uid, s.get("name", ""),
+                s.get("class_name", ""), s.get("class_id", "") or "")
     return None
 
 
