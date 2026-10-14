@@ -166,6 +166,78 @@ def _mark_sent(audience, phone):
         print(f"[WA-LIMITS] تعذّر تسجيل الرقم: {e}")
 
 
+# ── انقطاع حقن المكتبة داخل صفحة واتساب ويب ─────────────────────────
+# الخادم يبقى «متصلاً» بالجلسة بينما `window.WWebJS` يختفي من الصفحة
+# (تحميلٌ داخلي لواتساب ويب لا تُعيد المكتبة حقنه). فكل إرسال بعدها يفشل
+# بـ«reading 'getChat'»، ومعالج الخادم لا يُعيد الاتصال إلا لأخطاء الإطار
+# المفصول، فيبقى معطّلاً حتى يُعاد تشغيل الخادم يدوياً.
+# (ثانوية الشقيق، ١٤ أكتوبر ٢٠٢٦: ٤٧٤ رسالة فشلت بعد أن قال الجهاز إنه متصل.)
+#
+# ملف الخادم `.js` لا يصله التحديث، فالعلاج هنا: إعادة تشغيل عملية الخادم
+# على منفذها عند هذا الخطأ — بحدٍّ زمني لئلا تتكرّر إعادة التشغيل.
+_INJECTION_SIGNS = ("getchat", "wwebjs")
+_WA_RESTART_COOLDOWN_S = 600    # لا إعادة تشغيل أكثر من مرة كل ١٠ دقائق
+_WA_RESTART_SETTLE_S = 180      # مدة تُعرض فيها الرسالة «يُعاد تشغيله»
+_wa_restart_state = {"at": 0.0, "running": False}
+_wa_restart_lock = threading.Lock()
+
+
+def is_injection_failure(detail) -> bool:
+    """هل الخطأ هو انقطاع الحقن؟ لا أي عطل إرسال آخر."""
+    d = str(detail or "").lower()
+    return any(s in d for s in _INJECTION_SIGNS)
+
+
+def wa_restarting() -> bool:
+    """هل يُعاد تشغيل خادم الواتساب الآن أو قبل قليل؟"""
+    with _wa_restart_lock:
+        if _wa_restart_state["running"]:
+            return True
+        return (time.time() - _wa_restart_state["at"]) < _WA_RESTART_SETTLE_S
+
+
+def _restart_allowed(now=None) -> bool:
+    now = time.time() if now is None else now
+    with _wa_restart_lock:
+        if _wa_restart_state["running"]:
+            return False
+        if now - _wa_restart_state["at"] < _WA_RESTART_COOLDOWN_S:
+            return False
+        _wa_restart_state["running"] = True
+        _wa_restart_state["at"] = now
+        return True
+
+
+def _do_restart(port):
+    try:
+        print("[WA-RECOVER] الحقن تعطّل على المنفذ %s — إعادة تشغيل الخادم" % port)
+        print("[WA-RECOVER] " + str(_kill_stale_wa_server(port)))
+        start_whatsapp_server()
+    except Exception as e:
+        print("[WA-RECOVER] تعذّرت إعادة التشغيل: %s" % e)
+    finally:
+        with _wa_restart_lock:
+            _wa_restart_state["running"] = False
+
+
+def maybe_recover_wa(port, detail) -> bool:
+    """
+    إن كان الخطأ انقطاع حقنٍ وسُمح بإعادة التشغيل: تبدأها في خيط خلفي ولا
+    تنتظرها (تستغرق دقيقة تقريباً). تُرجع True إن بدأتها.
+    """
+    if not is_injection_failure(detail):
+        return False
+    if not _restart_allowed():
+        return False
+    try:
+        threading.Thread(target=_do_restart, args=(port,), daemon=True).start()
+    except Exception:
+        with _wa_restart_lock:
+            _wa_restart_state["running"] = False
+        return False
+    return True
+
+
 def send_whatsapp_message(phone: str, message_body: str, student_data: dict = None, humanize: bool = False) -> (bool, str):
     if humanize:
         message_body = humanize_message(message_body)
@@ -234,7 +306,12 @@ def send_whatsapp_message(phone: str, message_body: str, student_data: dict = No
                 _refund(_port, _consumed, _aud, cleaned_phone)
                 return False, f"فشل: {error_msg}"
         elif response.status_code == 503:
-            error_msg = "الواتساب غير متصل — امسح QR Code أولاً"
+            # أثناء إعادة التشغيل الجاري «غير متصل» كاذبة، وتدفع إلى مسح QR
+            # لا داعي له — فتُقال الحقيقة: الخادم يعود بعد دقيقة.
+            if wa_restarting():
+                error_msg = "خادم الواتساب يُعاد تشغيله — أعد الإرسال بعد دقيقتين"
+            else:
+                error_msg = "الواتساب غير متصل — امسح QR Code أولاً"
             print(f"[WHATSAPP] ❌ {error_msg}")
             _refund(_port, _consumed, _aud, cleaned_phone)
             return False, error_msg
@@ -249,6 +326,9 @@ def send_whatsapp_message(phone: str, message_body: str, student_data: dict = No
             # ٤٠٠ حمولة ناقصة · ٤٠٤ الرقم ليس على واتساب · ٥٠٠ فشل الإرسال
             # في الخادم — في كلٍّ منها لم يخرج شيء، فتُردّ الخانة.
             _refund(_port, _consumed, _aud, cleaned_phone)
+            if maybe_recover_wa(_port, err_detail):
+                error_msg = ("الواتساب متصل لكن جلسته الداخلية تعطّلت — أُعيد "
+                             "تشغيل الخادم تلقائياً، أعد الإرسال بعد دقيقتين")
             return False, error_msg
 
     except requests.exceptions.ConnectionError:
@@ -312,6 +392,9 @@ def send_whatsapp_pdf(phone: str, pdf_bytes: bytes, filename: str, caption: str 
             _refund(_port, _consumed, _aud, cleaned_phone)
             return False, rd.get("message", response.text)
         _refund(_port, _consumed, _aud, cleaned_phone)
+        if maybe_recover_wa(_port, response.text):
+            return False, ("الواتساب متصل لكن جلسته الداخلية تعطّلت — أُعيد "
+                           "تشغيل الخادم تلقائياً، أعد الإرسال بعد دقيقتين")
         return False, f"HTTP {response.status_code}: {response.text}"
     except requests.exceptions.ConnectionError:
         _refund(_port, _consumed, _aud, cleaned_phone)
