@@ -3519,6 +3519,15 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
       <button class="btn bp2" id="cc-reset" onclick="ccReset()" style="display:none">↺ البدء من جديد</button>
     </div>
     <div id="cc-msg" style="margin-top:10px;display:none"></div>
+    <div class="st" style="margin-top:18px">تجربة على رقمك قبل أولياء الأمور</div>
+    <div class="ab ai" style="font-size:12.5px">تصل رقمك أنت الرسالة نفسها بأسماء طلاب حقيقيين، عبر خادم الواتساب نفسه وبالفواصل الزمنية نفسها. لا تُحتسب في الحملة، ولا تظهر في تقرير الرسائل، ولا تنتظر ساعات الإرسال.</div>
+    <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-top:8px">
+      <div class="fg"><label class="fl">رقم جوالك</label><input type="tel" id="cc-test-phone" placeholder="05xxxxxxxx" dir="ltr" style="min-width:170px"></div>
+      <div class="fg"><label class="fl">عدد الرسائل</label><select id="cc-test-count"><option value="1">رسالة واحدة</option><option value="3">3 رسائل — تجربة كاملة</option></select></div>
+      <button class="btn bp1" id="cc-test-btn" onclick="ccTest()">🧪 إرسال التجربة</button>
+      <button class="btn bp2" id="cc-test-stop" onclick="ccTestStop()" style="display:none">إلغاء التجربة</button>
+    </div>
+    <div id="cc-test-out" style="margin-top:10px"></div>
     <div style="margin-top:16px;font-size:12.5px;color:var(--mu);line-height:2">
       • رسالة واحدة لكل رقم؛ وليّ أمر أكثر من طالب تصله رسالة واحدة بأسمائهم.<br>
       • يجري الإرسال في الخلفية ولا يلزم إبقاء الصفحة مفتوحة، ويكمل في اليوم التالي تلقائياً.<br>
@@ -5479,8 +5488,24 @@ async function ccLoad(){
     fh+='</tbody></table></div>';
   }
   document.getElementById('cc-failed').innerHTML=fh;
+  var T=d.test||{}, tr=(T.status==='running'), to='';
+  if(T.rows&&T.rows.length){
+    var tl=tr?'⏳ التجربة جارية':(T.status==='done'?'✅ انتهت التجربة':'⏸ أُلغيت التجربة');
+    to='<b>'+tl+'</b> — إلى الرقم المنتهي بـ '+_ccEsc(T.phone_tail);
+    if(tr&&T.reason)to+='<div style="color:var(--mu);font-size:12.5px;margin-top:4px">'+_ccEsc(T.reason)+'</div>';
+    to+='<div class="tw" style="margin-top:6px"><table><thead><tr><th>الرسالة باسم</th><th>النتيجة</th></tr></thead><tbody>';
+    T.rows.forEach(function(x){
+      var res=x.st==='sent'?'✅ أُرسلت':((x.st==='failed'||x.st==='unsure')?'❌ '+_ccEsc(x.why):'⏳ بانتظار دورها');
+      to+='<tr><td>'+_ccEsc(x.names)+'</td><td>'+res+'</td></tr>';
+    });
+    to+='</tbody></table></div>';
+    if(T.status==='done')to+='<div class="ab as" style="margin-top:8px;font-size:12.5px">افتح الواتساب في جوالك وراجع نص الرسالة، ثم ردّ عليها بكلمة «تم» وتأكد أنه لا يصلك ردّ آلي من البوت.</div>';
+  }
+  document.getElementById('cc-test-out').innerHTML=to;
+  document.getElementById('cc-test-btn').style.display=tr?'none':'';
+  document.getElementById('cc-test-stop').style.display=tr?'':'none';
   var tab=document.getElementById('tab-contact_confirm');
-  if(tab&&tab.classList.contains('active'))_ccTimer=setTimeout(ccLoad,running?15000:60000);
+  if(tab&&tab.classList.contains('active'))_ccTimer=setTimeout(ccLoad,tr?4000:(running?15000:60000));
 }
 async function _ccPost(path){
   try{
@@ -5499,6 +5524,24 @@ function ccReset(){
   if(!confirm('سيُعاد الإرسال لكل أولياء الأمور من البداية، حتى من وصلتهم الرسالة. هل أنت متأكد؟'))return;
   _ccPost('reset');
 }
+function ccTest(){
+  var ph=(document.getElementById('cc-test-phone').value||'').trim();
+  if(!ph){ss('cc-msg','اكتب رقم جوالك أولاً','er');return;}
+  var n=document.getElementById('cc-test-count').value;
+  if(!confirm('ستُرسل '+n+' رسالة تجربة إلى الرقم '+ph+' الآن. متابعة؟'))return;
+  _ccTestStart(ph,parseInt(n,10));
+}
+async function _ccTestStart(ph,n){
+  try{
+    var r=await fetch('/web/api/contact-confirm/test',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:ph,count:n})});
+    var d=await r.json();
+    if(!d.ok)ss('cc-msg',d.msg||'تعذّرت التجربة','er');
+    else document.getElementById('cc-msg').style.display='none';
+  }catch(e){ss('cc-msg','تعذّر الاتصال بالخادم','er');}
+  ccLoad();
+}
+function ccTestStop(){_ccPost('test/stop');}
 
 /* ── DASHBOARD ── */
 /* تسمية مصادر رسائل الواتساب. المفاتيح **لاتينية** لأنها تصل من JSON
@@ -13485,6 +13528,8 @@ def contact_confirm_start(request: Request):
         import contact_confirm
         by = user.get("name") or user.get("username") or ""
         return JSONResponse({"ok": True, **contact_confirm.start(by)})
+    except ValueError as e:                 # تجربةٌ تعمل الآن
+        return JSONResponse({"ok": False, "msg": str(e)})
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 
@@ -13510,6 +13555,41 @@ def contact_confirm_reset(request: Request):
         import contact_confirm
         ok, msg = contact_confirm.reset()
         return JSONResponse({"ok": ok, "msg": msg, **contact_confirm.summary()})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+@router.post("/web/api/contact-confirm/test")
+async def contact_confirm_test(request: Request):
+    """تجربة حقيقية إلى رقم المدير وحده قبل الإرسال لأولياء الأمور."""
+    user = _cc_allowed(request)
+    if not user:
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        import contact_confirm
+        from starlette.concurrency import run_in_threadpool
+        by = user.get("name") or user.get("username") or ""
+        res = await run_in_threadpool(contact_confirm.start_test,
+                                      str(body.get("phone") or ""),
+                                      body.get("count") or 1, by)
+        return JSONResponse({"ok": True, **res})
+    except ValueError as e:                 # رقم غير صالح أو حملة تعمل
+        return JSONResponse({"ok": False, "msg": str(e)})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+@router.post("/web/api/contact-confirm/test/stop")
+def contact_confirm_test_stop(request: Request):
+    if not _cc_allowed(request):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        import contact_confirm
+        return JSONResponse({"ok": True, **contact_confirm.stop(contact_confirm.TEST)})
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 

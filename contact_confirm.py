@@ -17,6 +17,11 @@ contact_confirm.py — رسالة «تأكيد رقم ولي الأمر» لكل
     ردّه «نعم» أو «تمام» كان سيُحتسب موافقةً على خروج الطالب.
   • لا تراسل أولياء أمور المستثنَين والمنقولين، كبقية رسائل النظام.
 
+وضع التجربة (TEST): الرسالة نفسها بأسماء طلاب حقيقيين إلى رقم المدير وحده،
+عبر الخيط نفسه والإرسال نفسه والفواصل نفسها — لتُجرَّب الحملة حقيقةً قبل أن
+تصل وليّ أمر واحد. لا تنتظر ساعات الإرسال، ولا تُسجَّل في تقرير الرسائل،
+وحالتها في ملف مستقل فلا تمسّ تقدّم الحملة.
+
 ما لا تفعله: لا تقرأ ردود أولياء الأمور. الردود تصل جوال المدرسة، وقراءتها
 آلياً تحتاج تعديل server.js الذي لا يصله التحديث.
 
@@ -30,7 +35,9 @@ import threading
 from constants import DATA_DIR
 
 STATE_FILE = os.path.join(DATA_DIR, "contact_confirm.json")
+TEST_STATE_FILE = os.path.join(DATA_DIR, "contact_confirm_test.json")
 SOURCE = "contact_confirm"
+LIVE, TEST = "live", "test"
 
 SEND_HOURS = (7, 20)        # لا رسائل لأولياء الأمور ليلاً
 NEW_FROM_HOUR = 10          # الأرقام الجديدة بعد مرور رسائل الغياب الصباحية
@@ -39,14 +46,16 @@ RESERVE_SHARE = 0.3         # من رصيد الأرقام الجديدة الي
 RESERVE_MIN = 10
 PENDING_DEFER_MIN = 120     # رقمٌ عليه طلب معلّق يُعاد فحصه بعد ساعتين
 RETRY_DEFER_MIN = 30        # فشل عابر في الخادم يُعاد بعد نصف ساعة
+TEST_RETRY_MIN = 1          # في التجربة: المدير ينتظر أمام الشاشة
+TEST_MAX = 3                # أقصى رسائل التجربة إلى رقم المدير
 MAX_TRIES = 3
 SERVER_WAIT_S = 120
 MAX_WAIT_S = 300            # أطول نوم متصل — ليُلاحَظ الإيقاف وتغيّر الحال
 RESUME_DELAY_S = 90         # بعد إقلاع الخادم تُستأنف الحملة الجارية
 
 _lock = threading.RLock()
-_thread = None
-_wake = threading.Event()
+_threads = {}
+_wakes = {LIVE: threading.Event(), TEST: threading.Event()}
 
 
 # ── الوقت ────────────────────────────────────────────────────────────
@@ -79,14 +88,18 @@ def _next_window_start(now):
 
 
 # ── الحالة ───────────────────────────────────────────────────────────
+def _path(mode):
+    return TEST_STATE_FILE if mode == TEST else STATE_FILE
+
+
 def _blank():
     return {"status": "idle", "items": {}, "defer": {}, "tries": {}}
 
 
-def _load_state():
+def _load_state(mode=LIVE):
     with _lock:
         try:
-            with open(STATE_FILE, encoding="utf-8") as f:
+            with open(_path(mode), encoding="utf-8") as f:
                 d = json.load(f)
         except FileNotFoundError:
             return _blank()
@@ -107,14 +120,15 @@ def _load_state():
         return d
 
 
-def _save_state(st):
+def _save_state(st, mode=LIVE):
     with _lock:
         st["updated_at"] = _iso(_now())
-        os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
-        tmp = STATE_FILE + ".tmp"
+        path = _path(mode)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(st, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, STATE_FILE)
+        os.replace(tmp, path)
 
 
 def _wait(st, until, reason, now):
@@ -212,6 +226,18 @@ def reserve_for(new_limit) -> int:
     return max(RESERVE_MIN, int(round((new_limit or 0) * RESERVE_SHARE)))
 
 
+def _pick_test(recips, count):
+    """
+    مستقبِلو التجربة: وليّ أمرٍ لأكثر من طالب أولاً — ليرى المدير الرسالة
+    الجامعة كما ستصل — ثم من أول الكشف.
+    """
+    multi = [r for r in recips if len(r["students"]) > 1][:1]
+    rest = [r for r in recips if r not in multi]
+    picks = (multi + rest)[:count]
+    return picks or [{"students": [{"id": "", "name": "اسم الطالب",
+                                    "class_id": "", "class_name": ""}]}]
+
+
 # ── خادم الواتساب ────────────────────────────────────────────────────
 def _port():
     try:
@@ -272,6 +298,12 @@ def _log(rec, ok, detail):
         print("[CONTACT-CONFIRM] تعذّر تسجيل الرسالة: %s" % e)
 
 
+# ما يجزم فيه الخادم بأن الرسالة لم تخرج — وهو نفسه ما تُردّ عليه خانة السقف
+# في wa_limits (٤٠٠/٥٠٠/٥٠٣ وتعذّر الاتصال وردّ «فشل»). هذا وحده يُعاد.
+_NOT_SENT = ("غير متصل", "يُعاد تشغيله", "فشل الاتصال بخادم", "تعطّلت",
+             "HTTP 500", "HTTP 400", "فشل:")
+
+
 def _classify(msg):
     m = str(msg or "")
     if "غير مسجّل" in m or "غير مسجل" in m:
@@ -283,32 +315,42 @@ def _classify(msg):
     if "مهلة" in m:
         # لا إعادة: قد تكون وصلت، ورسالتان لوليّ الأمر نفسه إزعاج
         return "unsure", "انتهت المهلة — قد تكون الرسالة وصلت"
-    return "retry", m
+    if "غير متوقع" in m:
+        return "unsure", "خطأ غير متوقع أثناء الإرسال — قد تكون الرسالة وصلت فلم تُكرَّر"
+    if any(k in m for k in _NOT_SENT):
+        return "retry", m
+    # ما لا نعرفه لا يُعاد: رسالةٌ ناقصة أهون من رسالة مكرّرة لوليّ الأمر
+    return "failed", m
 
 
 # ── خطوة الإرسال ─────────────────────────────────────────────────────
-def _step(st, now=None):
+def _step(st, now=None, mode=LIVE):
     """
     خطوة واحدة: ترسل رسالة واحدة أو تقرّر الانتظار.
     تُعدّل `st` ولا تحفظه، وتُرجع الثواني قبل الخطوة التالية.
+
+    في التجربة: المستقبِلون مثبَّتون في الحالة (رقم المدير)، ولا ساعات إرسال
+    ولا حصة للغياب (رقمٌ واحد)، ولا سجلّ رسائل، وما يُؤجَّل في الحملة
+    يُبلَّغ في التجربة نتيجةً فوراً — المدير ينتظر أمام الشاشة.
     """
     import wa_limits
+    test = mode == TEST
     now = now or _now()
     until = _parse(st.get("wait_until"))
     if until and now < until:
         return max(1.0, min(float(MAX_WAIT_S), (until - now).total_seconds()))
     st["wait_until"] = ""
 
-    if not (SEND_HOURS[0] <= now.hour < SEND_HOURS[1]):
+    if not test and not (SEND_HOURS[0] <= now.hour < SEND_HOURS[1]):
         return _wait(st, _next_window_start(now),
                      "خارج ساعات الإرسال — تُكمل الحملة صباحاً", now)
 
-    recips, _ = build_recipients()
+    recips = (st.get("recips") or []) if test else build_recipients()[0]
     items, defer, tries = st["items"], st["defer"], st["tries"]
     todo = [r for r in recips if r["fp"] not in items]
     if not todo:
         st["status"] = "done"
-        st["reason"] = "اكتملت الحملة"
+        st["reason"] = "اكتملت التجربة" if test else "اكتملت الحملة"
         st["finished_at"] = _iso(now)
         return 0
 
@@ -327,13 +369,16 @@ def _step(st, now=None):
         st["reason"] = "خادم الواتساب غير متصل — تُكمل الحملة حين يعود"
         return SERVER_WAIT_S
 
-    # المعروفون أولاً: لا يستهلكون من رصيد الأرقام الجديدة شيئاً
-    known = {r["fp"]: wa_limits.is_known(r["phone"]) for r in ready}
-    ready.sort(key=lambda r: 0 if known[r["fp"]] else 1)
-    r = ready[0]
+    if test:
+        r = ready[0]
+    else:
+        # المعروفون أولاً: لا يستهلكون من رصيد الأرقام الجديدة شيئاً
+        known = {x["fp"]: wa_limits.is_known(x["phone"]) for x in ready}
+        ready.sort(key=lambda x: 0 if known[x["fp"]] else 1)
+        r = ready[0]
     fp = r["fp"]
 
-    if not known[fp]:
+    if not test and not known[fp]:
         if now.hour < NEW_FROM_HOUR:
             at = now.replace(hour=NEW_FROM_HOUR, minute=0, second=0, microsecond=0)
             return _wait(st, at, "الأرقام الجديدة تُراسَل بعد الساعة %d صباحاً "
@@ -349,95 +394,114 @@ def _step(st, now=None):
         st["reason"] = "تعذّر فحص الطلبات المعلّقة في بوت الواتساب — يُعاد بعد قليل"
         return SERVER_WAIT_S
     if r["phone"][-9:] in pend:
+        if test:
+            items[fp] = {"st": "failed", "at": _iso(now),
+                         "why": "على رقمك طلب استئذان أو عذر مفتوح في بوت الواتساب — "
+                                "في الحملة يُؤجَّل مثل هذا الرقم حتى يُغلق طلبه"}
+            return 1
         defer[fp] = _iso(now + datetime.timedelta(minutes=PENDING_DEFER_MIN))
         return 1
 
-    ok, msg = _send(r["phone"], render_message(r))
+    text = render_message(r)
+    try:
+        ok, msg = _send(r["phone"], text)
+    except Exception as e:
+        # استثناءٌ بعد خروج الطلب لا يعني أن الرسالة لم تصل، وإعادتها تكرارٌ
+        # لوليّ الأمر نفسه. حدث في التجربة الحقيقية: وصلت الرسالة ثم انهار
+        # طبعُ «✅» بترميزٍ لا يحملها، فأُرسلت الرسالة نفسها مرتين.
+        ok, msg = False, "خطأ غير متوقع أثناء الإرسال: %s" % e
     if ok:
         items[fp] = {"st": "sent", "at": _iso(now)}
         defer.pop(fp, None)
         tries.pop(fp, None)
         st["reason"] = ""
-        _log(r, True, msg)
+        if not test:
+            _log(r, True, msg)
         return wa_limits.next_delay(port)
 
     kind, why = _classify(msg)
     if kind == "cap":
-        return _wait(st, _next_morning(now), why, now)
+        if not test:
+            return _wait(st, _next_morning(now), why, now)
+        kind = "failed"
     if kind == "retry":
         n = int(tries.get(fp, 0)) + 1
         tries[fp] = n
         if n < MAX_TRIES:
-            defer[fp] = _iso(now + datetime.timedelta(minutes=RETRY_DEFER_MIN))
+            mins = TEST_RETRY_MIN if test else RETRY_DEFER_MIN
+            defer[fp] = _iso(now + datetime.timedelta(minutes=mins))
             st["reason"] = why
-            return SERVER_WAIT_S
+            return 60.0 if test else SERVER_WAIT_S
         kind, why = "failed", "تعذّر بعد %d محاولات: %s" % (n, why)
     items[fp] = {"st": kind, "at": _iso(now), "why": why}
     defer.pop(fp, None)
     tries.pop(fp, None)
-    _log(r, False, why)
+    if not test:
+        _log(r, False, why)
     return wa_limits.next_delay(port)
 
 
-def _commit(st) -> bool:
+def _commit(st, mode=LIVE) -> bool:
     """
     يحفظ نتيجة الخطوة. إن أُوقفت الحملة أثناءها حُفظ التقدّم وبقيت حالة
     المستخدم — وإلا محا حفظُ الخطوة إيقافَه فاستمرّت الرسائل.
     """
     with _lock:
-        cur = _load_state()
+        cur = _load_state(mode)
         if cur.get("status") != "running":
             for k in ("items", "defer", "tries"):
                 cur[k] = st.get(k) or {}
-            _save_state(cur)
+            _save_state(cur, mode)
             return False
-        _save_state(st)
+        _save_state(st, mode)
         return st.get("status") == "running"
 
 
-def _worker():
-    global _thread
+def _worker(mode):
     try:
         while True:
-            st = _load_state()
+            st = _load_state(mode)
             if st.get("status") != "running":
                 return
             try:
-                delay = _step(st)
+                delay = _step(st, mode=mode)
             except Exception as e:
                 print("[CONTACT-CONFIRM] خطأ في خطوة الإرسال: %s" % e)
                 st["reason"] = "خطأ داخلي — يُعاد بعد قليل: %s" % e
                 delay = SERVER_WAIT_S
-            if not _commit(st):
+            if not _commit(st, mode):
                 return
             if delay > 0:
-                _wake.wait(delay)
-                _wake.clear()
+                ev = _wakes[mode]
+                ev.wait(delay)
+                ev.clear()
     finally:
         with _lock:
-            if _thread is threading.current_thread():
-                _thread = None
+            if _threads.get(mode) is threading.current_thread():
+                _threads.pop(mode, None)
 
 
-def _alive():
-    t = _thread
+def _alive(mode=LIVE):
+    t = _threads.get(mode)
     return bool(t and t.is_alive())
 
 
-def _ensure_thread():
-    global _thread
+def _ensure_thread(mode=LIVE):
     with _lock:
-        if _alive():
+        if _alive(mode):
             return
-        _wake.clear()
-        _thread = threading.Thread(target=_worker, name="contact-confirm",
-                                   daemon=True)
-        _thread.start()
+        _wakes[mode].clear()
+        t = threading.Thread(target=_worker, args=(mode,),
+                             name="contact-confirm-" + mode, daemon=True)
+        _threads[mode] = t
+        t.start()
 
 
 # ── الواجهة ──────────────────────────────────────────────────────────
 def start(by="") -> dict:
     with _lock:
+        if _load_state(TEST).get("status") == "running":
+            raise ValueError("تجربة على رقمك تعمل الآن — انتظر انتهاءها ثم ابدأ الحملة")
         st = _load_state()
         if st.get("status") != "running":
             if not st.get("started_at"):
@@ -447,27 +511,55 @@ def start(by="") -> dict:
             st["wait_until"] = ""
             st["reason"] = ""
             _save_state(st)
-    _ensure_thread()
-    _wake.set()
+    _ensure_thread(LIVE)
+    _wakes[LIVE].set()
     return summary()
 
 
-def stop() -> dict:
+def start_test(phone, count=1, by="") -> dict:
+    """تجربة حقيقية إلى رقم المدير وحده — لا يمسّ تقدّم الحملة شيئاً."""
+    import wa_limits
+    ph = wa_limits._norm(phone)
+    if not (len(ph) == 12 and ph.startswith("966")):
+        raise ValueError("رقم الجوال غير صالح — اكتبه هكذا: 05xxxxxxxx")
+    try:
+        count = max(1, min(TEST_MAX, int(count)))
+    except (TypeError, ValueError):
+        count = 1
     with _lock:
-        st = _load_state()
+        if _load_state(LIVE).get("status") == "running":
+            raise ValueError("الحملة تعمل الآن — أوقفها قبل التجربة")
+        if _load_state(TEST).get("status") == "running":
+            raise ValueError("تجربة أخرى تعمل الآن — انتظر انتهاءها")
+        recips, _ = build_recipients()
+        st = _blank()
+        st.update({
+            "status": "running", "started_at": _iso(_now()), "started_by": by,
+            "phone_tail": ph[-4:],
+            "recips": [{"phone": ph, "fp": "test-%d" % i, "students": r["students"]}
+                       for i, r in enumerate(_pick_test(recips, count))]})
+        _save_state(st, TEST)
+    _ensure_thread(TEST)
+    _wakes[TEST].set()
+    return summary()
+
+
+def stop(mode=LIVE) -> dict:
+    with _lock:
+        st = _load_state(mode)
         if st.get("status") == "running":
             st["status"] = "stopped"
             st["wait_until"] = ""
-            st["reason"] = "أُوقفت يدوياً"
-            _save_state(st)
-    _wake.set()
+            st["reason"] = "أُلغيت التجربة" if mode == TEST else "أُوقفت يدوياً"
+            _save_state(st, mode)
+    _wakes[mode].set()
     return summary()
 
 
 def reset():
     """يمحو التقدّم — الإرسال التالي يبدأ من أول رقم، حتى لمن وصلته الرسالة."""
     with _lock:
-        if _load_state().get("status") == "running" or _alive():
+        if _load_state().get("status") == "running" or _alive(LIVE):
             return False, "أوقف الحملة أولاً"
         try:
             os.remove(STATE_FILE)
@@ -478,11 +570,12 @@ def reset():
 
 def resume_if_active():
     """بعد إعادة تشغيل البرنامج تُستأنف الحملة الجارية من حيث وقفت."""
-    try:
-        if _load_state().get("status") == "running":
-            _ensure_thread()
-    except Exception as e:
-        print("[CONTACT-CONFIRM] تعذّر الاستئناف: %s" % e)
+    for mode in (LIVE, TEST):
+        try:
+            if _load_state(mode).get("status") == "running":
+                _ensure_thread(mode)
+        except Exception as e:
+            print("[CONTACT-CONFIRM] تعذّر الاستئناف: %s" % e)
 
 
 def schedule_resume(delay=RESUME_DELAY_S):
@@ -491,10 +584,29 @@ def schedule_resume(delay=RESUME_DELAY_S):
     t.start()
 
 
+def _test_summary() -> dict:
+    """نتيجة آخر تجربة — بآخر أربعة أرقام من رقم المدير لا بالرقم كله."""
+    st = _load_state(TEST)
+    if st.get("status") == "running" and not _alive(TEST):
+        _ensure_thread(TEST)
+    rows = []
+    for r in st.get("recips") or []:
+        it = st["items"].get(r.get("fp")) or {}
+        rows.append({
+            "names": "، ".join(s.get("name", "") for s in r.get("students") or []
+                              if s.get("name")),
+            "st": it.get("st", "pending"), "why": it.get("why", ""),
+            "at": it.get("at", "")})
+    return {"status": st.get("status", "idle"),
+            "phone_tail": st.get("phone_tail", ""),
+            "reason": st.get("reason", "") or "",
+            "started_at": st.get("started_at", "") or "", "rows": rows}
+
+
 def summary() -> dict:
     st = _load_state()
-    if st.get("status") == "running" and not _alive():
-        _ensure_thread()                 # بعد إعادة تشغيلٍ لم يحن فيها الاستئناف
+    if st.get("status") == "running" and not _alive(LIVE):
+        _ensure_thread(LIVE)             # بعد إعادة تشغيلٍ لم يحن فيها الاستئناف
     now = _now()
     try:
         recips, skipped = build_recipients()
@@ -547,7 +659,7 @@ def summary() -> dict:
     if not (w and now < w):
         wait_until = ""
     return {
-        "status": st.get("status", "idle"), "alive": _alive(),
+        "status": st.get("status", "idle"), "alive": _alive(LIVE),
         "wait_until": wait_until, "reason": st.get("reason", "") or "",
         "started_at": st.get("started_at", "") or "",
         "started_by": st.get("started_by", "") or "",
@@ -562,4 +674,5 @@ def summary() -> dict:
         "hours": {"from": SEND_HOURS[0], "to": SEND_HOURS[1],
                   "new_from": NEW_FROM_HOUR},
         "preview": preview,
+        "test": _test_summary(),
     }
