@@ -139,6 +139,7 @@ _SRC_BY_MODULE = {
     "links_tab":         "class_links",
     "users_tab":         "credentials",
     "poller":            "biometric",
+    "contact_confirm":   "contact_confirm",
 }
 _SRC_BY_FUNC = {
     "safe_send_absence_alert":     "absence",

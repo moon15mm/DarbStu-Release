@@ -2532,6 +2532,7 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
             ("إرسال رسائل الغياب",  "send_absence",         "fas fa-envelope-open-text"),
             ("إرسال رسائل التأخر",  "send_tardiness",       "fas fa-paper-plane"),
             ("روابط بوابة أولياء الأمور", "portal_links",  "fas fa-user-shield"),
+            ("تأكيد أرقام أولياء الأمور", "contact_confirm", "fas fa-address-book"),
             ("التعاميم والنشرات",   "circulars",            "fas fa-scroll"),
             ("قصص المدرسة",         "school_stories",       "fas fa-camera-retro"),
             ("تعزيز الحضور الأسبوعي", "weekly_reward",      "fas fa-medal"),
@@ -3501,6 +3502,35 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
   </div>
 </div>
 
+<div id="tab-contact_confirm">
+  <h2 class="pt"><i class="fas fa-address-book"></i> تأكيد أرقام أولياء الأمور</h2>
+  <div class="section">
+    <div class="ab ai">📌 تصل كل وليّ أمر رسالة واحدة من رقم المدرسة تطلب منه الرد بكلمة «تم» وحفظ الرقم في جهات الاتصال. حفظ أولياء الأمور للرقم هو أقوى حماية له من تجميد الواتساب.</div>
+    <div class="st">نص الرسالة</div>
+    <div id="cc-preview" style="white-space:pre-wrap;background:#F8FAFC;border:1px solid #E2E8F0;border-radius:10px;padding:14px;font-size:13.5px;line-height:1.9;margin-bottom:16px"></div>
+    <div class="st">حالة الإرسال</div>
+    <div id="cc-state" style="margin-bottom:12px"></div>
+    <div id="cc-stats" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:14px"></div>
+    <div id="cc-cap" style="font-size:12.5px;color:var(--mu);margin-bottom:12px;line-height:1.9"></div>
+    <div class="bg-btn">
+      <button class="btn bp1" id="cc-start" onclick="ccStart()">📤 بدء الإرسال</button>
+      <button class="btn bp2" id="cc-stop" onclick="ccStop()" style="display:none">⏸ إيقاف الإرسال</button>
+      <button class="btn bp2" onclick="ccLoad()">🔄 تحديث</button>
+      <button class="btn bp2" id="cc-reset" onclick="ccReset()" style="display:none">↺ البدء من جديد</button>
+    </div>
+    <div id="cc-msg" style="margin-top:10px;display:none"></div>
+    <div style="margin-top:16px;font-size:12.5px;color:var(--mu);line-height:2">
+      • رسالة واحدة لكل رقم؛ وليّ أمر أكثر من طالب تصله رسالة واحدة بأسمائهم.<br>
+      • يجري الإرسال في الخلفية ولا يلزم إبقاء الصفحة مفتوحة، ويكمل في اليوم التالي تلقائياً.<br>
+      • يلتزم بسقف الواتساب اليومي ويترك جزءاً منه لرسائل الغياب، فقد تستغرق الحملة عدة أيام.<br>
+      • من عليه طلب استئذان أو عذر لم يُغلق يُؤجَّل حتى يُغلق طلبه، حتى لا يُحتسب ردّه موافقة.<br>
+      • المستثنَون والمنقولون لا تصلهم الرسالة.<br>
+      • ردود أولياء الأمور تصل جوال المدرسة مباشرة، ولا يسجّلها النظام.
+    </div>
+    <div id="cc-failed" style="margin-top:14px"></div>
+  </div>
+</div>
+
 <div id="tab-circulars">
   <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap">
     <h2 class="pt" style="margin:0"><i class="fas fa-scroll"></i> التعاميم والنشرات</h2>
@@ -3747,7 +3777,7 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
       <div class="fg"><label class="fl">إلى تاريخ</label><input type="date" id="mr-to"></div>
       <div class="fg"><label class="fl">النوع</label><select id="mr-type">
         <option value="">الكل</option><option value="absence">الغياب</option>
-        <option value="tardiness">التأخر</option></select></div>
+        <option value="tardiness">التأخر</option><option value="contact_confirm">تأكيد الرقم</option></select></div>
       <div class="fg"><label class="fl">الحالة</label><select id="mr-status">
         <option value="">الكل</option><option value="success">ناجحة</option>
         <option value="failed">فاشلة</option></select></div>
@@ -5261,6 +5291,7 @@ function showTab(key){
     'send_absence':function(){},
     'send_tardiness':function(){},
     'parent_visits':pvInit,
+    'contact_confirm':ccLoad,
   };
   if(L[key])L[key]();
   if(window.innerWidth<=768)closeSidebar();
@@ -5394,6 +5425,81 @@ async function markCircRead(id){
 function ss(id,msg,type){var el=document.getElementById(id);if(!el)return;
   el.className='sm s'+(type||'in');el.textContent=msg;el.style.display='block';}
 
+/* ── تأكيد أرقام أولياء الأمور ── */
+var _ccTimer=null;
+function _ccEsc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function _ccTime(s){
+  if(!s)return '';
+  var d=new Date(s); if(isNaN(d.getTime()))return s;
+  var days=['الأحد','الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة','السبت'];
+  var same=(new Date()).toDateString()===d.toDateString();
+  return (same?'اليوم':days[d.getDay()])+' الساعة '+d.getHours()+':'+('0'+d.getMinutes()).slice(-2);
+}
+function _ccCard(label,val,color){
+  return '<div style="background:#fff;border:1px solid #E2E8F0;border-radius:10px;padding:10px 12px">'+
+    '<div style="font-size:12px;color:var(--mu)">'+label+'</div>'+
+    '<div style="font-size:20px;font-weight:700;color:'+(color||'inherit')+'">'+(val==null?0:val)+'</div></div>';
+}
+async function ccLoad(){
+  clearTimeout(_ccTimer);
+  var d=null;
+  try{ var r=await fetch('/web/api/contact-confirm/status'); d=await r.json(); }
+  catch(e){ ss('cc-msg','تعذّر الاتصال بالخادم','er'); return; }
+  if(!d||!d.ok){ ss('cc-msg',(d&&d.msg)||'تعذّر تحميل الحالة','er'); return; }
+  document.getElementById('cc-preview').textContent=d.preview||'';
+  var st=d.status, running=(st==='running'), waiting=(running&&d.wait_until);
+  var label=running?(waiting?'⏳ متوقّفة مؤقتاً حتى '+_ccTime(d.wait_until):'📤 جارٍ الإرسال')
+           :st==='done'?'✅ اكتمل الإرسال':st==='stopped'?'⏸ موقوفة':'لم يبدأ الإرسال بعد';
+  var h='<b>'+label+'</b>';
+  if(d.reason)h+='<div style="color:var(--mu);font-size:12.5px;margin-top:4px">'+_ccEsc(d.reason)+'</div>';
+  if(running&&!d.server_ready&&(d.reason||'').indexOf('خادم الواتساب')<0)
+    h+='<div class="ab aw" style="margin-top:8px">خادم الواتساب غير متصل الآن — تنتظر الحملة حتى يعود.</div>';
+  document.getElementById('cc-state').innerHTML=h;
+  var sk=d.skipped||{}, bad=(sk.no_phone||0)+(sk.invalid||0), fail=(d.failed||0)+(d.unsure||0);
+  document.getElementById('cc-stats').innerHTML=
+    _ccCard('أرقام أولياء الأمور',d.total)+
+    _ccCard('وصلتهم الرسالة',d.sent,'#059669')+
+    _ccCard('المتبقي',d.remaining)+
+    (d.deferred?_ccCard('مؤجَّلة لطلب معلّق',d.deferred,'#B45309'):'')+
+    (fail?_ccCard('تعذّر الإرسال',fail,'#DC2626'):'')+
+    (bad?_ccCard('طلاب بلا رقم صالح',bad,'#64748B'):'');
+  var c=d.capacity||{}, hr=d.hours||{}, t='';
+  if(c.new_limit!=null)t='رصيد الأرقام الجديدة اليوم: '+c.new_remaining+' من '+c.new_limit+'، ويبقى منه '+c.reserve+' لرسائل الغياب.';
+  if(hr.from!=null)t+=(t?'<br>':'')+'ساعات الإرسال من '+hr.from+':00 إلى '+hr.to+':00، والأرقام التي لم تُراسَل من قبل بعد '+hr.new_from+':00.';
+  document.getElementById('cc-cap').innerHTML=t;
+  var bs=document.getElementById('cc-start');
+  bs.style.display=running?'none':'';
+  bs.textContent=st==='stopped'?'▶ متابعة الإرسال':(st==='done'?'📤 إرسال للأرقام الجديدة':'📤 بدء الإرسال');
+  document.getElementById('cc-stop').style.display=running?'':'none';
+  document.getElementById('cc-reset').style.display=(!running&&d.started_at)?'':'none';
+  var f=d.failed_list||[], fh='';
+  if(f.length){
+    fh='<div class="st">تعذّر الإرسال إلى هذه الأرقام — صحّحها في إدارة الجوالات</div><div class="tw"><table><thead><tr><th>الطالب</th><th>الفصل</th><th>السبب</th></tr></thead><tbody>';
+    f.forEach(function(x){fh+='<tr><td>'+_ccEsc(x.names)+'</td><td>'+_ccEsc(x.class)+'</td><td>'+_ccEsc(x.why)+'</td></tr>';});
+    fh+='</tbody></table></div>';
+  }
+  document.getElementById('cc-failed').innerHTML=fh;
+  var tab=document.getElementById('tab-contact_confirm');
+  if(tab&&tab.classList.contains('active'))_ccTimer=setTimeout(ccLoad,running?15000:60000);
+}
+async function _ccPost(path){
+  try{
+    var r=await fetch('/web/api/contact-confirm/'+path,{method:'POST'}); var d=await r.json();
+    if(!d.ok)ss('cc-msg',d.msg||'تعذّر تنفيذ الطلب','er');
+    else document.getElementById('cc-msg').style.display='none';
+  }catch(e){ss('cc-msg','تعذّر الاتصال بالخادم','er');}
+  ccLoad();
+}
+function ccStart(){
+  if(!confirm('ستُرسل رسالة التأكيد لأولياء الأمور على دفعات حسب سقف الواتساب اليومي، وقد يستغرق ذلك عدة أيام. هل تريد البدء؟'))return;
+  _ccPost('start');
+}
+function ccStop(){_ccPost('stop');}
+function ccReset(){
+  if(!confirm('سيُعاد الإرسال لكل أولياء الأمور من البداية، حتى من وصلتهم الرسالة. هل أنت متأكد؟'))return;
+  _ccPost('reset');
+}
+
 /* ── DASHBOARD ── */
 /* تسمية مصادر رسائل الواتساب. المفاتيح **لاتينية** لأنها تصل من JSON
    وهو لا يُؤنَّث، والقيم عربية في المصدر ليُؤنّثها الوسيط في مدارس
@@ -5409,7 +5515,8 @@ var _WA_SRC={
   certificate:'شهادات التميز', reward:'التعزيز الأسبوعي',
   circular:'التعاميم', credentials:'حسابات المستخدمين',
   teacher_form:'نماذج المعلمين', bus:'الحافلات',
-  biometric:'جهاز البصمة', test:'رسائل تجريبية', other:'مصادر أخرى'
+  biometric:'جهاز البصمة', test:'رسائل تجريبية',
+  contact_confirm:'تأكيد أرقام أولياء الأمور', other:'مصادر أخرى'
 };
 function monEsc(s){
   return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -9765,7 +9872,7 @@ async function loadMsgReport(){
          '<td style="color:'+(x.failed?'#B91C1C':'#9CA3AF')+'">'+x.failed+'</td></tr>';});
     h+='</tbody></table></div></div>';
   }
-  var TY={absence:'غياب',tardiness:'تأخر',reward:'تحفيز'};
+  var TY={absence:'غياب',tardiness:'تأخر',reward:'تحفيز',contact_confirm:'تأكيد الرقم'};
   h+='<div class="section"><h3 style="margin:0 0 8px;font-size:14px;color:#0C2E56">التفاصيل</h3>'+
      '<div class="tw"><table><thead><tr><th>التاريخ</th><th>الطالب</th><th>الفصل</th>'+
      '<th>النوع</th><th>الجوال</th><th>الحالة</th><th>السبب</th></tr></thead><tbody>';
@@ -13347,6 +13454,72 @@ async def api_send_portal_link(request: Request):
         return JSONResponse({"ok": ok, "msg": status})
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+# ─── تأكيد أرقام أولياء الأمور ───────────────────────────────────
+# حملة رسالةٍ لكل وليّ أمر تطلب الرد وحفظ رقم المدرسة — انظر
+# contact_confirm.py. الدوال متزامنة (def) عمداً: الملخّص يقرأ كشف الطلاب
+# ويسأل خادم الواتساب، فيجري في مجمّع الخيوط ولا يحجز حلقة الخادم.
+def _cc_allowed(request: Request, roles=("admin", "deputy")):
+    user = _get_current_user(request)
+    return user if user and user.get("role") in roles else None
+
+
+@router.get("/web/api/contact-confirm/status")
+def contact_confirm_status(request: Request):
+    if not _cc_allowed(request):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        import contact_confirm
+        return JSONResponse({"ok": True, **contact_confirm.summary()})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+@router.post("/web/api/contact-confirm/start")
+def contact_confirm_start(request: Request):
+    user = _cc_allowed(request)
+    if not user:
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        import contact_confirm
+        by = user.get("name") or user.get("username") or ""
+        return JSONResponse({"ok": True, **contact_confirm.start(by)})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+@router.post("/web/api/contact-confirm/stop")
+def contact_confirm_stop(request: Request):
+    if not _cc_allowed(request):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        import contact_confirm
+        return JSONResponse({"ok": True, **contact_confirm.stop()})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+@router.post("/web/api/contact-confirm/reset")
+def contact_confirm_reset(request: Request):
+    # محو التقدّم يعيد الإرسال لمن وصلتهم الرسالة — للمدير وحده
+    if not _cc_allowed(request, ("admin",)):
+        return JSONResponse({"ok": False, "msg": "البدء من جديد للمدير فقط"},
+                            status_code=403)
+    try:
+        import contact_confirm
+        ok, msg = contact_confirm.reset()
+        return JSONResponse({"ok": ok, "msg": msg, **contact_confirm.summary()})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+# حملةٌ جارية تُستأنف بعد إعادة تشغيل البرنامج، بعد مهلةٍ يستقرّ فيها الخادم
+try:
+    import contact_confirm as _cc_boot
+    _cc_boot.schedule_resume()
+except Exception as _cc_e:
+    print(f"[CONTACT-CONFIRM] تعذّر تحميل الحملة: {_cc_e}")
 
 
 # ─── PARENT PORTAL (SNAP-VIEW) ───────────────────────────────────

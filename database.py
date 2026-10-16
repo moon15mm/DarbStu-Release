@@ -650,6 +650,8 @@ def init_db():
                      ('admin', 'deputy', 'staff', 'counselor'))
     _migrate_add_tab(cur, 'روابط بوابة أولياء الأمور',
                      ('admin', 'deputy', 'staff', 'counselor'))
+    # رسالة لكل أولياء الأمور — للمدير والوكيل وحدهما
+    _migrate_add_tab(cur, 'تأكيد أرقام أولياء الأمور', ('admin', 'deputy'))
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS exempted_students (
