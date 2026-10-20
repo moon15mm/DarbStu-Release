@@ -14265,8 +14265,12 @@ async def wa_status_proxy(request: Request):
 
 
 @router.post("/web/api/wa/start", response_class=JSONResponse)
-async def wa_start_server(request: Request):
-    """تشغيل خادم واتساب — للمدير والوكيل فقط."""
+def wa_start_server(request: Request):
+    """تشغيل خادم واتساب — للمدير والوكيل فقط.
+
+    متزامنة (def) عمداً: التشغيل قد يُصلح server.js ثم يوقف الخادم القديم وينتظر
+    خروج متصفحه (حتى ٢٠ ثانية)، ولو جرى في حلقة الخادم لتجمّدت اللوحة كلها.
+    """
     user = _get_current_user(request)
     if not user or user.get("role") not in ("admin", "deputy"):
         return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
@@ -14279,8 +14283,12 @@ async def wa_start_server(request: Request):
 
 
 @router.post("/web/api/wa/reset", response_class=JSONResponse)
-async def wa_reset_session(request: Request):
-    """حذف جلسة واتساب المحفوظة لإجبار QR جديد."""
+def wa_reset_session(request: Request):
+    """حذف جلسة واتساب المحفوظة لإجبار QR جديد.
+
+    متزامنة (def) عمداً: الإيقاف ينتظر خروج المتصفح حتى ٢٠ ثانية، ولو جرى في
+    حلقة الخادم لتجمّدت اللوحة كلها طوال ذلك.
+    """
     user = _get_current_user(request)
     if not user or user.get("role") not in ("admin", "deputy"):
         return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
@@ -14290,6 +14298,25 @@ async def wa_reset_session(request: Request):
         from whatsapp_service import reset_wa_session
         reset_wa_session()
         return JSONResponse({"ok": True, "msg": "تم حذف الجلسة وإيقاف الخادم — اضغط «تشغيل الخادم» لطلب رمز QR جديد"})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)})
+
+
+@router.post("/web/api/wa/restart", response_class=JSONResponse)
+def wa_restart_server(request: Request):
+    """
+    إعادة تشغيل خادم واتساب بالجلسة نفسها — بلا مسح QR.
+
+    لما يقول الخادم «متصل» والرسائل تفشل (getChat) والمدير بعيد عن المدرسة:
+    «تشغيل الخادم» لا يفعل شيئاً لخادمٍ حيّ، و«فرض QR جديد» يحتاج جوال المدرسة.
+    """
+    user = _get_current_user(request)
+    if not user or user.get("role") not in ("admin", "deputy"):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        from whatsapp_service import request_restart
+        ok, msg = request_restart()
+        return JSONResponse({"ok": ok, "msg": msg})
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)})
 
@@ -14462,6 +14489,7 @@ async def wa_connect_page(request: Request):
   <div class="btns" id="btns">
     <button class="btn btn-primary" id="btn-start" onclick="waStart()">▶ تشغيل الخادم</button>
     <button class="btn btn-warn"    id="btn-reset" onclick="waReset()" style="display:none">🔄 فرض QR جديد</button>
+    <button class="btn btn-primary" id="btn-restart" onclick="waRestart()" style="display:none">🔁 إعادة تشغيل الخادم</button>
     <button class="btn btn-ghost"   id="btn-refresh" onclick="poll()">↻ تحديث</button>
   </div>
 
@@ -14470,7 +14498,8 @@ async def wa_connect_page(request: Request):
     ١- اضغط "تشغيل الخادم" إذا كان الخادم غير متصل<br>
     ٢- انتظر ظهور رمز QR (قد يستغرق دقيقة)<br>
     ٣- افتح واتساب ← الأجهزة المرتبطة ← ربط جهاز<br>
-    ٤- امسح رمز QR الظاهر أعلاه
+    ٤- امسح رمز QR الظاهر أعلاه<br>
+    ⚠️ إن قال «متصل» والرسائل تفشل: اضغط «إعادة تشغيل الخادم» — يعود بالجلسة نفسها دون مسح QR
   </div>
 
   <div class="bots" id="bots">
@@ -14555,6 +14584,7 @@ async function poll(){
   try{
     var r=await fetch('/web/api/wa/qr');
     var d=await r.json();
+    showRestart(!!d.ok);
 
     // ── الخادم لا يعمل (ok=false أو خطأ في الاتصال بـ Node.js) ──
     if(!d.ok){
@@ -14605,6 +14635,7 @@ async function poll(){
     schedulePoll(3000);
 
   }catch(e){
+    showRestart(false);
     setBadge('b-error','d-red','خطأ في الاتصال');
     showSpinner(false);
     showIcon('⚠️','');
@@ -14639,7 +14670,22 @@ async function waReset(){
   _lastQR=''; _connected=false;
   btn.disabled=false; btn.textContent='🔄 فرض QR جديد';
   document.getElementById('btn-start').style.display='';
+  showRestart(false);
   schedulePoll(1000);
+}
+
+function showRestart(v){var b=document.getElementById('btn-restart');if(b)b.style.display=v?'':'none';}
+async function waRestart(){
+  if(!confirm('سيُعاد تشغيل خادم الواتساب بالجلسة نفسها، فلا يلزم مسح QR. تتوقف الرسائل دقيقة أو دقيقتين. هل تريد المتابعة؟'))return;
+  var btn=document.getElementById('btn-restart');
+  btn.disabled=true; btn.textContent='⏳ جارٍ إعادة التشغيل...';
+  try{
+    var r=await fetch('/web/api/wa/restart',{method:'POST'});
+    var d=await r.json();
+    setMsg(d.msg||(d.ok?'جارٍ إعادة التشغيل':'تعذّرت إعادة التشغيل'));
+  }catch(e){ setMsg('خطأ: '+e.message); }
+  _lastQR=''; _connected=false;
+  setTimeout(function(){ btn.disabled=false; btn.textContent='🔁 إعادة تشغيل الخادم'; poll(); }, 6000);
 }
 
 // ── البوتات التلقائية ──

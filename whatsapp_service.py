@@ -208,16 +208,48 @@ def _restart_allowed(now=None) -> bool:
         return True
 
 
-def _do_restart(port):
+def _do_restart(port, why="الحقن تعطّل"):
     try:
-        print("[WA-RECOVER] الحقن تعطّل على المنفذ %s — إعادة تشغيل الخادم" % port)
+        print("[WA-RECOVER] %s على المنفذ %s — إعادة تشغيل الخادم" % (why, port))
         print("[WA-RECOVER] " + str(_kill_stale_wa_server(port)))
+        # الجلسة تبقى كما هي — نُعيد تشغيل الخادم لا نحذف شيئاً، فلا يلزم مسح QR
+        _wait_profile_free(port)
         start_whatsapp_server()
     except Exception as e:
         print("[WA-RECOVER] تعذّرت إعادة التشغيل: %s" % e)
     finally:
         with _wa_restart_lock:
             _wa_restart_state["running"] = False
+
+
+def request_restart(port=None):
+    """
+    إعادة تشغيل يدوية لخادم الواتساب من الواجهة — تُبقي الجلسة فلا يلزم مسح QR.
+
+    هي ما يحتاجه المدير عن بُعد حين يقول الخادم «متصل» والرسائل تفشل
+    (getChat): «تشغيل الخادم» لا يفعل شيئاً لخادمٍ حيّ، و«فرض QR جديد» يحذف
+    الجلسة فيلزم مسح الرمز من جوال المدرسة. لا تخضع لحدّ العشر دقائق — المدير
+    طلبها عمداً — لكنها لا تتداخل مع إعادةٍ جارية. تُرجع (بدأت، رسالة).
+    """
+    if port is None:
+        try:
+            port = int(get_wa_servers()[0].get("port", 3000))
+        except Exception:
+            port = 3000
+    with _wa_restart_lock:
+        if _wa_restart_state["running"]:
+            return False, "إعادة تشغيل الخادم جارية الآن — انتظر دقيقة"
+        _wa_restart_state["running"] = True
+        _wa_restart_state["at"] = time.time()
+    try:
+        threading.Thread(target=_do_restart, args=(port, "إعادة تشغيل يدوية"),
+                         daemon=True).start()
+    except Exception as e:
+        with _wa_restart_lock:
+            _wa_restart_state["running"] = False
+        return False, "تعذّرت إعادة التشغيل: %s" % e
+    return True, ("جارٍ إعادة تشغيل خادم الواتساب — يعود خلال دقيقة أو دقيقتين "
+                  "بالجلسة نفسها، دون مسح QR")
 
 
 def maybe_recover_wa(port, detail) -> bool:
@@ -491,6 +523,38 @@ def _ensure_wa_version_pin():
         return f"خطأ غير متوقع ({e})"
 
 
+def _ensure_wa_cache_fix():
+    """
+    يُصلح مسار نسخة واتساب ويب في `server.js` (انظر `wa_server_fix`).
+    يُرجع (أُصلح الآن؟، وصفاً للسجل). لا يرفع استثناءً.
+
+    العطل: من ١٥ سبتمبر يسقط الحقن بعد «مصادق» في كل تشغيل، فيبقى الخادم
+    «متصلاً» ولا تخرج رسالة واحدة (ثانوية الشقيق). الإصلاح الآلي في 3.6.64
+    يعيد التشغيل، لكن التشغيل الجديد يسقط السقوط نفسه — فلا علاج إلا الملف.
+    """
+    try:
+        import wa_server_fix
+    except Exception as e:
+        return False, f"وحدة الإصلاح غير متاحة ({e})"
+    js = os.path.join(WHATS_PATH, "server.js")
+    if not os.path.isfile(js):
+        return False, "لا server.js"
+    app_dir = (os.path.dirname(sys.executable)
+               if getattr(sys, 'frozen', False) else BASE_DIR)
+    node = os.path.join(app_dir, "node.exe")
+    state, desc = wa_server_fix.fix_file(js, node if os.path.isfile(node) else None)
+    return state == wa_server_fix.FIXED, desc
+
+
+def _stage_ports() -> list:
+    """منافذ خوادم الواتساب التي تستعملها هذه المرحلة، بلا تكرار."""
+    try:
+        ports = [int(s.get("port", 3000)) for s in get_wa_servers()]
+    except Exception:
+        ports = [3000]
+    return list(dict.fromkeys(p for p in ports if p)) or [3000]
+
+
 def _kill_stale_wa_server(port=3000):
     """
     يُنهي خادم واتساب عالقاً يحتجز المنفذ.
@@ -560,6 +624,24 @@ def _profile_browsers(auth_path) -> list:
             if mark in str(r.get("CommandLine") or "").replace("/", "\\").lower()]
 
 
+def _wait_profile_free(port, timeout=20):
+    """
+    ينتظر خروج متصفح جلسة هذا المنفذ بعد إيقاف خادمه، ويُنهي ما بقي بعد المهلة.
+    يُرجع مسار الجلسة.
+
+    خادمٌ جديد يفتح ملف الجلسة نفسه والمتصفح القديم ما زال يخرج قد يعلق في
+    صفحة واتساب الترحيبية بلا رمز ولا اتصال — رأيناه في المختبر نحو ٢٠ دقيقة.
+    """
+    auth_path = wa_file(".wwebjs_auth", port)
+    end = time.time() + timeout
+    while time.time() < end and _profile_browsers(auth_path):
+        time.sleep(1)
+    for pid in _profile_browsers(auth_path):   # ما بقي بعد المهلة: نُنهيه بشجرته
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+    return auth_path
+
+
 def reset_wa_session() -> str:
     """
     يُوقف خادم هذه المرحلة ويحذف جلسته، فيُقلع التشغيل التالي بلا جلسة
@@ -574,15 +656,9 @@ def reset_wa_session() -> str:
     except Exception:
         port = 3000
     stopped = _kill_stale_wa_server(port)
-    auth_path = wa_file(".wwebjs_auth", port)
     # المتصفح يخرج بعد الخادم بثوانٍ. الحذف وهو يكتب فيها يترك بقايا تُفسد
     # التشغيل التالي (ظهر ذلك في المختبر)، فننتظر خروجه أولاً.
-    end = time.time() + 20
-    while time.time() < end and _profile_browsers(auth_path):
-        time.sleep(1)
-    for pid in _profile_browsers(auth_path):   # ما بقي بعد المهلة: نُنهيه بشجرته
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True,
-                       creationflags=subprocess.CREATE_NO_WINDOW)
+    auth_path = _wait_profile_free(port)
     for _ in range(5):
         shutil.rmtree(auth_path, ignore_errors=True)
         if not os.path.exists(auth_path):
@@ -604,6 +680,19 @@ def start_whatsapp_server():
                 print(f"[WA-VERSION] {_kill_stale_wa_server()}")
         except Exception:
             pass
+        # ويسبقه: مسار نسخةٍ يُسقط الحقن بعد «مصادق» فلا تخرج رسالة أبداً.
+        # أُصلح الملف الآن ⇒ الخادم الحيّ ما زال يحمل الكود القديم، فنوقفه
+        # على منافذ هذه المرحلة وحدها (المرحلة الأخرى يُعيدها استردادها الآلي
+        # عند أول فشل، أو زرّ «إعادة تشغيل الخادم» فيها).
+        try:
+            _fixed, _d = _ensure_wa_cache_fix()
+            print(f"[WA-CACHEFIX] {_d}")
+            if _fixed:
+                for _p in _stage_ports():
+                    print(f"[WA-CACHEFIX] {_kill_stale_wa_server(_p)}")
+                    _wait_profile_free(_p)
+        except Exception as e:
+            print(f"[WA-CACHEFIX] تعذّر: {e}")
         if not os.path.isdir(WHATS_PATH):
             # messagebox من خيط خلفي لا يرمي استثناءً — بل يتجمّد ويُعلّق
             # الخادم كله، فنفحص الخيط قبل عرض أي نافذة.
@@ -632,11 +721,7 @@ def start_whatsapp_server():
         # المرحلتان على منفذ واحد ⇒ رقم واحد مشترك: الأولى تُقلعه
         # والثانية تجده حياً فلا تُقلع ثانياً. وإقلاع خادمين على منفذ
         # واحد يفشل في الربط ويتنازع الاثنان على ملف الجلسة نفسه.
-        try:
-            ports = [int(s.get("port", 3000)) for s in get_wa_servers()]
-        except Exception:
-            ports = [3000]
-        ports = list(dict.fromkeys(p for p in ports if p)) or [3000]
+        ports = _stage_ports()
 
         started, alive = [], []
         for p in ports:
