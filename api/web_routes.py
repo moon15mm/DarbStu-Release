@@ -466,6 +466,129 @@ def _log_msg(date_str, sid, sname, cid, cname, phone, ok, mtype, detail=""):
         print(f"[MSG-LOG] تعذّر تسجيل الرسالة: {e}")
 
 
+# ── دفعات الغياب والتأخر: تبدأ في الخادم وتعود فوراً ─────────────────
+# كانت الدفعة كلها داخل طلبٍ واحد يمتدّ دقائق (٨–١٦ ثانية بين الرسائل)،
+# فيقطعه الاتصال قبل أن ينتهي: لا يظهر شيء والحلقة ماضية في الخادم، فيُضغط
+# الزرّ ثانيةً وتدور حلقتان على القائمة نفسها — فوصلت أولياء الأمور رسالتان
+# (أكتوبر ٢٠٢٦). صار الطلب يبدأ الدفعة في خيطٍ ويعود فوراً، والصفحة تتابع
+# التقدّم من /web/api/send-batch-status، ولا تبدأ دفعةٌ ثانية من النوع نفسه
+# والأولى جارية. ومنع التكرار نفسه في send_daily_message — يشمل كل المسارات.
+_batches = {}
+_batches_lock = threading.Lock()
+_BATCH_LABEL = {"absence": "رسائل الغياب", "tardiness": "رسائل التأخر"}
+
+
+def _batch_snapshot(kind):
+    with _batches_lock:
+        b = _batches.get(kind)
+        return dict(b, skipped_names=list(b["skipped_names"])) if b else None
+
+
+def _run_batch(kind, date_str, jobs):
+    """jobs: قائمة (sid, sname, cid, cname, phone, text, student_data)."""
+    import time as _time
+    from alerts_service import send_daily_message
+    b = _batches[kind]
+    sent_once = False
+
+    def _gap():
+        # تباعد متصاعد بين الرسائل — الدفعة الطويلة المتسارعة هي ما يلفت كاشف الإزعاج
+        try:
+            import wa_limits
+            _time.sleep(wa_limits.next_delay())
+        except Exception:
+            import random
+            _time.sleep(random.uniform(8, 16))
+
+    try:
+        for sid, sname, cid, cname, phone, text, sdata in jobs:
+            if not phone:
+                _log_msg(date_str, sid, sname, cid, cname, "", False, kind,
+                         "لا يوجد رقم جوال لولي الأمر")
+                with _batches_lock:
+                    b["failed"] += 1
+                    b["done"] += 1
+                continue
+            # التباعد بعد الحجز وحده: المتخطّى (أُرسلت له اليوم) لا ينتظر
+            res, _detail = send_daily_message(kind, date_str, sid, sname, cid, cname,
+                                              phone, text, student_data=sdata,
+                                              humanize=True,
+                                              pace=_gap if sent_once else None)
+            skipped = res.startswith("skip:")
+            with _batches_lock:
+                b["done"] += 1
+                if res == "sent":
+                    b["sent"] += 1
+                elif skipped:
+                    b["skipped"] += 1
+                    if len(b["skipped_names"]) < 50:
+                        b["skipped_names"].append(sname)
+                elif res == "unsure":
+                    b["unsure"] += 1
+                else:
+                    b["failed"] += 1
+            if not skipped:
+                sent_once = True
+    except Exception as e:
+        print(f"[BATCH] {kind}: توقّفت الدفعة: {e}")
+        with _batches_lock:
+            b["error"] = str(e)
+    finally:
+        with _batches_lock:
+            b["running"] = False
+            b["finished_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def _start_batch(kind, date_str, jobs):
+    """يبدأ الدفعة في خيط. يُرجع (بدأت؟، لقطة الحالة)."""
+    with _batches_lock:
+        cur = _batches.get(kind)
+        if cur and cur.get("running"):
+            return False, dict(cur, skipped_names=list(cur["skipped_names"]))
+        _batches[kind] = {"kind": kind, "date": date_str, "total": len(jobs),
+                          "done": 0, "sent": 0, "skipped": 0, "unsure": 0, "failed": 0,
+                          "skipped_names": [], "running": True, "error": "",
+                          "started_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                          "finished_at": None}
+    try:
+        threading.Thread(target=_run_batch, args=(kind, date_str, jobs),
+                         daemon=True).start()
+    except Exception:
+        with _batches_lock:
+            _batches[kind]["running"] = False
+        raise
+    return True, _batch_snapshot(kind)
+
+
+def _batch_response(kind, started, snap):
+    if started:
+        return JSONResponse({**snap, "ok": True, "started": True})
+    return JSONResponse({**snap, "ok": False, "running": True,
+                         "msg": "إرسال %s جارٍ الآن (%d من %d) — انتظر حتى ينتهي" % (
+                             _BATCH_LABEL[kind], snap.get("done", 0), snap.get("total", 0))})
+
+
+@router.get("/web/api/send-batch-status", response_class=JSONResponse)
+async def web_send_batch_status(request: Request, kind: str = "tardiness"):
+    user = _get_current_user(request)
+    if not user: return JSONResponse({"error": "غير مصرح"}, status_code=401)
+    if kind not in _BATCH_LABEL:
+        return JSONResponse({"ok": False, "msg": "نوع غير معروف"}, status_code=400)
+    snap = _batch_snapshot(kind) or {"running": False, "total": 0}
+    return JSONResponse({**snap, "ok": True})
+
+
+@router.get("/web/api/messages-sent-today", response_class=JSONResponse)
+async def web_messages_sent_today(request: Request, date: str = None, kind: str = "tardiness"):
+    """من سبقت له رسالة هذا النوع اليوم — من أي مسار، ومنه إشعار جهاز البصمة."""
+    user = _get_current_user(request)
+    if not user: return JSONResponse({"error": "غير مصرح"}, status_code=401)
+    if kind not in _BATCH_LABEL:
+        return JSONResponse({"ok": False, "msg": "نوع غير معروف"}, status_code=400)
+    from alerts_service import daily_sent_map
+    return JSONResponse({"ok": True, "sent": daily_sent_map(date or now_riyadh_date(), kind)})
+
+
 @router.post("/web/api/send-absence-messages", response_class=JSONResponse)
 async def web_send_absence_messages(req: Request):
     user = _get_current_user(req)
@@ -488,45 +611,26 @@ async def web_send_absence_messages(req: Request):
             for s in cls["students"]:
                 phone_map[s["id"]] = s.get("phone", "")
 
-        import random, asyncio
-        sent = failed = 0
-        for i, stu in enumerate(students):
-            # تأخير عشوائي بين الرسائل (إلا الأولى)
-            if i > 0:
-                # تباعد متصاعد: يبطؤ كلما طالت الدفعة، فالدفعة الطويلة
-                # المتسارعة هي ما يلفت كاشف الإزعاج لا الرسالة المفردة
-                try:
-                    import wa_limits
-                    await asyncio.sleep(wa_limits.next_delay())
-                except Exception:
-                    await asyncio.sleep(random.uniform(8, 16))
-            
-            sid   = str(stu.get("student_id", ""))
+        jobs, seen = [], set()
+        for stu in students:
+            sid = str(stu.get("student_id", ""))
+            if not sid or sid in seen:          # الطالب مرة واحدة ولو تكرّر في القائمة
+                continue
+            seen.add(sid)
             sname = stu.get("student_name", "")
             cname = stu.get("class_name", "")
             cid   = str(stu.get("class_id", "") or "")
-            phone = phone_map.get(sid, "")
-            if not phone:
-                failed += 1
-                _log_msg(date_str, sid, sname, cid, cname, "", False,
-                         "absence", "لا يوجد رقم جوال لولي الأمر")
-                continue
-
             msg = template.format(
                 school_name=school,
                 student_name=sname,
                 class_name=cname,
                 date=date_str)
+            jobs.append((sid, sname, cid, cname, phone_map.get(sid, ""), msg,
+                         {"student_id": sid, "student_name": sname,
+                          "class_name": cname, "date": date_str}))
 
-            ok, wstatus = send_whatsapp_message(phone, msg, student_data={
-                "student_id": sid, "student_name": sname,
-                "class_name": cname, "date": date_str}, humanize=True)
-            if ok: sent += 1
-            else:  failed += 1
-            _log_msg(date_str, sid, sname, cid, cname, phone, ok,
-                     "absence", "" if ok else str(wstatus or ""))
-
-        return JSONResponse({"ok": True, "sent": sent, "failed": failed})
+        started, snap = _start_batch("absence", date_str, jobs)
+        return _batch_response("absence", started, snap)
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 
@@ -543,7 +647,6 @@ async def web_send_tardiness_messages(req: Request):
             return JSONResponse({"ok": False, "msg": "لا يوجد طلاب"})
 
         cfg      = load_config()
-        school   = cfg.get("school_name", "المدرسة")
         template = cfg.get("tardiness_message_template",
                            "تنبيه تأخر: {student_name} تأخر {minutes_late} دقيقة بتاريخ {date}")
         store    = load_students()
@@ -553,42 +656,23 @@ async def web_send_tardiness_messages(req: Request):
             for s in cls["students"]:
                 phone_map[s["id"]] = s.get("phone", "")
 
-        import random, asyncio
-        sent = failed = 0
-        for i, stu in enumerate(students):
-            if i > 0:
-                # تباعد متصاعد: يبطؤ كلما طالت الدفعة، فالدفعة الطويلة
-                # المتسارعة هي ما يلفت كاشف الإزعاج لا الرسالة المفردة
-                try:
-                    import wa_limits
-                    await asyncio.sleep(wa_limits.next_delay())
-                except Exception:
-                    await asyncio.sleep(random.uniform(8, 16))
-                
-            sid   = str(stu.get("student_id", ""))
+        from config_manager import render_template
+        jobs, seen = [], set()
+        for stu in students:
+            sid = str(stu.get("student_id", ""))
+            if not sid or sid in seen:          # الطالب مرة واحدة ولو تكرّر في القائمة
+                continue
+            seen.add(sid)
             sname = stu.get("student_name", "")
             cname = stu.get("class_name", "")
             cid   = str(stu.get("class_id", "") or "")
-            mins  = stu.get("minutes_late", 0)
-            phone = phone_map.get(sid, "")
-            if not phone:
-                failed += 1
-                _log_msg(date_str, sid, sname, cid, cname, "", False,
-                         "tardiness", "لا يوجد رقم جوال لولي الأمر")
-                continue
-
-            from config_manager import render_template
             msg = render_template(
                 template, student_name=sname, class_name=cname,
-                date=date_str, minutes_late=mins)
+                date=date_str, minutes_late=stu.get("minutes_late", 0))
+            jobs.append((sid, sname, cid, cname, phone_map.get(sid, ""), msg, None))
 
-            ok, wstatus = send_whatsapp_message(phone, msg, humanize=True)
-            if ok: sent += 1
-            else:  failed += 1
-            _log_msg(date_str, sid, sname, cid, cname, phone, ok,
-                     "tardiness", "" if ok else str(wstatus or ""))
-
-        return JSONResponse({"ok": True, "sent": sent, "failed": failed})
+        started, snap = _start_batch("tardiness", date_str, jobs)
+        return _batch_response("tardiness", started, snap)
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 
@@ -3468,8 +3552,12 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
     <div id="st-status" style="margin-bottom:12px"></div>
     <div id="st-list"></div>
     <div id="st-send-btn" style="margin-top:12px;display:none">
-      <button class="btn bp1" onclick="sendTardinessMessages()">📩 إرسال للمحددين</button>
-      <span id="st-progress" style="margin-right:12px;font-size:13px;color:var(--mu)"></span>
+      <div class="bg-btn">
+        <button class="btn bp1" onclick="sendTardinessMessages()" id="st-btn">📩 إرسال للمحددين</button>
+        <button class="btn bp2" onclick="stAll(true)">تحديد الكل</button>
+        <button class="btn bp2" onclick="stAll(false)">إلغاء الكل</button>
+      </div>
+      <span id="st-progress" style="display:block;margin-top:8px;font-size:13px;color:var(--mu)"></span>
     </div>
   </div>
 </div>
@@ -5996,35 +6084,102 @@ async function loadAbsencesForSend(){
     students.map(function(s){return '<label class="sk"><input type="checkbox" value="'+s.student_id+'" data-name="'+s.student_name+'" data-class="'+s.class_name+'" data-classid="'+s.class_id+'" checked>'+
       '<div><div style="font-size:13px;font-weight:600">'+s.student_name+'</div><div style="font-size:11px;color:var(--mu)">'+s.class_name+'</div></div></label>';}).join('')+'</div>';
   document.getElementById('sa-send-btn').style.display='block';
+  await _markSentToday('absence','#sa-list',date,'sa-status');
+  _batchPoll('absence',true);
 }
 function saAll(v){document.querySelectorAll('#sa-list input[type=checkbox]').forEach(function(c){c.checked=v;});}
+function stAll(v){document.querySelectorAll('#st-list input[type=checkbox]').forEach(function(c){c.checked=v;});}
+/* دفعة الغياب أو التأخر تبدأ في الخادم وتعود فوراً، والصفحة تتابع التقدّم.
+   كانت داخل طلبٍ واحد يمتدّ دقائق، فإن قطعه الاتصال لم يظهر شيء وضُغط الزرّ
+   ثانيةً فدارت حلقتان معاً — ووصلت أولياء الأمور رسالتان. والخادم يتخطّى من
+   أُرسلت له رسالة النوع نفسه اليوم، أياً كان المسار الذي أرسلها. */
+var _BATCH_UI={absence:{btn:'sa-btn',out:'sa-progress',label:'📨 إرسال للمحددين'},
+  tardiness:{btn:'st-btn',out:'st-progress',label:'📩 إرسال للمحددين'}};
+function _batchLine(b){
+  var t='أُرسلت '+(b.sent||0)+' من '+(b.total||0);
+  if(b.skipped)t+=' · تُخطّي '+b.skipped+' أُرسلت لهم اليوم';
+  if(b.unsure)t+=' · لم يُتأكد '+b.unsure;
+  if(b.failed)t+=' · فشلت '+b.failed;
+  return t;
+}
+async function _batchPoll(kind,quiet){
+  var u=_BATCH_UI[kind],btn=document.getElementById(u.btn),out=document.getElementById(u.out);
+  if(!btn||!out)return;
+  var b=null;
+  try{var r=await fetch('/web/api/send-batch-status?kind='+kind);b=await r.json();}catch(e){b=null;}
+  if(!b||!b.ok){
+    if(quiet)return;
+    out.textContent='⚠️ تعذّر الاتصال بالخادم — الإرسال مستمر فيه، أُعيد المحاولة...';
+    setTimeout(function(){_batchPoll(kind);},6000);return;
+  }
+  if(b.running){
+    btn.disabled=true;btn.textContent='جارٍ الإرسال...';
+    out.textContent='⏳ '+_batchLine(b)+' — يجري في الخادم ولو أغلقت الصفحة';
+    setTimeout(function(){_batchPoll(kind);},4000);return;
+  }
+  btn.disabled=false;btn.textContent=u.label;
+  if(quiet)return;
+  var at=(b.started_at||'').slice(11,16);
+  out.textContent=b.total?((b.failed||b.error?'⚠️ ':'✅ ')+'اكتمل'+(at?' (بدأ '+at+')':'')+': '+
+    _batchLine(b)+(b.error?' — '+b.error:'')):'';
+}
+async function _batchStart(kind,url,date,students){
+  var u=_BATCH_UI[kind],btn=document.getElementById(u.btn),out=document.getElementById(u.out);
+  btn.disabled=true;btn.textContent='جارٍ الإرسال...';out.textContent='⏳ جارٍ البدء...';
+  var d=null;
+  try{var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({date:date,students:students})});d=await r.json();}catch(e){d=null;}
+  if(d&&!d.ok&&!d.running){btn.disabled=false;btn.textContent=u.label;
+    out.textContent='❌ '+(d.msg||'تعذّر بدء الإرسال');return;}
+  _batchPoll(kind);
+}
+/* من سبقت له رسالة النوع نفسه اليوم (من أي مسار، ومنه جهاز البصمة) يُعلَّم ويُلغى
+   تحديده — الخادم يتخطّاه على كل حال، فيطابق التحديدُ ما سيُرسَل فعلاً. */
+async function _markSentToday(kind,listSel,date,statusId){
+  var d=null;
+  try{var r=await fetch('/web/api/messages-sent-today?kind='+kind+'&date='+encodeURIComponent(date));d=await r.json();}catch(e){d=null;}
+  if(!d||!d.ok||!d.sent)return 0;
+  var n=0;
+  document.querySelectorAll(listSel+' input[type=checkbox]').forEach(function(c){
+    var o=d.sent[c.value];if(!o)return;
+    c.checked=false;n++;
+    var name=c.parentNode.querySelector('div div');if(!name)return;
+    var tag=document.createElement('span');
+    tag.className='badge '+(o==='sent'?'bg':'bo');
+    tag.style.cssText='margin-right:6px;font-size:10px';
+    tag.textContent=o==='sent'?'✓ أُرسلت اليوم':'لم يُتأكد اليوم';
+    name.appendChild(tag);
+  });
+  var st=document.getElementById(statusId);
+  if(n&&st)st.insertAdjacentHTML('beforeend',' <span class="badge bg">'+n+' سبقت لهم رسالة اليوم</span>');
+  return n;
+}
 async function sendAbsenceMessages(){
   var date=document.getElementById('sa-date').value;
   var checked=Array.from(document.querySelectorAll('#sa-list input:checked'));
   if(!checked.length){alert('حدد طالباً');return;}
-  var btn=document.getElementById('sa-btn');btn.disabled=true;btn.textContent='جارٍ الإرسال...';
   var students=checked.map(function(c){return {student_id:c.value,student_name:c.dataset.name,class_id:c.dataset.classid,class_name:c.dataset.class};});
-  var r=await fetch('/web/api/send-absence-messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({date:date,students:students})});
-  var d=await r.json();
-  document.getElementById('sa-progress').textContent=d.ok?'✅ تم إرسال '+d.sent+' رسالة':'❌ '+d.msg;
-  btn.disabled=false;btn.textContent='📨 إرسال للمحددين';
+  _batchStart('absence','/web/api/send-absence-messages',date,students);
 }
 async function loadTardinessForSend(){
   var date=document.getElementById('st-date').value;if(!date){alert('اختر التاريخ');return;}
   var d=await api('/web/api/tardiness?date='+date);if(!d||!d.ok)return;
-  if(!d.rows.length){ss('st-status','لا يوجد تأخر','ok');document.getElementById('st-list').innerHTML='';document.getElementById('st-send-btn').style.display='none';return;}
-  document.getElementById('st-status').innerHTML='<span class="badge bo">'+d.rows.length+' حالة تأخر</span>';
+  // الطالب مرة واحدة في القائمة — كما في قائمة الغياب
+  var seen=new Set();var rows=d.rows.filter(function(r){if(seen.has(r.student_id))return false;seen.add(r.student_id);return true;});
+  if(!rows.length){ss('st-status','لا يوجد تأخر','ok');document.getElementById('st-list').innerHTML='';document.getElementById('st-send-btn').style.display='none';return;}
+  document.getElementById('st-status').innerHTML='<span class="badge bo">'+rows.length+' حالة تأخر</span>';
   document.getElementById('st-list').innerHTML='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:6px;margin-top:8px">'+
-    d.rows.map(function(s){return '<label class="sk" style="background:#FFF8F0;border-color:#FED7AA"><input type="checkbox" value="'+s.student_id+'" data-name="'+s.student_name+'" data-class="'+s.class_name+'" data-mins="'+s.minutes_late+'" checked>'+
+    rows.map(function(s){return '<label class="sk" style="background:#FFF8F0;border-color:#FED7AA"><input type="checkbox" value="'+s.student_id+'" data-name="'+s.student_name+'" data-class="'+s.class_name+'" data-mins="'+s.minutes_late+'" checked>'+
       '<div><div style="font-size:13px;font-weight:600">'+s.student_name+'</div><div style="font-size:11px;color:#92400E">'+s.class_name+' - '+s.minutes_late+' دقيقة</div></div></label>';}).join('')+'</div>';
   document.getElementById('st-send-btn').style.display='block';
+  await _markSentToday('tardiness','#st-list',date,'st-status');
+  _batchPoll('tardiness',true);
 }
 async function sendTardinessMessages(){
   var date=document.getElementById('st-date').value;
   var checked=Array.from(document.querySelectorAll('#st-list input:checked'));if(!checked.length){alert('حدد طالباً');return;}
   var students=checked.map(function(c){return {student_id:c.value,student_name:c.dataset.name,class_name:c.dataset.class,minutes_late:c.dataset.mins};});
-  var r=await fetch('/web/api/send-tardiness-messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({date:date,students:students})});
-  var d=await r.json();document.getElementById('st-progress').textContent=d.ok?'✅ تم إرسال '+d.sent+' رسالة':'❌ '+d.msg;
+  _batchStart('tardiness','/web/api/send-tardiness-messages',date,students);
 }
 
 /* ── PORTAL LINKS ── */
@@ -9921,13 +10076,17 @@ async function loadMsgReport(){
      '<th>النوع</th><th>الجوال</th><th>الحالة</th><th>السبب</th></tr></thead><tbody>';
   (d.rows||[]).forEach(function(r){
     var okv=String(r.status||'').toLowerCase();
-    var bad=(okv==='failed'||okv==='fail'||okv==='error'||okv==='');
+    // ‏outcome من الخادم: «فشل: …» من المكتبي كان يظهر «وصلت» لأنه ليس Failed حرفياً
+    var oc=r.outcome||'';
+    var bad=oc?(oc==='failed'||oc==='unsure'):(okv==='failed'||okv==='fail'||okv==='error'||okv==='');
+    var col=oc==='unsure'?'#B45309':(bad?'#B91C1C':'#059669');
+    var lab=oc==='unsure'?'لم يُتأكد':(bad?'فشلت':'وصلت');
     h+='<tr><td>'+(r.date||'')+'</td><td>'+(r.student_name||'')+'</td>'+
        '<td>'+(r.class_name||'—')+'</td>'+
-       '<td>'+(TY[r.message_type]||r.message_type||'—')+'</td>'+
+       '<td>'+(TY[r.message_type]||r.message_type||'—')+(r.template_used==='biometric'?' (البصمة)':'')+'</td>'+
        '<td>'+(r.phone||'—')+'</td>'+
-       '<td style="color:'+(bad?'#B91C1C':'#059669')+';font-weight:700">'+
-         (bad?'فشلت':'وصلت')+'</td>'+
+       '<td style="color:'+col+';font-weight:700">'+
+         lab+'</td>'+
        '<td style="font-size:12px;color:#6B7280">'+(r.detail||'')+'</td></tr>';
   });
   h+='</tbody></table></div>';

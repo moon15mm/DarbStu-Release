@@ -166,9 +166,32 @@ _SRC_BY_FUNC = {
 # وحدات لا تُحسب مصدراً — نتخطّاها بحثاً عن المُستدعي الحقيقي
 _SRC_SKIP = ("wa_limits", "whatsapp_service")
 
+# مصدرٌ صريح لما يمرّ بدالة إرسالٍ مشتركة: `alerts_service.send_daily_message`
+# تخدم الغياب والتأخر والبصمة معاً، فالمكدّس وحده يراها «other».
+_src_override = threading.local()
+
+
+class as_source:
+    """يُسند مصدر الرسائل داخل الكتلة صراحةً — `with as_source("tardiness"): …`"""
+
+    def __init__(self, src):
+        self.src = src
+
+    def __enter__(self):
+        self.prev = getattr(_src_override, "src", None)
+        _src_override.src = self.src
+        return self
+
+    def __exit__(self, *exc):
+        _src_override.src = self.prev
+        return False
+
 
 def detect_source() -> str:
     """يستنتج مصدر الرسالة من مكدّس الاستدعاء — بلا تعديل أي موضع إرسال."""
+    forced = getattr(_src_override, "src", None)
+    if forced:
+        return forced
     try:
         f = sys._getframe(1)
         for _ in range(12):

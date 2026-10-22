@@ -6,7 +6,9 @@ from typing import List, Dict, Any, Optional
 from constants import now_riyadh_date, CONFIG_JSON
 from config_manager import DEFAULT_CONFIG, get_message_template, render_message, load_config
 from alerts_service import (build_absent_groups, log_message_status,
-                             query_today_messages, safe_send_absence_alert)
+                             query_today_messages, safe_send_absence_alert,
+                             claim_daily_message, release_daily_message,
+                             message_outcome)
 from whatsapp_service import send_whatsapp_message
 
 class MessagesTabMixin:
@@ -242,28 +244,41 @@ class MessagesTabMixin:
         self.send_button.config(state="disabled")
         self.root.update_idletasks()
 
-        s_ok, s_fail = 0, 0
+        s_ok, s_fail, s_skip = 0, 0, 0
         for cid, cname, s in selected:
             student_name = s["name"]
             phone = s.get("phone", "")
-            body = render_message(student_name, class_name=cname, date_str=date_str)
-            success, msg = safe_send_absence_alert(s["id"], student_name, cname, date_str)
-            status_text = "تم الإرسال" if success else f"فشل: {msg}"
-            if success:
-                s_ok += 1
-            else:
-                s_fail += 1
-
+            # رسالة غياب واحدة في اليوم لكل طالب — أياً كان مُرسِلها (الويب أو
+            # هذا التبويب أو صفحة الإرسال)؛ انظر alerts_service.claim_daily_message
+            if claim_daily_message(date_str, s["id"], "absence"):
+                s_skip += 1
+                continue
+            outcome = "failed"
             try:
-                log_message_status(date_str, s["id"], student_name, cid, cname, phone, status_text, body)
-            except Exception as e:
-                print("log_message_status error:", e)
+                body = render_message(student_name, class_name=cname, date_str=date_str)
+                success, msg = safe_send_absence_alert(s["id"], student_name, cname, date_str)
+                status_text = "تم الإرسال" if success else f"فشل: {msg}"
+                outcome = "sent" if success else message_outcome(status_text)
+                if success:
+                    s_ok += 1
+                else:
+                    s_fail += 1
+
+                try:
+                    log_message_status(date_str, s["id"], student_name, cid, cname, phone, status_text, body)
+                except Exception as e:
+                    print("log_message_status error:", e)
+            finally:
+                release_daily_message(date_str, s["id"], "absence",
+                                      outcome if outcome != "legacy" else "failed")
 
             self.status_label.config(text=f"جاري الإرسال... ✅{s_ok} / ❌{s_fail}", foreground="blue")
             self.root.update_idletasks()
 
         self.send_button.config(state="normal")
         summary = f"اكتمل: نجح {s_ok}، فشل {s_fail}."
+        if s_skip:
+            summary += f" وتُخطّي {s_skip} سبقت لهم رسالة غياب اليوم."
         self.status_label.config(text=summary, foreground="green" if s_fail == 0 else "red")
         messagebox.showinfo("نتيجة الإرسال", summary)
     

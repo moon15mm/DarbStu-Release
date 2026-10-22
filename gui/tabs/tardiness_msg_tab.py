@@ -7,6 +7,8 @@ from constants import now_riyadh_date, CONFIG_JSON
 from config_manager import invalidate_config_cache, load_config, get_terms
 from database import get_db, load_students, query_tardiness
 from whatsapp_service import send_whatsapp_message
+from alerts_service import (claim_daily_message, release_daily_message,
+                            message_outcome, DAILY_SKIP_TEXT)
 
 class TardinessMessagesTabMixin:
     """Mixin: TardinessMessagesTabMixin"""
@@ -193,15 +195,31 @@ class TardinessMessagesTabMixin:
             foreground="#1565C0")
 
     def _tard_msg_get_sent_map(self, date_str: str) -> dict:
-        """يستعلم عن الرسائل المُرسَلة للمتأخرين من جدول message_log."""
+        """
+        أفضل نتيجة اليوم لكل طالب من سجلّ الرسائل: «تم الإرسال» ثم «لم يُتأكد»
+        ثم آخر فشل. الويب يكتب Success/Failed والمكتبي «تم الإرسال»/«فشل: …».
+        """
         try:
             con = get_db()
             con.row_factory = sqlite3.Row; cur = con.cursor()
-            cur.execute("""SELECT student_id, status FROM messages_log
-                           WHERE date=? AND message_type='tardiness'""",
+            cur.execute("""SELECT * FROM messages_log
+                           WHERE date=? AND message_type='tardiness' ORDER BY id""",
                         (date_str,))
-            result = {r["student_id"]: r["status"] for r in cur.fetchall()}
-            con.close(); return result
+            rank = {"sent": 3, "unsure": 2, "legacy": 1, "failed": 0}
+            best = {}
+            for r in cur.fetchall():
+                r = dict(r)
+                o = message_outcome(r.get("status"), r.get("detail"))
+                sid = r["student_id"]
+                if sid in best and rank[best[sid][0]] > rank[o]:
+                    continue
+                label = {"sent": "تم الإرسال", "unsure": "لم يُتأكد"}.get(
+                    o, str(r.get("status") or ""))
+                if o == "failed" and "فشل" not in label:
+                    label = "فشل: " + str(r.get("detail") or label)
+                best[sid] = (o, label)
+            con.close()
+            return {sid: lab for sid, (_o, lab) in best.items()}
         except Exception:
             return {}
 
@@ -265,6 +283,7 @@ class TardinessMessagesTabMixin:
 
         def do_send():
             ok_cnt = fail_cnt = skip_cnt = 0
+            sent_once = False
             for sid in list(self._tard_msg_checked):
                 row   = tard_rows.get(sid)
                 phone = phone_map.get(sid,"")
@@ -276,48 +295,69 @@ class TardinessMessagesTabMixin:
                         row.get("student_name",sid)))
                     self._tard_msg_update_row(sid, "لا يوجد رقم")
                     continue
+                # رسالة تأخر واحدة في اليوم لكل طالب — أياً كان مُرسِلها
+                # (الويب أو هذا التبويب أو جهاز البصمة)؛ انظر alerts_service
+                why = claim_daily_message(date_str, sid, "tardiness")
+                if why:
+                    skip_cnt += 1
+                    self._tard_msg_log_append("⏭ {} — {}".format(
+                        row.get("student_name", sid), DAILY_SKIP_TEXT.get(why, why)))
+                    if why == "sent":
+                        self._tard_msg_update_row(sid, "تم الإرسال", "sent_ok")
+                    continue
+                if sent_once:
+                    # ── تأخير بين الرسائل لتجنب حظر الواتساب ──
+                    delay_sec = self.tard_msg_delay_var.get() if hasattr(self, "tard_msg_delay_var") else 8
+                    try:
+                        import wa_limits
+                        # التباعد المتصاعد أهم من رقم ثابت يختاره المستخدم
+                        delay_sec = max(delay_sec, wa_limits.next_delay())
+                    except Exception:
+                        pass
+                    time.sleep(max(1, delay_sec))
+                sent_once = True
+                outcome = "failed"
                 try:
-                    mins = row.get("minutes_late",0)
-                    from config_manager import render_template
-                    msg  = render_template(
-                        tpl,
-                        student_name=row.get("student_name",""),
-                        class_name=row.get("class_name",""),
-                        date=date_str, minutes_late=mins)
-                except Exception:
-                    _t = get_terms()
-                    msg = "تنبيه: {late_v} {son} {} دقيقة بتاريخ {}".format(
-                        row.get("minutes_late",0), date_str,
-                        late_v=_t["late_v"], son=_t["son"])
+                    try:
+                        mins = row.get("minutes_late",0)
+                        from config_manager import render_template
+                        msg  = render_template(
+                            tpl,
+                            student_name=row.get("student_name",""),
+                            class_name=row.get("class_name",""),
+                            date=date_str, minutes_late=mins)
+                    except Exception:
+                        _t = get_terms()
+                        mins = row.get("minutes_late",0)
+                        msg = "تنبيه: {late_v} {son} {} دقيقة بتاريخ {}".format(
+                            row.get("minutes_late",0), date_str,
+                            late_v=_t["late_v"], son=_t["son"])
 
-                ok, status = send_whatsapp_message(phone, msg)
-                log_status = "تم الإرسال" if ok else "فشل: {}".format(status)
+                    try:
+                        ok, status = send_whatsapp_message(phone, msg)
+                    except Exception as e:
+                        ok, status = False, "حدث خطأ غير متوقع أثناء الإرسال: {}".format(e)
+                    log_status = "تم الإرسال" if ok else "فشل: {}".format(status)
+                    outcome = "sent" if ok else message_outcome(log_status)
 
-                # ── تأخير بين الرسائل لتجنب حظر الواتساب ──
-                delay_sec = self.tard_msg_delay_var.get() if hasattr(self, "tard_msg_delay_var") else 8
-                try:
-                    import wa_limits
-                    # التباعد المتصاعد أهم من رقم ثابت يختاره المستخدم
-                    delay_sec = max(delay_sec, wa_limits.next_delay())
-                except Exception:
-                    pass
-                time.sleep(max(1, delay_sec))
-
-                # سجّل في message_log
-                try:
-                    created = datetime.datetime.utcnow().isoformat()
-                    con = get_db(); cur = con.cursor()
-                    cur.execute("""INSERT INTO messages_log
-                        (date,student_id,student_name,class_id,class_name,
-                         phone,status,template_used,message_type,created_at)
-                        VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                        (date_str, sid,
-                         row.get("student_name",""),
-                         row.get("class_id",""),
-                         row.get("class_name",""),
-                         phone, log_status, msg, "tardiness", created))
-                    con.commit(); con.close()
-                except Exception: pass
+                    # سجّل في message_log — قبل فكّ الحجز، فلا تُعيدها حلقةٌ أخرى
+                    try:
+                        created = datetime.datetime.utcnow().isoformat()
+                        con = get_db(); cur = con.cursor()
+                        cur.execute("""INSERT INTO messages_log
+                            (date,student_id,student_name,class_id,class_name,
+                             phone,status,template_used,message_type,created_at)
+                            VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                            (date_str, sid,
+                             row.get("student_name",""),
+                             row.get("class_id",""),
+                             row.get("class_name",""),
+                             phone, log_status, msg, "tardiness", created))
+                        con.commit(); con.close()
+                    except Exception: pass
+                finally:
+                    release_daily_message(date_str, sid, "tardiness",
+                                          outcome if outcome != "legacy" else "failed")
 
                 if ok:
                     ok_cnt += 1

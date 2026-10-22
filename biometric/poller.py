@@ -224,21 +224,36 @@ def process_pending(cfg=None):
         if notify:
             phone = _student_phone(sid)
             if phone:
-                _notify_parent(phone, sname, local, minutes_late)
+                _notify_parent(phone, sname, local, minutes_late, sid=sid,
+                               cname=cname, cid=ccid or "",
+                               date_str=p["date"] or _today_local())
 
     return stat
 
 
-def _notify_parent(phone, name, local_dt, minutes_late):
-    """إشعار واتساب فوري لولي الأمر — بلا إسقاط المعالجة إن فشل الإرسال."""
+def _notify_parent(phone, name, local_dt, minutes_late, sid="", cname="", cid="",
+                   date_str=""):
+    """
+    إشعار واتساب فوري لولي الأمر — بلا إسقاط المعالجة إن فشل الإرسال.
+
+    يمرّ بقاعدة «رسالة تأخر واحدة في اليوم» ويُسجَّل في سجلّ الرسائل: كان
+    يخرج بلا تسجيل، ثم تُرسَل رسالة التأخر يدوياً فتصل وليَّ الأمر رسالتان،
+    ولا يظهر في التقرير إلا واحدة.
+    """
     try:
-        from whatsapp_service import send_whatsapp_message
         t = local_dt.strftime("%I:%M")
         msg = ("تنبيه حضور\n"
                "الطالب: %s\n"
                "سجّل دخوله الساعة %s متأخّراً %d دقيقة." %
                (name, t, minutes_late))
-        send_whatsapp_message(phone, msg)
+        if sid:
+            from alerts_service import send_daily_message
+            send_daily_message("tardiness", date_str or _today_local(), sid, name,
+                               cid, cname, phone, msg, template_used="biometric",
+                               source="biometric")
+        else:
+            from whatsapp_service import send_whatsapp_message
+            send_whatsapp_message(phone, msg)
     except Exception:
         pass
 

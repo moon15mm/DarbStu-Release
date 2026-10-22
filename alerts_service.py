@@ -3,6 +3,9 @@
 alerts_service.py — نظام الإشعارات الذكية والتقارير اليومية
 """
 import datetime, threading, os, json, sqlite3
+# ‏time كان غائباً و`run_smart_alerts` ينام به بين الرسائل: NameError بعد أول
+# تنبيه فيموت الخيط صامتاً — فلم يصل تنبيه الغياب المتكرر إلا لطالبٍ واحد يومياً.
+import time
 from typing import List, Dict, Any, Optional
 from constants import DB_PATH, DATA_DIR, TZ_OFFSET, CONFIG_JSON, now_riyadh_date
 from config_manager import (load_config, get_terms, render_message,
@@ -115,6 +118,185 @@ def log_message_status(date_str: str, student_id: str, student_name: str, class_
     con.commit(); con.close()
 
 
+# ── رسالة واحدة في اليوم: الغياب والتأخر ────────────────────────────
+# تكرّرت رسائل التأخر لأولياء الأمور في اليوم نفسه (أكتوبر ٢٠٢٦): زرّ الإرسال
+# في الويب يبقى قابلاً للضغط وطلبه يمتدّ دقائق، فإن انقطع الاتصال ضُغط ثانيةً
+# فدارت حلقتان معاً؛ وجهاز البصمة يُشعر وليّ الأمر فوراً ثم تُرسَل رسالة التأخر
+# يدوياً. ولم يكن أيّ مسار يسأل: هل أُرسلت لهذا الطالب اليوم؟
+#
+# القاعدة الآن في موضع واحد لكل المسارات: لكل طالب رسالة غياب واحدة ورسالة
+# تأخر واحدة في اليوم. تُحجز الخانة قبل الإرسال (فحلقتان معاً لا ترسلان للطالب
+# نفسه) ولا تُفكّ إلا بعد تسجيل النتيجة. والمحاولة التي انتهت مهلتها «ربما
+# وصلت» فلا تُعاد: مع الشبكة البطيئة تخرج الرسالة متأخرةً، وإعادتها هي التكرار.
+DAILY_ONCE_TYPES = ("absence", "tardiness")
+DAILY_SKIP_TEXT = {
+    "sent": "أُرسلت له اليوم",
+    "unsure": "محاولة سابقة اليوم انتهت مهلتها وربما وصلت",
+    "inflight": "تُرسَل له الآن من مكان آخر",
+}
+_UNSURE_MARKS = ("مهلة", "غير متوقع", "timeout", "timed out")
+_FAILED_MARKS = ("فشل", "تعذّر", "تعذر", "غير متاح", "غير متصل", "غير مسجّل",
+                 "غير مسجل", "لا يوجد رقم", "غير موجود", "غير صالح", "غير مدعوم",
+                 "يُعاد تشغيله", "تعطّلت", "موقوف", "السقف", "http ")
+_daily_lock = threading.Lock()
+_daily_inflight = set()
+_daily_done = {}      # (date, sid, type) -> 'sent'|'unsure' — احتياطٌ إن تعذّر التسجيل
+
+
+def message_outcome(status, detail="") -> str:
+    """
+    نتيجة سطرٍ في سجلّ الرسائل:
+      'sent' وصلت · 'unsure' ربما وصلت (مهلة أو خطأ غير متوقع بعد الطلب) ·
+      'failed' لم تخرج · 'legacy' نصٌّ قديم لا يُعرف معناه.
+
+    المسارات تكتب الحالة بصيغ مختلفة: Success/Failed مع التفصيل (الويب)،
+    و«تم الإرسال» / «فشل: …» (المكتبي)، ونصّ النتيجة نفسه (صفحة الإرسال).
+    """
+    st = str(status or "").strip()
+    low = st.lower()
+    if low in ("success", "sent", "ok") or st.startswith("تم"):
+        return "sent"
+    txt = (st + " " + str(detail or "")).lower()
+    if any(m in txt for m in _UNSURE_MARKS):
+        return "unsure"
+    if low in ("failed", "fail", "error", "") or any(m in txt for m in _FAILED_MARKS):
+        return "failed"
+    return "legacy"
+
+
+def _prior_daily_outcome(date_str, sid, mtype) -> str:
+    """أفضل نتيجة سابقة اليوم لهذا الطالب والنوع: 'sent' ثم 'unsure'، وإلا ''."""
+    best = _daily_done.get((date_str, sid, mtype), "")
+    if best == "sent":
+        return best
+    client = get_cloud_client()
+    if client.is_active():
+        rows = [r for r in query_today_messages(date_str)
+                if str(r.get("student_id")) == sid
+                and (r.get("message_type") or "absence") == mtype]
+    else:
+        con = get_db(); con.row_factory = sqlite3.Row
+        try:
+            q = ("SELECT status, %s FROM messages_log WHERE date=? AND student_id=? "
+                 "AND COALESCE(NULLIF(message_type,''),'absence')=?")
+            try:
+                rows = [dict(r) for r in con.execute(q % "detail", (date_str, sid, mtype))]
+            except sqlite3.OperationalError:          # قاعدة قديمة بلا عمود detail
+                rows = [dict(r) for r in con.execute(q % "'' AS detail", (date_str, sid, mtype))]
+        finally:
+            con.close()
+    for r in rows:
+        o = message_outcome(r.get("status"), r.get("detail"))
+        if o == "sent":
+            return "sent"
+        if o == "unsure":
+            best = "unsure"
+    return best
+
+
+def daily_sent_map(date_str, mtype) -> dict:
+    """
+    ‏{رقم الطالب: 'sent'|'unsure'} لمن سبقت له رسالة هذا النوع في هذا اليوم —
+    من أي مسار، ومنه إشعار جهاز البصمة. تعرضه قوائم الإرسال في الويب.
+    """
+    out = {}
+    for r in query_today_messages(date_str):
+        if (r.get("message_type") or "absence") != mtype:
+            continue
+        sid = str(r.get("student_id") or "")
+        o = message_outcome(r.get("status"), r.get("detail"))
+        if not sid or o not in ("sent", "unsure"):
+            continue
+        if out.get(sid) != "sent":
+            out[sid] = o
+    with _daily_lock:
+        for (d, sid, t), o in _daily_done.items():
+            if d == str(date_str) and t == mtype and out.get(sid) != "sent":
+                out[sid] = o
+    return out
+
+
+def claim_daily_message(date_str, student_id, mtype) -> str:
+    """
+    يحجز رسالة اليوم لهذا الطالب والنوع قبل إرسالها.
+    '' ⇒ أرسِل، ثم استدعِ release_daily_message بعد تسجيل النتيجة.
+    وإلا سبب التخطّي (مفتاحٌ في DAILY_SKIP_TEXT): 'sent' · 'unsure' · 'inflight'.
+    الأنواع خارج DAILY_ONCE_TYPES لا تُحجز.
+    """
+    if mtype not in DAILY_ONCE_TYPES:
+        return ""
+    key = (str(date_str), str(student_id), mtype)
+    with _daily_lock:
+        if key in _daily_inflight:
+            return "inflight"
+        _daily_inflight.add(key)
+    try:
+        prior = _prior_daily_outcome(*key)
+    except Exception as e:
+        print(f"[DAILY-ONCE] تعذّر فحص سجلّ الرسائل: {e}")
+        prior = _daily_done.get(key, "")
+    if prior:
+        with _daily_lock:
+            _daily_inflight.discard(key)
+    return prior
+
+
+def release_daily_message(date_str, student_id, mtype, outcome=""):
+    """يفكّ الحجز بعد تسجيل النتيجة، ويحفظ 'sent'/'unsure' احتياطاً إن تعذّر التسجيل."""
+    key = (str(date_str), str(student_id), mtype)
+    with _daily_lock:
+        _daily_inflight.discard(key)
+        if outcome in ("sent", "unsure") and _daily_done.get(key) != "sent":
+            if len(_daily_done) > 20000:          # أيامٌ مضت لا حاجة لها
+                for k in [k for k in _daily_done if k[0] != key[0]]:
+                    del _daily_done[k]
+            _daily_done[key] = outcome
+
+
+def send_daily_message(mtype, date_str, sid, sname, cid, cname, phone, text,
+                       student_data=None, humanize=False, template_used=None,
+                       source=None, pace=None):
+    """
+    يرسل رسالة غياب أو تأخر لوليّ الأمر مرةً واحدة في اليوم، ويسجّلها.
+    يُرجع (النتيجة، التفصيل): 'sent' · 'failed' · 'unsure' · 'skip:<سبب>'.
+    `source` لعدّاد الواتساب (افتراضاً النوع نفسه): المكدّس يرى هذه الدالة
+    المشتركة وحدها فيعدّ كل ما يمرّ بها «other».
+    `pace` يُستدعى بعد الحجز وقبل الإرسال — التباعد بين الرسائل الفعلية وحدها،
+    فدفعةٌ أُعيدت لمن وصلتهم لا تنتظر ١٦ ثانية عن كل طالبٍ متخطّى.
+    """
+    why = claim_daily_message(date_str, sid, mtype)
+    if why:
+        return "skip:" + why, DAILY_SKIP_TEXT.get(why, why)
+    outcome = "failed"
+    try:
+        if pace:
+            pace()
+        try:
+            import contextlib
+            try:
+                import wa_limits
+                ctx = wa_limits.as_source(source or mtype)
+            except Exception:         # wa_limits أقدم (تحديثٌ لم يكتمل) — بلا إسناد
+                ctx = contextlib.nullcontext()
+            with ctx:
+                ok, detail = send_whatsapp_message(phone, text, student_data=student_data,
+                                                   humanize=humanize)
+        except Exception as e:
+            ok, detail = False, "حدث خطأ غير متوقع أثناء الإرسال: %s" % e
+        outcome = "sent" if ok else message_outcome("Failed", detail)
+        if outcome == "legacy":
+            outcome = "failed"
+        try:
+            log_message_status(date_str, sid, sname, cid, cname, phone,
+                               "Success" if ok else "Failed", template_used or mtype,
+                               mtype, detail="" if ok else str(detail or "")[:300])
+        except Exception as e:
+            print(f"[MSG-LOG] تعذّر تسجيل الرسالة: {e}")
+        return outcome, detail
+    finally:
+        release_daily_message(date_str, sid, mtype, outcome)
+
+
 def query_messages_report(date_from: str = None, date_to: str = None,
                           message_type: str = "", class_id: str = "",
                           status: str = "", limit: int = 1000):
@@ -148,8 +330,13 @@ def query_messages_report(date_from: str = None, date_to: str = None,
     rows = [dict(r) for r in cur.execute(" ".join(sql), args).fetchall()]
     con.close()
 
+    # ‏«فشل: …» من المكتبي كان يُعدّ «وصلت» لأنه ليس «Failed» حرفياً، فظهرت
+    # محاولاتٌ فاشلة ناجحةً في التقرير. والنصوص القديمة غير المعروفة تبقى ناجحة.
+    for r in rows:
+        r["outcome"] = message_outcome(r.get("status"), r.get("detail"))
+
     def _ok(r):
-        return str(r.get("status") or "").strip().lower() not in ("failed", "fail", "error", "")
+        return r["outcome"] in ("sent", "legacy")
 
     if status == "success":
         rows = [r for r in rows if _ok(r)]
@@ -178,8 +365,7 @@ def query_messages_report(date_from: str = None, date_to: str = None,
 
 def _msg_ok(r) -> bool:
     """هل نجحت هذه الرسالة؟ (نسخة على مستوى الوحدة — `_ok` مُعشَّشة)"""
-    return str(r.get("status") or "").strip().lower() not in (
-        "failed", "fail", "error", "")
+    return message_outcome(r.get("status"), r.get("detail")) in ("sent", "legacy")
 
 
 # ── أرقام تحتاج تصحيحاً في نور ──────────────────────────────────────

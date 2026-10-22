@@ -1948,13 +1948,16 @@ def send_messages_html() -> str:
                         const studentLi = document.getElementById(`student-${result.student_id}`);
                         if (studentLi) {
                             const statusDiv = studentLi.querySelector('.status');
-                            statusDiv.textContent = result.success ? 'تم الإرسال' : 'فشل';
-                            statusDiv.className = `status ${result.success ? 'sent' : 'failed'}`;
+                            // المتخطّى سبقت له رسالة اليوم — يُعرض سببه لا «فشل»
+                            statusDiv.textContent = result.skipped ? result.message : (result.success ? 'تم الإرسال' : 'فشل');
+                            statusDiv.className = `status ${result.success || result.skipped ? 'sent' : 'failed'}`;
                         }
                     });
-                    const successCount = results.filter(r => r.success).length;
-                    const failedCount = results.length - successCount;
-                    statusLog.textContent = `اكتمل: نجح ${successCount}، فشل ${failedCount}.`;
+                    const skippedCount = results.filter(r => r.skipped).length;
+                    const successCount = results.filter(r => r.success && !r.skipped).length;
+                    const failedCount = results.length - successCount - skippedCount;
+                    statusLog.textContent = `اكتمل: نجح ${successCount}، فشل ${failedCount}` +
+                        (skippedCount ? `، وتُخطّي ${skippedCount} سبقت لهم رسالة اليوم.` : '.');
 
                 } catch (e) {
                     statusLog.textContent = 'حدث خطأ فادح أثناء الإرسال.';
@@ -2440,22 +2443,42 @@ async def send_bulk_messages_api(request: Request):
             results.append({"student_id": sid, "success": False, "message": "Student not found in today's absence list."})
             continue
 
-        success, message = send_absence_alert(
-            student_id=sid,
-            student_name=student_details["name"],
-            class_name=student_details["class_name"],
-            date_str=today
-        )
-        results.append({"student_id": sid, "success": success, "message": message})
-        
+        # رسالة غياب واحدة في اليوم لكل طالب — أياً كان مُرسِلها؛ انظر
+        # alerts_service.claim_daily_message
+        from alerts_service import (claim_daily_message, release_daily_message,
+                                    message_outcome, DAILY_SKIP_TEXT)
+        why = claim_daily_message(today, sid, "absence")
+        if why:
+            results.append({"student_id": sid, "success": why == "sent", "skipped": True,
+                            "message": DAILY_SKIP_TEXT.get(why, why)})
+            continue
+        outcome = "failed"
         try:
-            log_message_status(
-                date_str=today, student_id=sid, student_name=student_details["name"],
-                class_id=student_details.get("class_id", ""), class_name=student_details["class_name"],
-                phone=student_details.get("phone", ""), status=message, template_used=get_message_template()
+            success, message = send_absence_alert(
+                student_id=sid,
+                student_name=student_details["name"],
+                class_name=student_details["class_name"],
+                date_str=today
             )
-        except Exception as e:
-            print(f"Error logging message status for {sid}: {e}")
+            results.append({"student_id": sid, "success": success, "message": message})
+            outcome = "sent" if success else message_outcome("Failed", message)
+
+            try:
+                # Success/Failed والسبب في التفصيل — كان يُكتب نصّ النتيجة حالةً،
+                # فظهر كل فشلٍ «وصلت» في تقرير الرسائل
+                log_message_status(
+                    date_str=today, student_id=sid, student_name=student_details["name"],
+                    class_id=student_details.get("class_id", ""), class_name=student_details["class_name"],
+                    phone=student_details.get("phone", ""),
+                    status="Success" if success else "Failed",
+                    template_used=get_message_template(), message_type="absence",
+                    detail="" if success else str(message or "")[:300]
+                )
+            except Exception as e:
+                print(f"Error logging message status for {sid}: {e}")
+        finally:
+            release_daily_message(today, sid, "absence",
+                                  outcome if outcome != "legacy" else "failed")
 
     return JSONResponse(content=results)
 
