@@ -65,6 +65,23 @@ _SKIP_FILES = {
 }
 
 
+def _zip_prefix(names) -> str:
+    """
+    مجلدٌ يغلّف الحزمة كلها (أرشيف GitHub: DarbStu-Release-main/…) فيُنزع.
+
+    كان الفحص على أول خمسة أسماء، وحزمتنا تبدأ بعشرة ملفات في _vendor/xlrd/
+    — فنُزع «_vendor/» منها فكُتبت في xlrd/ بجذر التثبيت ولم يُنشأ _vendor
+    قط (منذ ١٥ سبتمبر). لو بدأت الحزمة بـ api/ لهبط كل كود اللوحة في الجذر
+    ولما تحدّثت أبداً، والتحديث يقول «نجح». فلا يُنزع إلا ما يغلّف **كل** الأسماء.
+    """
+    if not names:
+        return ""
+    top = names[0].split("/")[0]
+    if all(n.startswith(top + "/") or n == top + "/" for n in names):
+        return top + "/"
+    return ""
+
+
 def _get_installed_version() -> str:
     """
     يقرأ الإصدار الفعلي من version.json المحلي إن وُجد،
@@ -229,11 +246,7 @@ def _auto_update(latest, dl_url, win=None, status_lbl=None, btn=None):
         # ٣. استخراج الملفات من ZIP
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             names = zf.namelist()
-            prefix = ""
-            if names:
-                top = names[0].split("/")[0]
-                if all(n.startswith(top + "/") or n == top + "/" for n in names[:5]):
-                    prefix = top + "/"
+            prefix = _zip_prefix(names)
 
             updated = 0
             skipped = 0

@@ -81,6 +81,17 @@ DEFAULT_CONFIG = {
     # قائمة خوادم واتساب: [{"port": 3000}, {"port": 3001}, ...]
     # اتركها فارغة لاستخدام خادم واحد فقط (المنفذ 3000)
     "wa_servers": [],
+    # ─── مزوّد الواتساب: محلي · سحابي (Evolution API) · تلقائي ──────────
+    # local (الافتراضي): خادم Node على جهاز المدرسة كما كان حرفاً.
+    # evolution: الخادم السحابي على سيرفرنا. auto: المحلي أولاً، والسحابي حين
+    # يتعطّل المحلي أو يبلغ سقفه اليومي. انظر wa_evolution.py.
+    # المفتاح مفتاح جلسة المدرسة وحدها (darbstu-evo-add على السيرفر) — يبقى
+    # فارغاً هنا: هذه بذرة كل تنصيب، ومفتاحٌ فيها يُشحن إلى كل مدرسة.
+    "whatsapp_provider":       "local",
+    "evolution_server_url":    "https://wa-api.darbstu.com",
+    "evolution_api_key":       "",
+    "evolution_instance_name": "darbstu_main",
+    "evolution_webhook_token": "",
     # ─── وقت إرسال رابط التأخر المجدوَل ────────────────────────
     "tardiness_auto_send_enabled": True,   # تفعيل الإرسال التلقائي المجدوَل
     "tardiness_auto_send_time":    "07:00",# وقت الإرسال (HH:MM)
@@ -434,6 +445,17 @@ def set_reply_bot(on: bool, timeout: float = 3.0) -> bool:
     """
     import json as _j
     import urllib.request as _ur
+    # السحابي: لا خادم Node يحمل الحالة، فتُكتب في ملفه مباشرةً — الملف نفسه
+    # الذي يقرؤه server.js وبوت السحابي، فالتبديل بين المزوّدين لا يغيّرها.
+    try:
+        import wa_evolution
+        _prov = wa_evolution.provider()
+        if _prov != "local":
+            _wrote = wa_evolution.write_bot_config(enabled=bool(on))
+            if _prov == "evolution":
+                return _wrote
+    except Exception as e:
+        print(f"[BOTS] تعذّر حفظ حالة البوت السحابي: {e}")
     try:
         port = int(load_config().get("whatsapp_port", 3000) or 3000)
     except Exception:

@@ -57,6 +57,14 @@ def check_whatsapp_server_status(port=None) -> bool:
     بلا منفذ: منفذ هذه المرحلة من إعداداتها — و`wa_servers` الفارغة تعني
     3000 كما كان، فمدرسة المرحلة الواحدة لا يتغيّر سلوكها.
     """
+    # بلا منفذ صريح: يتبع مزوّد المدرسة. السحابي حالته من الخادم السحابي،
+    # والتلقائي جاهزٌ إن جهز أيٌّ منهما. ومنفذٌ صريح يعني المحلي كما كان.
+    if port is None:
+        _prov = _provider()
+        if _prov != "local":
+            _cloud = _cloud_ready()
+            if _prov == "evolution" or _cloud:
+                return _cloud
     if port is None:
         try:
             port = get_wa_servers()[0].get("port", 3000)
@@ -270,7 +278,120 @@ def maybe_recover_wa(port, detail) -> bool:
     return True
 
 
+# ─── مزوّد الواتساب: محلي · سحابي · تلقائي ─────────────────────────────
+# ‏`whatsapp_provider` في الإعداد. «local» — الافتراضي — يمرّ بالكود القائم
+# حرفاً (_send_local)، فمدرسةٌ لم تختر السحابي لا يتغيّر عليها شيء. والسحابي
+# في wa_evolution: جلسة لكل مدرسة بمفتاحها على https://wa-api.darbstu.com.
+#
+# التلقائي يحوّل إلى السحابي حين **يجزم** المحلي بأن شيئاً لم يخرج: الخادم
+# غير متصل أو متوقف أو جلسته معطوبة، أو بلغ سقفه اليومي. ولا يحوّل بعد مهلةٍ
+# أو خطأٍ غير متوقع — الرسالة ربما خرجت، والتحويل حينها هو التكرار نفسه.
+_FAILOVER_KINDS = ("unavailable", "blocked_cap")
+
+
+def _provider() -> str:
+    try:
+        import wa_evolution
+        return wa_evolution.provider()
+    except Exception:
+        return "local"      # وحدةٌ ناقصة أو معطوبة لا تمسّ الإرسال المحلي أبداً
+
+
+def _cloud_ready() -> bool:
+    try:
+        import wa_evolution
+        return wa_evolution.configured() and wa_evolution.state() == "open"
+    except Exception:
+        return False
+
+
 def send_whatsapp_message(phone: str, message_body: str, student_data: dict = None, humanize: bool = False) -> (bool, str):
+    prov = _provider()
+    if prov == "local":
+        ok, msg, _kind = _send_local(phone, message_body, student_data, humanize)
+        return ok, msg
+    if humanize:
+        message_body = humanize_message(message_body)
+    if prov == "evolution":
+        ok, msg, _kind = _send_cloud(phone, message_body, student_data)
+        return ok, msg
+    ok, msg, kind = _send_local(phone, message_body, student_data, False)
+    if ok or kind not in _FAILOVER_KINDS:
+        return ok, msg
+    print(f"[WA-AUTO] المحلي: {msg} — تحويل إلى السحابي")
+    ok2, msg2, _kind2 = _send_cloud(phone, message_body, student_data)
+    return (ok2, msg2) if ok2 else (False, f"{msg} — والسحابي: {msg2}")
+
+
+def _send_cloud(phone, message_body, student_data=None):
+    """الإرسال عبر الخادم السحابي — بالسقف اليومي نفسه، بدفترٍ مستقلّ لرقمه."""
+    try:
+        import wa_evolution as evo
+    except Exception as e:
+        return False, f"وحدة الإرسال السحابي غير متاحة ({e})", "unavailable"
+    num, err = evo.normalize_number(phone)
+    if not num:
+        print(f"[WHATSAPP-WARN] {err}")
+        return False, err, "invalid"
+    key = evo.ledger_key()
+    _consumed, _blocked, _aud = _consume(key, num)
+    if _blocked:
+        return False, _blocked, "blocked_cap"
+    print(f"[WHATSAPP-CLOUD] محاولة إرسال إلى: {num}")
+    ok, msg, kind = evo.send_text(num, message_body)
+    if ok:
+        _mark_sent(_aud, num)
+        try:
+            evo.record_pending(num, student_data)       # بوت الأعذار والاستئذان
+        except Exception as e:
+            print(f"[EVO-BOT] تعذّر تسجيل الطلب المعلّق: {e}")
+    elif kind != "unsure":
+        _refund(key, _consumed, _aud, num)              # لم يخرج شيء — تُردّ الخانة
+    print(f"[WHATSAPP-CLOUD] {'✅' if ok else '❌'} {msg}")
+    return ok, msg, kind
+
+
+def send_whatsapp_pdf(phone: str, pdf_bytes: bytes, filename: str, caption: str = "") -> tuple:
+    """يرسل ملف PDF عبر المزوّد المختار (محلي /send-document · سحابي /message/sendMedia)."""
+    prov = _provider()
+    if prov == "local":
+        ok, msg, _kind = _send_pdf_local(phone, pdf_bytes, filename, caption)
+        return ok, msg
+    if prov == "evolution":
+        ok, msg, _kind = _send_pdf_cloud(phone, pdf_bytes, filename, caption)
+        return ok, msg
+    ok, msg, kind = _send_pdf_local(phone, pdf_bytes, filename, caption)
+    if ok or kind not in _FAILOVER_KINDS:
+        return ok, msg
+    print(f"[WA-AUTO] المحلي (ملف): {msg} — تحويل إلى السحابي")
+    ok2, msg2, _kind2 = _send_pdf_cloud(phone, pdf_bytes, filename, caption)
+    return (ok2, msg2) if ok2 else (False, f"{msg} — والسحابي: {msg2}")
+
+
+def _send_pdf_cloud(phone, pdf_bytes, filename, caption=""):
+    try:
+        import wa_evolution as evo
+    except Exception as e:
+        return False, f"وحدة الإرسال السحابي غير متاحة ({e})", "unavailable"
+    num, err = evo.normalize_number(phone)
+    if not num:
+        return False, err or "رقم الجوال فارغ", "invalid"
+    key = evo.ledger_key()
+    _consumed, _blocked, _aud = _consume(key, num)
+    if _blocked:
+        return False, _blocked, "blocked_cap"
+    b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+    ok, msg, kind = evo.send_document(num, b64, filename, caption)
+    if ok:
+        _mark_sent(_aud, num)
+        return True, "تم ارسال PDF بنجاح (سحابي)", "sent"
+    if kind != "unsure":
+        _refund(key, _consumed, _aud, num)
+    return False, msg, kind
+
+
+def _send_local(phone: str, message_body: str, student_data: dict = None, humanize: bool = False):
+    """الإرسال عبر خادم Node المحلي — الكود القائم حرفاً، ويُرجع معه نوع النتيجة."""
     if humanize:
         message_body = humanize_message(message_body)
     
@@ -282,14 +403,14 @@ def send_whatsapp_message(phone: str, message_body: str, student_data: dict = No
     if not phone:
         msg = "رقم الجوال غير موجود أو فارغ."
         print(f"[WHATSAPP-WARN] {msg}")
-        return False, msg
+        return False, msg, "invalid"
 
     # تنظيف رقم الهاتف
     cleaned_phone = ''.join(filter(str.isdigit, str(phone)))
     if not cleaned_phone:
         msg = f"رقم الجوال '{phone}' غير صالح."
         print(f"[WHATSAPP-WARN] {msg}")
-        return False, msg
+        return False, msg, "invalid"
 
     # تحويل التنسيق المحلي إلى دولي — **قبل** حجز خانة السقف. رقمٌ مشوّه
     # لا يبلغ واتساب أصلاً، وكان يُحسب من رصيد اليوم فيأكل خانةً بلا رسالة.
@@ -303,13 +424,13 @@ def send_whatsapp_message(phone: str, message_body: str, student_data: dict = No
     else:
         msg = f"تنسيق رقم الجوال غير مدعوم: {cleaned_phone}"
         print(f"[WHATSAPP-WARN] {msg}")
-        return False, msg
+        return False, msg, "invalid"
 
     # السقف اليومي والإحماء — يُفحص قبل الإرسال لا بعده. تجاوز السقف
     # يعني تجميد ٢٤ ساعة، ورسالة واحدة زائدة تُوقف كل رسائل الغد.
     _consumed, _blocked, _aud = _consume(_port, cleaned_phone)
     if _blocked:
-        return False, _blocked
+        return False, _blocked, "blocked_cap"
 
     try:
         print(f"[WHATSAPP] محاولة إرسال إلى: {cleaned_phone}")
@@ -331,12 +452,12 @@ def send_whatsapp_message(phone: str, message_body: str, student_data: dict = No
             if response_data.get('status') == 'success':
                 print(f"[WHATSAPP] ✅ تم الإرسال بنجاح إلى {cleaned_phone}")
                 _mark_sent(_aud, cleaned_phone)
-                return True, "تم الإرسال بنجاح"
+                return True, "تم الإرسال بنجاح", "sent"
             else:
                 error_msg = response_data.get('message', response.text)
                 print(f"[WHATSAPP] ❌ فشل الإرسال: {error_msg}")
                 _refund(_port, _consumed, _aud, cleaned_phone)
-                return False, f"فشل: {error_msg}"
+                return False, f"فشل: {error_msg}", "failed"
         elif response.status_code == 503:
             # أثناء إعادة التشغيل الجاري «غير متصل» كاذبة، وتدفع إلى مسح QR
             # لا داعي له — فتُقال الحقيقة: الخادم يعود بعد دقيقة.
@@ -346,7 +467,7 @@ def send_whatsapp_message(phone: str, message_body: str, student_data: dict = No
                 error_msg = "الواتساب غير متصل — امسح QR Code أولاً"
             print(f"[WHATSAPP] ❌ {error_msg}")
             _refund(_port, _consumed, _aud, cleaned_phone)
-            return False, error_msg
+            return False, error_msg, "unavailable"
         else:
             # أظهر رسالة الخطأ التفصيلية من الخادم
             try:
@@ -361,27 +482,28 @@ def send_whatsapp_message(phone: str, message_body: str, student_data: dict = No
             if maybe_recover_wa(_port, err_detail):
                 error_msg = ("الواتساب متصل لكن جلسته الداخلية تعطّلت — أُعيد "
                              "تشغيل الخادم تلقائياً، أعد الإرسال بعد دقيقتين")
-            return False, error_msg
+            return False, error_msg, ("unavailable" if is_injection_failure(err_detail) else "failed")
 
     except requests.exceptions.ConnectionError:
         error_msg = "فشل الاتصال بخادم الواتساب. تأكد من تشغيل الخادم."
         print(f"[WHATSAPP] ❌ {error_msg}")
         _refund(_port, _consumed, _aud, cleaned_phone)
-        return False, error_msg
+        return False, error_msg, "unavailable"
 
     except requests.exceptions.Timeout:
         # لا ردّ هنا عمداً: الطلب قد يكون بلغ واتساب وتمّ. التقدير الزائد
         # يكلّف خانة، والتقدير الناقص يكلّف تجميد الرقم ٢٤ ساعة.
         error_msg = "انتهت مهلة الاتصال بخادم الواتساب."
         print(f"[WHATSAPP] ❌ {error_msg}")
-        return False, error_msg
+        return False, error_msg, "unsure"
 
     except Exception as e:
         error_msg = f"حدث خطأ غير متوقع: {e}"
         print(f"[WHATSAPP] ❌ {error_msg}")
-        return False, error_msg
+        return False, error_msg, "unsure"
 
-def send_whatsapp_pdf(phone: str, pdf_bytes: bytes, filename: str, caption: str = "") -> tuple:
+def _send_pdf_local(phone: str, pdf_bytes: bytes, filename: str, caption: str = ""):
+    """إرسال ملف عبر خادم Node المحلي — الكود القائم حرفاً، ويُرجع معه نوع النتيجة."""
     """
     يرسل ملف PDF عبر واتساب - endpoint: /send-document
     """
@@ -390,7 +512,7 @@ def send_whatsapp_pdf(phone: str, pdf_bytes: bytes, filename: str, caption: str 
     API_URL = "http://127.0.0.1:{}/send-document".format(_port)
 
     if not phone:
-        return False, "رقم الجوال فارغ"
+        return False, "رقم الجوال فارغ", "invalid"
 
     cleaned_phone = "".join(filter(str.isdigit, str(phone)))
     if len(cleaned_phone) == 10 and cleaned_phone.startswith("05"):
@@ -398,13 +520,13 @@ def send_whatsapp_pdf(phone: str, pdf_bytes: bytes, filename: str, caption: str 
     elif len(cleaned_phone) == 9 and cleaned_phone.startswith("5"):
         cleaned_phone = "966" + cleaned_phone
     elif not (len(cleaned_phone) == 12 and cleaned_phone.startswith("966")):
-        return False, f"تنسيق رقم الجوال غير مدعوم: {cleaned_phone}"
+        return False, f"تنسيق رقم الجوال غير مدعوم: {cleaned_phone}", "invalid"
 
     # الملف رسالةُ واتساب كاملة في نظر كاشف الإزعاج، وكان لا يُحسب من
     # السقف إطلاقاً — فكان حجم اليوم الحقيقي يتجاوز الرقم المعروض.
     _consumed, _blocked, _aud = _consume(_port, cleaned_phone)
     if _blocked:
-        return False, _blocked
+        return False, _blocked, "blocked_cap"
 
     try:
         b64_data = base64.b64encode(pdf_bytes).decode("utf-8")
@@ -420,22 +542,22 @@ def send_whatsapp_pdf(phone: str, pdf_bytes: bytes, filename: str, caption: str 
             rd = response.json()
             if rd.get("status") == "success":
                 _mark_sent(_aud, cleaned_phone)
-                return True, "تم ارسال PDF بنجاح"
+                return True, "تم ارسال PDF بنجاح", "sent"
             _refund(_port, _consumed, _aud, cleaned_phone)
-            return False, rd.get("message", response.text)
+            return False, rd.get("message", response.text), "failed"
         _refund(_port, _consumed, _aud, cleaned_phone)
         if maybe_recover_wa(_port, response.text):
             return False, ("الواتساب متصل لكن جلسته الداخلية تعطّلت — أُعيد "
-                           "تشغيل الخادم تلقائياً، أعد الإرسال بعد دقيقتين")
-        return False, f"HTTP {response.status_code}: {response.text}"
+                           "تشغيل الخادم تلقائياً، أعد الإرسال بعد دقيقتين"), "unavailable"
+        return False, f"HTTP {response.status_code}: {response.text}", ("unavailable" if response.status_code == 503 else "failed")
     except requests.exceptions.ConnectionError:
         _refund(_port, _consumed, _aud, cleaned_phone)
-        return False, "فشل الاتصال بخادم الواتساب"
+        return False, "فشل الاتصال بخادم الواتساب", "unavailable"
     except requests.exceptions.Timeout:
         # لا ردّ — الملف قد يكون في الطريق (انظر الشرح في دالة الرسالة)
-        return False, "انتهت مهلة إرسال الملف"
+        return False, "انتهت مهلة إرسال الملف", "unsure"
     except Exception as e:
-        return False, f"خطأ: {e}"
+        return False, f"خطأ: {e}", "unsure"
 
 # ─── إصلاح ذاتي لتثبيت نسخة واتساب-ويب ───────────────────────────────
 # ‏`server.js` يطلب عند كل تشغيل ملفَ نسخةٍ من مستودع طرفٍ ثالث:

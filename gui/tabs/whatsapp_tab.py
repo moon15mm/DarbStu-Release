@@ -89,6 +89,13 @@ class WhatsappTabMixin:
                     _ur.urlopen(req, timeout=3)
                 except Exception:
                     pass
+                # السحابي: لا خادم Node يحفظ الحالة — تُكتب في الملف الذي يقرؤه بوته
+                try:
+                    import wa_evolution as _evo
+                    if _evo.provider() != "local":
+                        _evo.write_bot_config(enabled=bool(enabled))
+                except Exception:
+                    pass
                 status = "مفعّل ✅" if enabled else "موقوف ⏸"
                 color  = "#166634" if enabled else "#92400e"
                 self.root.after(0, lambda: self._wa_status_text.config(
@@ -119,6 +126,19 @@ class WhatsappTabMixin:
         def _load_keywords():
             def _do():
                 try:
+                    import wa_evolution as _evo
+                    if _evo.provider() == "evolution":
+                        # لا خادم محلي في السحابي — الكلمات والحالة من ملف البوت
+                        _bc = _evo.bot_config()
+                        def _apply_cloud():
+                            self._kw_text.delete("1.0", "end")
+                            self._kw_text.insert("1.0", "، ".join(_bc["keywords"]))
+                            self._bot_toggle_var.set(_bc["bot_enabled"])
+                        self.root.after(0, _apply_cloud)
+                        return
+                except Exception:
+                    pass
+                try:
                     import urllib.request as _ur, json as _j
                     r   = _ur.urlopen("http://localhost:3000/bot-config", timeout=1)
                     cfg = _j.loads(r.read())
@@ -139,20 +159,38 @@ class WhatsappTabMixin:
             if not kws:
                 messagebox.showerror("خطأ", "لا توجد كلمات للحفظ!")
                 return
+            try:
+                import wa_evolution as _evo
+                if _evo.provider() != "local":
+                    # السحابي: الكلمات في ملف البوت الذي يقرؤه بوته (والمحلي عند تشغيله)
+                    if _evo.write_bot_config(keywords=kws):
+                        messagebox.showinfo("تم", f"تم حفظ {len(kws)} كلمة مفتاحية بنجاح.")
+                    else:
+                        messagebox.showerror("خطأ", "تعذّر حفظ الكلمات في ملف البوت.")
+                    if _evo.provider() == "evolution":
+                        return
+            except Exception:
+                pass
             def _do():
                 try:
                     import urllib.request as _ur, json as _j
                     data = json.dumps({"keywords": kws}, ensure_ascii=False).encode("utf-8")
-                    req  = _ur.Request("http://localhost:3000/bot-keywords",
+                    # ‏‎/bot-config‎ لا ‎/bot-keywords‎: الأخير لا وجود له في server.js، فكان
+                    # الحفظ يفشل دائماً. وserver.js يردّ ‎{status:'ok'}‎ لا ‎{ok:true}‎.
+                    req  = _ur.Request("http://localhost:3000/bot-config",
                                        data=data,
                                        headers={"Content-Type": "application/json"},
                                        method="POST")
                     resp   = _ur.urlopen(req, timeout=3)
                     result = _j.loads(resp.read())
-                    if result.get("ok"):
+                    if result.get("ok") or result.get("status") == "ok":
                         self.root.after(0, lambda: messagebox.showinfo(
                             "تم", f"تم حفظ {len(kws)} كلمة مفتاحية بنجاح."))
                         _load_keywords()
+                    else:
+                        _why = str(result.get("message") or result)
+                        self.root.after(0, lambda: messagebox.showerror(
+                            "خطأ", "تعذّر حفظ الكلمات.\n" + _why))
                 except Exception as e:
                     self.root.after(0, lambda: messagebox.showerror(
                         "خطأ", "تعذّر حفظ الكلمات.\nتأكد من تشغيل الخادم أولاً.\n" + str(e)))
@@ -163,7 +201,45 @@ class WhatsappTabMixin:
 
     def check_whatsapp_status_ui(self):
         """وظيفة مساعدة لفحص حالة الواتساب وعرض رسالة للمستخدم (تُستخدم من تبويبات مختلفة)."""
+        def _cloud_msg():
+            # السحابي: الحالة من الخادم السحابي لا من المنفذ 3000 (لا خادم محلي فيه)
+            try:
+                import wa_evolution as _evo
+                if not _evo.configured():
+                    return "warn", "☁️ الوضع السحابي مختار، لكن إعداده ناقص.\nأكمل الرابط واسم الجلسة والمفتاح في تبويب 'إدارة الواتساب'."
+                if _evo.state(fresh=True) == "open":
+                    return "ok", "✅ الواتساب السحابي متصل وجاهز."
+                return "warn", "⏳ الجلسة السحابية غير مربوطة.\nامسح رمز الـ QR من تبويب 'إدارة الواتساب'."
+            except Exception as e:
+                return "err", "🔴 تعذّر بلوغ الخادم السحابي.\n" + str(e)
+
+        def _show(kind, msg):
+            box = {"ok": messagebox.showinfo, "warn": messagebox.showwarning}.get(kind, messagebox.showerror)
+            self.root.after(0, lambda: box("حالة الواتساب", msg))
+
+        try:
+            import wa_evolution as _evo
+            _prov = _evo.provider()
+        except Exception:
+            _prov = "local"
+        if _prov == "evolution":
+            threading.Thread(target=lambda: _show(*_cloud_msg()), daemon=True).start()
+            return
+
         def _do():
+            if _prov == "auto":
+                # التلقائي: يكفي أن يجهز أحدهما — المحلي أولاً كما يرسل
+                try:
+                    import urllib.request, json as _j
+                    r = urllib.request.urlopen("http://localhost:3000/status", timeout=3)
+                    if _j.loads(r.read()).get("ready"):
+                        _show("ok", "✅ الواتساب المحلي متصل وجاهز (والسحابي احتياطٌ له).")
+                        return
+                except Exception:
+                    pass
+                kind, msg = _cloud_msg()
+                _show(kind, "المحلي غير جاهز — " + msg if kind == "ok" else msg)
+                return
             try:
                 import urllib.request, json as _j
                 # فحص الحالة على المنفذ الافتراضي 3000
@@ -182,6 +258,221 @@ class WhatsappTabMixin:
                 self.root.after(0, lambda: messagebox.showerror("حالة الواتساب", msg))
         
         threading.Thread(target=_do, daemon=True).start()
+
+    # ═══════════════════════════════════════════════════════════════
+    # مزوّد الواتساب: محلي · سحابي (Evolution API) · تلقائي
+    # ═══════════════════════════════════════════════════════════════
+    # المحلي يبقى كما كان حرفاً. السحابي على خادم درب الطلاب بجلسةٍ ومفتاحٍ لهذه
+    # المدرسة وحدها (darbstu-evo-add). والتلقائي يحوّل إلى السحابي حين يجزم
+    # المحلي بأن شيئاً لم يخرج. والبطاقة لا تتصل بالشبكة ما دام «المحلي» مختاراً.
+    _WA_PROV_LABELS = {
+        "local":     "💻  الخادم المحلي (جهاز المدرسة)",
+        "evolution": "☁️  الخادم السحابي (Evolution API)",
+        "auto":      "🔄  الوضع التلقائي (محلي مع تحويل سحابي للطوارئ)",
+    }
+
+    def _build_wa_provider_card(self, inner, _card):
+        try:
+            import wa_evolution as _evo
+        except Exception as e:
+            print(f"[WA-GUI] وحدة الإرسال السحابي غير متاحة: {e}")
+            return
+        card = _card(inner, "☁️  مزوّد الواتساب", "#0f766e")
+        tk.Label(card,
+                 text="المحلي يرسل من جهاز المدرسة كما كان. السحابي يرسل من خادم درب "
+                      "الطلاب برقمٍ تربطه المدرسة مرة واحدة بمسح رمز. والتلقائي يرسل "
+                      "محلياً، ويحوّل إلى السحابي إن توقف المحلي أو بلغ سقفه اليومي.",
+                 font=("Tahoma", 9), bg="white", fg="#6b7280",
+                 justify="right", wraplength=560).pack(anchor="e", padx=10, pady=(6, 4))
+
+        cfg0 = load_config()
+        s0 = _evo.settings(cfg0)
+        prov_var = tk.StringVar(value=_evo.provider(cfg0))
+        url_var = tk.StringVar(value=s0["url"])
+        inst_var = tk.StringVar(value=s0["instance"])
+        key_var = tk.StringVar(value=s0["key"])
+        self._wa_prov_vars = (prov_var, url_var, inst_var, key_var)
+
+        for val in ("local", "evolution", "auto"):
+            tk.Radiobutton(card, text=self._WA_PROV_LABELS[val], value=val,
+                           variable=prov_var, font=("Tahoma", 10), bg="white",
+                           activebackground="white", anchor="e", justify="right",
+                           command=lambda: _apply_enabled()).pack(fill="x", padx=14)
+
+        fields = tk.Frame(card, bg="white")
+        fields.pack(fill="x", padx=10, pady=(6, 2))
+        entries = []
+
+        def _row(label, var, show=""):
+            r = tk.Frame(fields, bg="white")
+            r.pack(fill="x", pady=2)
+            tk.Label(r, text=label, font=("Tahoma", 9), bg="white",
+                     width=16, anchor="e").pack(side="right")
+            e = ttk.Entry(r, textvariable=var, show=show, justify="left")
+            e.pack(side="right", fill="x", expand=True, padx=(0, 6))
+            entries.append(e)
+
+        _row("رابط الخادم السحابي:", url_var)
+        _row("اسم الجلسة:", inst_var)
+        _row("مفتاح الجلسة:", key_var, show="•")
+
+        status_lbl = tk.Label(card, text="", font=("Tahoma", 10), bg="white",
+                              fg="#555555", justify="right", wraplength=560)
+        status_lbl.pack(anchor="e", padx=10, pady=(4, 2))
+        self._evo_status_lbl = status_lbl
+
+        btns = tk.Frame(card, bg="white")
+        btns.pack(fill="x", padx=10, pady=(2, 6))
+
+        qr_box = tk.Frame(card, bg="#f8fafc", bd=1, relief="sunken")
+        qr_lbl = tk.Label(qr_box, text="", font=("Tahoma", 9),
+                          bg="#f8fafc", fg="#64748b", pady=12)
+        qr_lbl.pack(expand=True)
+        self._evo_qr_img = None          # مرجعٌ يمنع حذف الصورة من الذاكرة
+        self._evo_qr_lbl = qr_lbl
+        poll = {"busy": False, "qr_at": 0.0}
+
+        def _status(text, color="#555555"):
+            self.root.after(0, lambda: status_lbl.config(text=text, fg=color))
+
+        def _apply_enabled():
+            cloud = prov_var.get() != "local"
+            for e in entries:
+                e.config(state="normal" if cloud else "disabled")
+            for b in cloud_btns:
+                b.config(state="normal" if cloud else "disabled")
+            if cloud:
+                qr_box.pack(fill="x", padx=10, pady=(2, 10))
+            else:
+                qr_box.pack_forget()
+
+        def _show_qr_b64(b64):
+            try:
+                raw = base64.b64decode(b64.split(",", 1)[-1])
+                img = Image.open(io.BytesIO(raw)).convert("RGB")
+                img = img.resize((230, 230), Image.Resampling.LANCZOS)
+                tk_img = ImageTk.PhotoImage(img)
+                qr_lbl.config(image=tk_img, text="")
+                self._evo_qr_img = tk_img
+            except Exception as e:
+                qr_lbl.config(image="", text="تعذّر عرض الرمز: %s" % e)
+
+        def _render(res):
+            """يعرض نتيجة fetch_qr أو الحالة — في خيط الواجهة."""
+            if res.get("state") == "open":
+                self._evo_qr_img = None
+                qr_lbl.config(image="", text="✅ الجلسة السحابية متصلة", fg="#059669")
+                status_lbl.config(text="✅ الواتساب السحابي متصل وجاهز", fg="#166534")
+            elif res.get("base64"):
+                _show_qr_b64(res["base64"])
+                status_lbl.config(text="📱 " + res.get("msg", ""), fg="#92400e")
+            else:
+                qr_lbl.config(image="", text=res.get("msg", ""), fg="#991b1b")
+                status_lbl.config(text="🔴 " + res.get("msg", ""), fg="#991b1b")
+
+        def _refresh(force_qr=False):
+            if poll["busy"]:
+                return
+            poll["busy"] = True
+
+            def _do():
+                try:
+                    st = _evo.state(fresh=True)
+                    poll["open"] = (st == "open")
+                    if st == "open":
+                        res = {"state": "open"}
+                    elif force_qr or time.time() - poll["qr_at"] > 18:
+                        poll["qr_at"] = time.time()
+                        res = _evo.fetch_qr()
+                    else:
+                        res = None
+                    if res is not None:
+                        self.root.after(0, lambda: _render(res))
+                    elif st is None:
+                        _status("🔴 تعذّر بلوغ الخادم السحابي — تحقق من الرابط والإنترنت",
+                                "#991b1b")
+                finally:
+                    poll["busy"] = False
+            threading.Thread(target=_do, daemon=True).start()
+
+        def _save():
+            prov = prov_var.get()
+            url = url_var.get().strip().rstrip("/")
+            inst = inst_var.get().strip()
+            key = key_var.get().strip()
+            if prov != "local" and not (url and inst and key):
+                messagebox.showerror(
+                    "إعداد ناقص",
+                    "السحابي والتلقائي يحتاجان رابط الخادم واسم الجلسة ومفتاحها.\n"
+                    "تجدها في بيانات تجهيز المدرسة للواتساب السحابي.")
+                return
+            if prov != "local" and not url.startswith("https://") \
+                    and not url.startswith(("http://127.", "http://localhost")):
+                if not messagebox.askyesno(
+                        "رابط غير مشفّر",
+                        "الرابط ليس https — سيعبر مفتاح الجلسة الإنترنت مكشوفاً.\nمتابعة؟"):
+                    return
+            cfg = load_config()
+            cfg.update({"whatsapp_provider": prov, "evolution_server_url": url,
+                        "evolution_instance_name": inst, "evolution_api_key": key})
+            save_config(cfg)
+            invalidate_config_cache()
+            _apply_enabled()
+            if prov == "local":
+                _status("✅ حُفظ: " + self._WA_PROV_LABELS[prov].strip(), "#166534")
+                return
+            _status("⏳ حُفظ — جارٍ ضبط الاستقبال وفحص الجلسة السحابية...", "#92400e")
+
+            def _after():
+                okw, msgw = _evo.ensure_webhook()
+                if not okw:
+                    _status("⚠️ " + msgw, "#92400e")
+                _refresh(force_qr=True)
+            threading.Thread(target=_after, daemon=True).start()
+
+        def _logout():
+            if not messagebox.askyesno(
+                    "فصل الجلسة السحابية",
+                    "سيُفصل رقم الواتساب عن الخادم السحابي ويلزم مسح رمز جديد.\nمتابعة؟"):
+                return
+            def _do():
+                ok = _evo.logout()
+                _status("✅ فُصلت الجلسة — امسح الرمز الجديد" if ok
+                        else "🔴 تعذّر فصل الجلسة", "#92400e" if ok else "#991b1b")
+                _refresh(force_qr=True)
+            threading.Thread(target=_do, daemon=True).start()
+
+        tk.Button(btns, text="💾  حفظ المزوّد", bg="#0f766e", fg="white",
+                  font=("Tahoma", 10, "bold"), relief="flat", cursor="hand2",
+                  padx=14, pady=6, command=_save).pack(side="right", padx=(0, 6))
+        cloud_btns = [
+            tk.Button(btns, text="🔗  عرض رمز الربط", bg="#115e59", fg="white",
+                      font=("Tahoma", 10), relief="flat", cursor="hand2",
+                      padx=12, pady=6, command=lambda: _refresh(force_qr=True)),
+            tk.Button(btns, text="🔍  فحص الاتصال السحابي", bg="#134e4a", fg="white",
+                      font=("Tahoma", 10), relief="flat", cursor="hand2",
+                      padx=12, pady=6, command=lambda: _refresh(force_qr=False)),
+            tk.Button(btns, text="🚪  فصل الجلسة", bg="#f3f4f6", fg="#991b1b",
+                      font=("Tahoma", 10), relief="flat", cursor="hand2",
+                      padx=12, pady=6, command=_logout),
+        ]
+        for b in cloud_btns:
+            b.pack(side="right", padx=(0, 4))
+        self._evo_save = _save           # للاختبار
+        self._evo_refresh = _refresh
+
+        def _poll():
+            # كل ٦ ثوانٍ أثناء انتظار المسح، وكل دقيقة بعد الاتصال — لا حِمل بلا داعٍ
+            if not self.whatsapp_manager_frame.winfo_exists():
+                return
+            if prov_var.get() != "local" and _evo.provider() != "local":
+                _refresh()
+            self.root.after(60000 if poll.get("open") else 6000, _poll)
+
+        _apply_enabled()
+        if prov_var.get() != "local":
+            _status("الوضع: " + self._WA_PROV_LABELS[prov_var.get()].strip(), "#555555")
+        self.root.after(1500, _poll)
 
     # ═══════════════════════════════════════════════════════════════
     # تبويب إدارة الواتساب
@@ -306,6 +597,9 @@ class WhatsappTabMixin:
         self._wm_master_on.pack(side="right")
 
         self._wm_refresh_master = _refresh_master
+
+        # ── بطاقة: مزوّد الواتساب — محلي · سحابي · تلقائي ───────────────
+        self._build_wa_provider_card(inner, _card)
 
         # ── بطاقة 1: خادم الواتساب ──────────────────────────────
         srv_card = _card(inner, "🖥️  خادم الواتساب", "#1565C0")
@@ -526,6 +820,13 @@ class WhatsappTabMixin:
                     _ur.urlopen(req, timeout=3)
                 except Exception:
                     pass
+                # السحابي لا خادم Node فيه يحفظ الحالة — تُكتب في الملف الذي يقرؤه بوته
+                try:
+                    import wa_evolution as _evo
+                    if _evo.provider() != "local":
+                        _evo.write_bot_config(enabled=bool(enabled))
+                except Exception:
+                    pass
                 def _apply():
                     if enabled:
                         self._wm_exc_lbl.config(text="✅  البوت مفعّل", fg="#166534")
@@ -562,6 +863,15 @@ class WhatsappTabMixin:
             _set_permission_bot(cfg.get("permission_bot_enabled", True))
             # جلب حالة بوت الأعذار في خيط خلفي
             def _fetch_excuse():
+                try:
+                    import wa_evolution as _evo
+                    if _evo.provider() == "evolution":
+                        # لا خادم محلي في السحابي — الحالة من ملفها الذي يقرؤه البوت
+                        _on = _evo.bot_config()["bot_enabled"]
+                        self.root.after(0, lambda: _set_excuse_bot(_on))
+                        return
+                except Exception:
+                    pass
                 try:
                     import urllib.request as _ur, json as _j
                     r = _ur.urlopen("http://localhost:3000/bot-config", timeout=1)

@@ -11208,12 +11208,23 @@ function deleteHolidayEntry(id){if(!confirm('حذف هذه الإجازة؟'))re
 # APIs إضافية للواجهة الجديدة
 # ═══════════════════════════════════════════════════════════════
 
+# أسرارٌ لا تُعاد في /web/api/config: كان المسار يعيد الإعداد كاملاً لأي مستخدم
+# داخل — والمعلّم منهم — وفيه مفتاح المدير ومفتاح نسخ تلجرام ومفتاح جلسة
+# الواتساب السحابية. الصفحة لا تقرأ أياً منها (تقرأ الاسم والقوالب والأوقات)،
+# و`save-config` يحدّث المفاتيح المُرسَلة وحدها، فلا يمحوها الإخفاء.
+_CONFIG_SECRET_KEYS = ("cloud_token", "telegram_backup_token", "telegram_backup_chat",
+                       "evolution_api_key", "evolution_webhook_token")
+
+
 @router.get("/web/api/config", response_class=JSONResponse)
 async def web_get_config(request: Request):
     user = _get_current_user(request)
     if not user: return JSONResponse({"error": "غير مصرح"}, status_code=401)
     try:
-        cfg = load_config()
+        cfg = dict(load_config())
+        for _k in _CONFIG_SECRET_KEYS:
+            if _k in cfg:
+                cfg[_k] = ""
         return JSONResponse(cfg)
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
@@ -14478,6 +14489,36 @@ def wa_restart_server(request: Request):
         return JSONResponse({"ok": ok, "msg": msg})
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)})
+
+
+def _evo_handle(payload):
+    try:
+        import wa_evolution
+        res = wa_evolution.handle_webhook(payload)
+        if not res.startswith("ignored"):
+            print(f"[EVO-BOT] {res}")
+    except Exception as e:
+        print(f"[EVO-BOT] تعذّرت معالجة رسالة واردة: {e}")
+
+
+@router.post("/api/wa/evolution-webhook/{token}", response_class=JSONResponse)
+async def evolution_webhook(token: str, request: Request):
+    """
+    الرسائل الواردة من الخادم السحابي (Evolution) — بوت الأعذار والاستئذان.
+
+    بلا جلسة دخول: يأتي من سيرفرنا عبر نفق المدرسة. يُصدَّق برمزٍ سريّ في الرابط
+    وبمفتاح الجلسة الذي يرسله Evolution في الجسم. والمعالجة في خيط: Evolution
+    ينتظر الردّ، والمعالجة تكتب في القاعدة وتردّ على وليّ الأمر عبر الإنترنت.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False}, status_code=400)
+    import wa_evolution
+    if not wa_evolution.verify_webhook(token, payload if isinstance(payload, dict) else {}):
+        return JSONResponse({"ok": False}, status_code=403)
+    threading.Thread(target=_evo_handle, args=(payload,), daemon=True).start()
+    return JSONResponse({"ok": True})
 
 
 @router.get("/web/api/wa/bots")

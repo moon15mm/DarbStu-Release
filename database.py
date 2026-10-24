@@ -4099,7 +4099,9 @@ _BACKUP_DIRS = ("school_reports", "inbox_attachments",
 # النسخ. و`cloud_token` مفتاح مدير المدرسة. تُستعاد فارغةً:
 # `load_config` يولّد cloud_token جديداً، ومفتاح تلجرام يُعاد إدخاله.
 _BACKUP_REDACT = ("telegram_backup_token", "telegram_backup_chat",
-                  "cloud_token")
+                  "cloud_token",
+                  # مفتاح الجلسة السحابية ورمز استقبالها: من يملكهما يرسل من رقم المدرسة
+                  "evolution_api_key", "evolution_webhook_token")
 
 
 def _backup_slug() -> str:
