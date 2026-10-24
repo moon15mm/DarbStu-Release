@@ -600,9 +600,10 @@ async def web_send_absence_messages(req: Request):
         if not students:
             return JSONResponse({"ok": False, "msg": "لا يوجد طلاب"})
 
-        cfg      = load_config()
-        school   = cfg.get("school_name", "المدرسة")
-        template = get_message_template()
+        # render_message لا template.format: القالب فيه {guardian} و{son}، و.format
+        # بأربعة حقول كان يرفع KeyError('guardian') قبل أول رسالة — فظهر
+        # «'guardian'» وزرّ «إرسال للمحددين» لا يرسل شيئاً في أي مدرسة (٢٤ أكتوبر ٢٠٢٦)
+        from config_manager import render_message
         store    = load_students()
 
         # ابنِ خريطة الطلاب للحصول على أرقام أولياء الأمور
@@ -620,11 +621,7 @@ async def web_send_absence_messages(req: Request):
             sname = stu.get("student_name", "")
             cname = stu.get("class_name", "")
             cid   = str(stu.get("class_id", "") or "")
-            msg = template.format(
-                school_name=school,
-                student_name=sname,
-                class_name=cname,
-                date=date_str)
+            msg = render_message(sname, cname, date_str)
             jobs.append((sid, sname, cid, cname, phone_map.get(sid, ""), msg,
                          {"student_id": sid, "student_name": sname,
                           "class_name": cname, "date": date_str}))
