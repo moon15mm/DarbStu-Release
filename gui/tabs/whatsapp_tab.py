@@ -281,7 +281,8 @@ class WhatsappTabMixin:
         tk.Label(card,
                  text="المحلي يرسل من جهاز المدرسة كما كان. السحابي يرسل من خادم درب "
                       "الطلاب برقمٍ تربطه المدرسة مرة واحدة بمسح رمز. والتلقائي يرسل "
-                      "محلياً، ويحوّل إلى السحابي إن توقف المحلي أو بلغ سقفه اليومي.",
+                      "محلياً، ويحوّل إلى السحابي إن توقف المحلي أو بلغ سقفه اليومي.\n"
+                      "للبدء: اختر السحابي أو التلقائي، ثم «تفعيل الواتساب السحابي»، ثم امسح الرمز.",
                  font=("Tahoma", 9), bg="white", fg="#6b7280",
                  justify="right", wraplength=560).pack(anchor="e", padx=10, pady=(6, 4))
 
@@ -299,8 +300,24 @@ class WhatsappTabMixin:
                            activebackground="white", anchor="e", justify="right",
                            command=lambda: _apply_enabled()).pack(fill="x", padx=14)
 
+        # التفعيل: جلسة هذه المدرسة من سيرفر درب الطلاب بتوقيع مفتاح نفقها —
+        # فلا تكتب المدرسة مفتاحاً. الحقول اليدوية تبقى للدعم الفني مطويّة.
+        act_row = tk.Frame(card, bg="white")
+        act_row.pack(fill="x", padx=10, pady=(8, 2))
+        act_btn = tk.Button(act_row, text="⚡  تفعيل الواتساب السحابي", bg="#0f766e", fg="white",
+                            font=("Tahoma", 10, "bold"), relief="flat", cursor="hand2",
+                            padx=14, pady=6, command=lambda: _activate())
+        act_btn.pack(side="right")
+        tk.Label(act_row, text="يجلب جلسة هذه المدرسة من سيرفر درب الطلاب — بلا مفتاح تكتبه",
+                 font=("Tahoma", 8), bg="white", fg="#6b7280").pack(side="right", padx=(0, 8))
+
+        manual = {"open": False}
+        manual_btn = tk.Button(card, text="⚙️  إعداد يدوي (للدعم الفني)  ▾", bg="white",
+                               fg="#475569", font=("Tahoma", 8), relief="flat", cursor="hand2",
+                               bd=0, activebackground="white", command=lambda: _toggle_manual())
+        manual_btn.pack(anchor="e", padx=10, pady=(2, 0))
+
         fields = tk.Frame(card, bg="white")
-        fields.pack(fill="x", padx=10, pady=(6, 2))
         entries = []
 
         def _row(label, var, show=""):
@@ -395,6 +412,42 @@ class WhatsappTabMixin:
                     poll["busy"] = False
             threading.Thread(target=_do, daemon=True).start()
 
+        def _toggle_manual():
+            manual["open"] = not manual["open"]
+            if manual["open"]:
+                fields.pack(fill="x", padx=10, pady=(4, 2), after=manual_btn)
+                manual_btn.config(text="⚙️  إعداد يدوي (للدعم الفني)  ▴")
+            else:
+                fields.pack_forget()
+                manual_btn.config(text="⚙️  إعداد يدوي (للدعم الفني)  ▾")
+
+        def _activate():
+            choice = prov_var.get()
+            act_btn.config(state="disabled")
+            _status("⏳ جارٍ طلب جلسة هذه المدرسة من سيرفر درب الطلاب...", "#92400e")
+
+            def _do():
+                res = _evo.activate(choice)
+
+                def _done():
+                    act_btn.config(state="normal")
+                    if not res.get("ok"):
+                        status_lbl.config(text="🔴 " + res.get("msg", ""), fg="#991b1b")
+                        return
+                    s = _evo.settings()
+                    prov_var.set(res["provider"])
+                    url_var.set(s["url"])
+                    inst_var.set(s["instance"])
+                    key_var.set(s["key"])
+                    _apply_enabled()
+                    msg = "✅ " + res["msg"]
+                    if not res.get("webhook_ok"):
+                        msg += "\n⚠️ " + res.get("webhook_msg", "")
+                    status_lbl.config(text=msg, fg="#166534" if res.get("webhook_ok") else "#92400e")
+                    _refresh(force_qr=True)
+                self.root.after(0, _done)
+            threading.Thread(target=_do, daemon=True).start()
+
         def _save():
             prov = prov_var.get()
             url = url_var.get().strip().rstrip("/")
@@ -402,9 +455,9 @@ class WhatsappTabMixin:
             key = key_var.get().strip()
             if prov != "local" and not (url and inst and key):
                 messagebox.showerror(
-                    "إعداد ناقص",
-                    "السحابي والتلقائي يحتاجان رابط الخادم واسم الجلسة ومفتاحها.\n"
-                    "تجدها في بيانات تجهيز المدرسة للواتساب السحابي.")
+                    "لم تُفعَّل الخدمة السحابية",
+                    "لم تُفعَّل الخدمة السحابية لهذه المدرسة بعد.\n"
+                    "اضغط «⚡ تفعيل الواتساب السحابي» — أو أدخل بيانات الجلسة في «إعداد يدوي».")
                 return
             if prov != "local" and not url.startswith("https://") \
                     and not url.startswith(("http://127.", "http://localhost")):
@@ -460,6 +513,8 @@ class WhatsappTabMixin:
             b.pack(side="right", padx=(0, 4))
         self._evo_save = _save           # للاختبار
         self._evo_refresh = _refresh
+        self._evo_activate = _activate
+        self._evo_toggle_manual = _toggle_manual
 
         def _poll():
             # كل ٦ ثوانٍ أثناء انتظار المسح، وكل دقيقة بعد الاتصال — لا حِمل بلا داعٍ
@@ -471,7 +526,9 @@ class WhatsappTabMixin:
 
         _apply_enabled()
         if prov_var.get() != "local":
-            _status("الوضع: " + self._WA_PROV_LABELS[prov_var.get()].strip(), "#555555")
+            _status("الوضع: " + self._WA_PROV_LABELS[prov_var.get()].strip()
+                    + ("" if s0["key"] else " — لم تُفعَّل بعد: اضغط «تفعيل الواتساب السحابي»"),
+                    "#555555" if s0["key"] else "#92400e")
         self.root.after(1500, _poll)
 
     # ═══════════════════════════════════════════════════════════════

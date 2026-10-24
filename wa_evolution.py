@@ -15,12 +15,14 @@ wa_evolution.py — الإرسال عبر خادم الواتساب السحاب
 `handle_webhook` هنا بمنطق server.js نفسه (الكلمات، مهلة ٤٨ ساعة، الردود)
 — إلا خطأً واحداً لم يُنقل: «لا أوافق» كانت تُقرأ موافقةً لأن فيها «أوافق».
 """
+import base64
 import datetime
 import hmac
 import json
 import os
 import re
 import secrets
+import struct
 import threading
 import time
 
@@ -256,6 +258,127 @@ def ensure_webhook() -> tuple:
     if st in (200, 201):
         return True, "ضُبط استقبال ردود أولياء الأمور"
     return False, f"تعذّر ضبط استقبال الردود: HTTP {st}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  التفعيل — جلسة هذه المدرسة من سيرفر درب الطلاب، بلا مفتاح يكتبه أحد
+# ═══════════════════════════════════════════════════════════════════
+# الطلب موقَّع بمفتاح نفق المدرسة الخاص (Ed25519، ولّده السيرفر عند التجهيز)،
+# والسيرفر يتحقق بمفتاحها العام. معرّف المدرسة وحده علنيّ فلا يكفي.
+# الخادم: tools/server/wa_provision/server.py — والنصّ الموقَّع بالترتيب نفسه.
+ACTIVATE_URL = os.environ.get("DARBSTU_WA_ACTIVATE", "https://darbstu.com/api/wa/activate")
+ACTIVATE_PURPOSE = "darbstu-wa-activate"
+NOT_PROVISIONED = ("هذا الجهاز غير مُجهَّز لدى درب الطلاب (لا معرّف مدرسة أو مفتاح نفق) — "
+                   "تواصل مع الدعم، أو أدخل بيانات الجلسة يدوياً")
+
+
+def _openssh_ed25519_seed(path) -> bytes:
+    """بذرة Ed25519 (٣٢ بايت) من مفتاح OpenSSH غير مشفّر — صيغة openssh-key-v1."""
+    with open(path, encoding="ascii") as f:
+        b64 = "".join(ln.strip() for ln in f if ln.strip() and not ln.startswith("-----"))
+    raw = base64.b64decode(b64)
+    magic = b"openssh-key-v1\0"
+    if not raw.startswith(magic):
+        raise ValueError("ليس مفتاح OpenSSH")
+
+    def reader(buf, pos):
+        def u32():
+            nonlocal pos
+            v = struct.unpack(">I", buf[pos:pos + 4])[0]
+            pos += 4
+            return v
+
+        def string():
+            nonlocal pos
+            n = u32()
+            v = buf[pos:pos + n]
+            pos += n
+            return v
+        return u32, string
+
+    u32, string = reader(raw, len(magic))
+    if string() != b"none":                    # التشفير
+        raise ValueError("المفتاح محمي بكلمة مرور")
+    string(), string()                         # اشتقاق المفتاح وخياراته
+    for _ in range(u32()):
+        string()                               # المفاتيح العامة
+    _, field = reader(string(), 8)             # القسم الخاص بعد checkint ×2
+    if field() != b"ssh-ed25519":
+        raise ValueError("ليس مفتاح ed25519")
+    pub, secret = field(), field()             # العام، ثم البذرة يليها العام
+    if len(pub) != 32 or len(secret) != 64 or secret[32:] != pub:
+        raise ValueError("مفتاح تالف")
+    return secret[:32]
+
+
+def _activation_body(sid, key_path, now=None, nonce=None) -> dict:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    ts = int(time.time() if now is None else now)
+    nonce = nonce or secrets.token_hex(16)
+    msg = ("%s\n%s\n%d\n%s" % (ACTIVATE_PURPOSE, sid, ts, nonce)).encode("utf-8")
+    key = Ed25519PrivateKey.from_private_bytes(_openssh_ed25519_seed(key_path))
+    return {"school_id": sid, "ts": ts, "nonce": nonce,
+            "sig": base64.b64encode(key.sign(msg)).decode("ascii")}
+
+
+def request_session(timeout=45) -> dict:
+    """يطلب جلسة هذه المدرسة من السيرفر — لا يحفظ شيئاً. {'ok','msg', وقيم الجلسة}."""
+    try:
+        import provisioning
+        sid = str(provisioning.get_tunnel_settings().get("school_id") or "").strip()
+        key_path = provisioning.KEY_FILE
+    except Exception:
+        sid, key_path = "", ""
+    if not sid or not key_path or not os.path.isfile(key_path):
+        return {"ok": False, "msg": NOT_PROVISIONED}
+    try:
+        body = _activation_body(sid, key_path)
+    except Exception as e:
+        return {"ok": False, "msg": f"تعذّر توقيع الطلب بمفتاح المدرسة: {e}"}
+    try:
+        from constants import APP_VERSION
+        r = requests.post(ACTIVATE_URL, json=body, timeout=timeout,
+                          headers={"User-Agent": "DarbStu/" + str(APP_VERSION)})
+    except requests.exceptions.RequestException as e:
+        return {"ok": False, "msg": f"تعذّر الاتصال بسيرفر درب الطلاب: {e}"}
+    try:
+        d = r.json()
+    except Exception:
+        d = {}
+    if r.status_code != 200 or not d.get("ok"):
+        return {"ok": False, "msg": d.get("msg") or f"رفض سيرفر درب الطلاب الطلب: HTTP {r.status_code}"}
+    out = {k: str(d.get(k) or "").strip() for k in
+           ("evolution_server_url", "evolution_instance_name", "evolution_api_key")}
+    if not all(out.values()):
+        return {"ok": False, "msg": "ردٌّ ناقص من سيرفر درب الطلاب"}
+    out.update(ok=True, created=bool(d.get("created")))
+    return out
+
+
+def activate(provider_choice=None, timeout=45) -> dict:
+    """
+    يفعّل الواتساب السحابي لهذه المدرسة: يجلب جلستها، ويحفظها مع المزوّد المختار
+    (السحابي إن لم يُختر غيره)، ويضبط استقبال الردود. {'ok','msg','webhook_ok','webhook_msg'}
+    """
+    res = request_session(timeout=timeout)
+    if not res.get("ok"):
+        return {"ok": False, "msg": res.get("msg", "")}
+    from config_manager import load_config, save_config, invalidate_config_cache
+    prov = provider_choice if provider_choice in ("evolution", "auto") else "evolution"
+    cfg = load_config()
+    cfg.update({"whatsapp_provider": prov,
+                "evolution_server_url": res["evolution_server_url"].rstrip("/"),
+                "evolution_instance_name": res["evolution_instance_name"],
+                "evolution_api_key": res["evolution_api_key"]})
+    save_config(cfg)
+    invalidate_config_cache()
+    _state_cache["at"] = 0.0
+    okw, msgw = ensure_webhook()
+    return {"ok": True, "created": res["created"], "provider": prov,
+            "instance": res["evolution_instance_name"],
+            "msg": ("فُعِّل الواتساب السحابي لهذه المدرسة" if res["created"]
+                    else "جلسة هذه المدرسة السحابية جاهزة"),
+            "webhook_ok": okw, "webhook_msg": msgw}
 
 
 # ═══════════════════════════════════════════════════════════════════

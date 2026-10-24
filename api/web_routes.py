@@ -14601,6 +14601,34 @@ def wa_cloud_state(request: Request, qr: int = 0):
         return JSONResponse({"ok": False, "state": None, "msg": str(e)})
 
 
+def _wa_cloud_activate(body):
+    """جلسة هذه المدرسة من سيرفر درب الطلاب بتوقيع مفتاح نفقها — في خيط: نداءان عبر الإنترنت."""
+    import wa_evolution
+    res = wa_evolution.activate(str(body.get("provider") or ""))
+    if not res.get("ok"):
+        return {"ok": False, "msg": res.get("msg", "")}
+    out = _wa_provider_view()
+    out.update(msg=res["msg"], webhook_ok=res["webhook_ok"], webhook_msg=res["webhook_msg"])
+    return out
+
+
+@router.post("/web/api/wa/cloud/activate", response_class=JSONResponse)
+async def wa_cloud_activate(request: Request):
+    """زرّ «تفعيل الواتساب السحابي» — بلا مفتاح تكتبه المدرسة."""
+    if not _wa_manager(request):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        from starlette.concurrency import run_in_threadpool
+        return JSONResponse(await run_in_threadpool(
+            _wa_cloud_activate, body if isinstance(body, dict) else {}))
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)})
+
+
 @router.post("/web/api/wa/cloud/logout", response_class=JSONResponse)
 def wa_cloud_logout(request: Request):
     """يفصل رقم الواتساب عن الجلسة السحابية — متزامنة: نداءٌ عبر الإنترنت."""
@@ -14835,6 +14863,14 @@ async def wa_connect_page(request: Request):
   #prov-msg:empty{display:none}
   .pm-ok{color:#166534}.pm-warn{color:#92400e}.pm-err{color:#991b1b}.pm-wait{color:#475569}
   .sec-h{font-weight:700;color:#1e3a5f;font-size:.9rem;margin:2px 0 10px}
+  .prov-acts{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 6px}
+  .prov-hint{font-size:.76rem;color:#64748b;line-height:1.6;margin-bottom:6px}
+  #prov-state{font-size:.8rem;font-weight:700;margin:4px 0 6px}
+  #prov-state:empty{display:none}
+  .ps-on{color:#166534}.ps-off{color:#92400e}
+  .prov-manual{margin:4px 0 8px}
+  .prov-manual summary{cursor:pointer;font-size:.78rem;color:#475569;padding:4px 0;list-style-position:inside}
+  .prov-manual[open] summary{margin-bottom:4px}
   .sec-sep{border-top:1px solid #e2e8f0;margin:4px 0 16px}
 </style>
 </head>
@@ -14846,16 +14882,24 @@ async def wa_connect_page(request: Request):
 
   <div class="prov" id="prov">
     <div class="prov-h">☁️ مزوّد الواتساب</div>
-    <p class="prov-sub">المحلي يرسل من جهاز المدرسة كما كان. السحابي يرسل من خادم درب الطلاب برقمٍ تربطه المدرسة مرة واحدة بمسح رمز. والتلقائي يرسل محلياً، ويحوّل إلى السحابي إن توقف المحلي أو بلغ سقفه اليومي.</p>
+    <p class="prov-sub">المحلي يرسل من جهاز المدرسة كما كان. السحابي يرسل من خادم درب الطلاب برقمٍ تربطه المدرسة مرة واحدة بمسح رمز. والتلقائي يرسل محلياً، ويحوّل إلى السحابي إن توقف المحلي أو بلغ سقفه اليومي. للبدء: اختر السحابي أو التلقائي، ثم «تفعيل الواتساب السحابي»، ثم امسح الرمز.</p>
     <label class="prov-opt"><input type="radio" name="prov" value="local" onchange="provChanged()">💻 الخادم المحلي (جهاز المدرسة)</label>
     <label class="prov-opt"><input type="radio" name="prov" value="evolution" onchange="provChanged()">☁️ الخادم السحابي (Evolution API)</label>
     <label class="prov-opt"><input type="radio" name="prov" value="auto" onchange="provChanged()">🔄 الوضع التلقائي (محلي مع تحويل سحابي للطوارئ)</label>
+    <div id="prov-state"></div>
+    <div class="prov-acts">
+      <button class="btn btn-teal" id="btn-activate" onclick="activateCloud()">⚡ تفعيل الواتساب السحابي</button>
+      <button class="btn btn-ghost" id="btn-prov-save" onclick="saveProvider(false)">💾 حفظ المزوّد</button>
+    </div>
+    <div class="prov-hint">«تفعيل» يجلب جلسة هذه المدرسة من سيرفر درب الطلاب — بلا مفتاح تكتبه — ثم يظهر رمز الربط. و«حفظ المزوّد» للتبديل بعد التفعيل.</div>
+    <details class="prov-manual" id="prov-manual">
+    <summary>⚙️ إعداد يدوي (للدعم الفني)</summary>
     <div class="prov-fields" id="prov-fields">
       <label>رابط الخادم السحابي<input type="url" id="evo-url" autocomplete="off" spellcheck="false"></label>
       <label>اسم الجلسة<input type="text" id="evo-inst" autocomplete="off" spellcheck="false"></label>
       <label>مفتاح الجلسة<input type="password" id="evo-key" autocomplete="new-password"></label>
     </div>
-    <button class="btn btn-teal" id="btn-prov-save" onclick="saveProvider(false)">💾 حفظ المزوّد</button>
+    </details>
     <div id="prov-msg"></div>
   </div>
 
@@ -15167,6 +15211,9 @@ function fillProvider(d){
   document.getElementById('evo-inst').value=d.instance||'';
   var k=document.getElementById('evo-key'); k.value='';
   k.placeholder=d.key_set?'محفوظ — اتركه فارغاً للإبقاء عليه':'أدخل مفتاح الجلسة';
+  var ps=document.getElementById('prov-state');
+  if(d.key_set){ ps.textContent='✅ الخدمة السحابية مُفعَّلة لهذه المدرسة (الجلسة: '+(d.instance||'')+')'; ps.className='ps-on'; }
+  else{ ps.textContent='لم تُفعَّل الخدمة السحابية لهذه المدرسة بعد'; ps.className='ps-off'; }
   provChanged();
 }
 async function loadProvider(){
@@ -15195,6 +15242,26 @@ async function saveProvider(allowInsecure){
   fillProvider(d);
   if(d.provider!=='local' && d.webhook_ok===false) setProvMsg('✅ '+d.msg+' — ⚠️ '+d.webhook_msg,'warn');
   else setProvMsg('✅ '+d.msg,'ok');
+  _cOpen=false; _cQrAt=0; _connected=false; _lastQR='';
+  applySections(); loadBots();
+}
+
+// ── التفعيل: جلسة المدرسة من سيرفر درب الطلاب بتوقيع مفتاح نفقها ──
+async function activateCloud(){
+  var btn=document.getElementById('btn-activate');
+  btn.disabled=true; btn.textContent='⏳ جارٍ التفعيل...';
+  setProvMsg('⏳ جارٍ طلب جلسة هذه المدرسة من سيرفر درب الطلاب...','wait');
+  var d;
+  try{
+    var r=await fetch('/web/api/wa/cloud/activate',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:provSel()})});
+    d=await r.json();
+  }catch(e){ d={ok:false,msg:e.message}; }
+  btn.disabled=false; btn.textContent='⚡ تفعيل الواتساب السحابي';
+  if(!d.ok){ setProvMsg('❌ '+(d.msg||'تعذّر التفعيل'),'err'); return; }
+  fillProvider(d);
+  if(d.webhook_ok===false) setProvMsg('✅ '+d.msg+' — ⚠️ '+d.webhook_msg,'warn');
+  else setProvMsg('✅ '+d.msg+' — امسح الرمز أدناه','ok');
   _cOpen=false; _cQrAt=0; _connected=false; _lastQR='';
   applySections(); loadBots();
 }
