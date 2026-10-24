@@ -124,7 +124,7 @@ _state_cache = {"at": 0.0, "val": None, "sig": None}
 _STATE_TTL = 10.0
 
 
-def state(cfg=None, fresh=False):
+def state(cfg=None, fresh=False, timeout=8):
     """حالة الجلسة: 'open' متصلة · 'close' · 'connecting' · None تعذّر الوصول."""
     s = settings(cfg)
     sig = (s["url"], s["instance"], s["key"][:6])
@@ -132,7 +132,7 @@ def state(cfg=None, fresh=False):
     if not fresh and _state_cache["sig"] == sig and now - _state_cache["at"] < _STATE_TTL:
         return _state_cache["val"]
     try:
-        st, data = _request("GET", "/instance/connectionState/{i}", timeout=8, cfg=cfg)
+        st, data = _request("GET", "/instance/connectionState/{i}", timeout=timeout, cfg=cfg)
         val = ((data.get("instance") or {}).get("state") if st == 200 else None)
     except Exception:
         val = None

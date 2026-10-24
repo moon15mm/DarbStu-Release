@@ -149,17 +149,33 @@ def _whatsapp_block():
     except Exception:
         pass
     try:
-        import json as _j
-        import urllib.request as _ur
-        from config_manager import load_config
-        port = int(load_config().get("whatsapp_port", 3000) or 3000)
-        with _ur.urlopen("http://127.0.0.1:%d/status" % port, timeout=2) as r:
-            d = _j.loads(r.read().decode())
-        out["connected"] = bool(d.get("ready"))
-        out["reply_bot"] = d.get("bot_enabled")
-        out["pending"] = d.get("pending")
+        import wa_evolution
+        prov = wa_evolution.provider()
     except Exception:
-        out["connected"] = False
+        prov = "local"
+    out["provider"] = prov
+    if prov != "evolution":
+        try:
+            import json as _j
+            import urllib.request as _ur
+            from config_manager import load_config
+            port = int(load_config().get("whatsapp_port", 3000) or 3000)
+            with _ur.urlopen("http://127.0.0.1:%d/status" % port, timeout=2) as r:
+                d = _j.loads(r.read().decode())
+            out["connected"] = bool(d.get("ready"))
+            out["reply_bot"] = d.get("bot_enabled")
+            out["pending"] = d.get("pending")
+        except Exception:
+            out["connected"] = False
+    if prov != "local" and not out["connected"]:
+        # السحابي، والتلقائي والمحلي متوقف: الرسائل تخرج من الخادم السحابي إن
+        # كانت جلسته متصلة — فلا يُنبَّه المدير «لن تخرج أي رسالة» وهي تخرج
+        try:
+            out["connected"] = wa_evolution.state(timeout=3) == "open"
+            out["reply_bot"] = wa_evolution.bot_config()["bot_enabled"]
+            out["pending"] = wa_evolution._pending_count(wa_evolution.load_pending())
+        except Exception:
+            out["connected"] = False
     return out
 
 
@@ -300,7 +316,10 @@ def _alerts(snap):
     sysb = snap.get("system") or {}
 
     if not wa.get("connected"):
-        a.append({"level": "err", "text": "خادم الواتساب غير متصل — لن تخرج أي رسالة",
+        a.append({"level": "err", "text": {
+                      "evolution": "الواتساب السحابي غير متصل — لن تخرج أي رسالة",
+                      "auto": "الخادمان المحلي والسحابي غير متصلين — لن تخرج أي رسالة",
+                  }.get(wa.get("provider"), "خادم الواتساب غير متصل — لن تخرج أي رسالة"),
                   "tab": "whatsapp"})
     elif wa.get("reply_bot") is False:
         a.append({"level": "warn", "text": "بوت استقبال الأعذار موقوف — لن تُسجَّل ردود أولياء الأمور"})

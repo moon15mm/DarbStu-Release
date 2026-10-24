@@ -4302,6 +4302,8 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
         <button class="btn bp1" onclick="checkWA()">🔍 فحص</button>
         <button class="btn bp4" onclick="alert('تشغيل الخادم — يعمل محلياً فقط')">▶️ تشغيل</button>
       </div>
+      <p style="margin:14px 0 8px;font-size:13px;color:var(--mu)">الإرسال من جهاز المدرسة أو من الخادم السحابي، ورمز الربط: في صفحة «ربط واتساب».</p>
+      <a class="btn bp1" href="/web/whatsapp-connect" target="_blank" style="text-decoration:none">☁️ مزوّد الواتساب وربطه</a>
     </div>
   </div>
   <div id="ss-adv" class="ip">
@@ -14491,6 +14493,128 @@ def wa_restart_server(request: Request):
         return JSONResponse({"ok": False, "msg": str(e)})
 
 
+# ─── مزوّد الواتساب من اللوحة: محلي · سحابي · تلقائي ────────────────────
+# نظير بطاقة «مزوّد الواتساب» في «إدارة الواتساب» بالبرنامج المكتبي، بقواعدها
+# نفسها. ومفتاح الجلسة لا يغادر الخادم أبداً: الصفحة تعرف أنه محفوظ فقط، والحقل
+# الفارغ عند الحفظ يُبقي المفتاح القائم.
+_WA_PROV_NAMES = {"local": "الخادم المحلي (جهاز المدرسة)",
+                  "evolution": "الخادم السحابي (Evolution API)",
+                  "auto": "الوضع التلقائي (محلي مع تحويل سحابي للطوارئ)"}
+
+
+def _wa_manager(request):
+    user = _get_current_user(request)
+    return user if user and user.get("role") in ("admin", "deputy") else None
+
+
+def _wa_provider_view():
+    import wa_evolution
+    cfg = load_config()
+    s = wa_evolution.settings(cfg)
+    return {"ok": True, "provider": wa_evolution.provider(cfg), "url": s["url"],
+            "instance": s["instance"], "key_set": bool(s["key"])}
+
+
+def _wa_provider_save(body):
+    """يحفظ المزوّد وإعداده. في خيط: ضبط استقبال الردود نداءٌ عبر الإنترنت."""
+    import wa_evolution
+    prov = str(body.get("provider") or "").strip().lower()
+    if prov not in wa_evolution.PROVIDERS:
+        return {"ok": False, "msg": "مزوّد غير معروف"}
+    cfg = load_config()
+    cur = wa_evolution.settings(cfg)
+    url = str(body.get("url") or "").strip().rstrip("/") or cur["url"]
+    inst = str(body.get("instance") or "").strip() or cur["instance"]
+    key = str(body.get("key") or "").strip() or cur["key"]
+    if prov != "local":
+        if not (url and inst and key):
+            return {"ok": False, "msg": "السحابي والتلقائي يحتاجان رابط الخادم واسم الجلسة ومفتاحها. "
+                                        "تجدها في بيانات تجهيز المدرسة للواتساب السحابي."}
+        if (not url.startswith("https://") and not body.get("allow_insecure")
+                and not url.startswith(("http://127.", "http://localhost"))):
+            return {"ok": False, "confirm": "insecure",
+                    "msg": "الرابط ليس https — سيعبر مفتاح الجلسة الإنترنت مكشوفاً. متابعة؟"}
+    cfg.update({"whatsapp_provider": prov, "evolution_server_url": url,
+                "evolution_instance_name": inst, "evolution_api_key": key})
+    save_config(cfg)
+    invalidate_config_cache()
+    out = _wa_provider_view()
+    out["msg"] = "حُفظ: " + _WA_PROV_NAMES[prov]
+    if prov != "local":
+        out["webhook_ok"], out["webhook_msg"] = wa_evolution.ensure_webhook()
+    return out
+
+
+@router.get("/web/api/wa/provider")
+async def wa_provider_get(request: Request):
+    if not _wa_manager(request):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        return JSONResponse(_wa_provider_view())
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)})
+
+
+@router.post("/web/api/wa/provider", response_class=JSONResponse)
+async def wa_provider_set(request: Request):
+    if not _wa_manager(request):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        body = await request.json()
+        from starlette.concurrency import run_in_threadpool
+        return JSONResponse(await run_in_threadpool(
+            _wa_provider_save, body if isinstance(body, dict) else {}))
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)})
+
+
+@router.get("/web/api/wa/cloud", response_class=JSONResponse)
+def wa_cloud_state(request: Request, qr: int = 0):
+    """
+    حالة الجلسة السحابية، ورمز ربطها إن طُلب ولم تكن متصلة.
+
+    متزامنة (def) عمداً: نداءٌ إلى الخادم السحابي عبر الإنترنت قد يطول ثوانيَ.
+    """
+    if not _wa_manager(request):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        import wa_evolution
+        if not wa_evolution.configured():
+            return JSONResponse({"ok": False, "state": None,
+                                 "msg": "إعداد الخادم السحابي ناقص — أدخل الرابط واسم الجلسة "
+                                        "والمفتاح ثم احفظ المزوّد"})
+        st = wa_evolution.state(fresh=True)
+        if st == "open":
+            return JSONResponse({"ok": True, "state": "open",
+                                 "msg": "الواتساب السحابي متصل وجاهز"})
+        if not qr:
+            return JSONResponse({"ok": st is not None, "state": st, "msg": (
+                "تعذّر بلوغ الخادم السحابي — تحقق من الرابط والإنترنت" if st is None
+                else "الجلسة السحابية غير مربوطة — اضغط «عرض رمز الربط» وامسحه")})
+        res = wa_evolution.fetch_qr()
+        png = str(res.get("base64") or "")
+        if png and not png.startswith("data:"):
+            png = "data:image/png;base64," + png
+        return JSONResponse({"ok": res.get("state") is not None, "state": res.get("state"),
+                             "qr_png": png, "msg": res.get("msg", "")})
+    except Exception as e:
+        return JSONResponse({"ok": False, "state": None, "msg": str(e)})
+
+
+@router.post("/web/api/wa/cloud/logout", response_class=JSONResponse)
+def wa_cloud_logout(request: Request):
+    """يفصل رقم الواتساب عن الجلسة السحابية — متزامنة: نداءٌ عبر الإنترنت."""
+    if not _wa_manager(request):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        import wa_evolution
+        ok = wa_evolution.logout()
+        return JSONResponse({"ok": ok, "msg": "فُصلت الجلسة — امسح الرمز الجديد" if ok
+                             else "تعذّر فصل الجلسة"})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)})
+
+
 def _evo_handle(payload):
     try:
         import wa_evolution
@@ -14523,18 +14647,31 @@ async def evolution_webhook(token: str, request: Request):
 
 @router.get("/web/api/wa/bots")
 async def wa_bots_status(request: Request):
-    """حالة البوتات الثلاثة: الغياب/الاستئذان من الإعدادات، والأعذار من خادم Node."""
+    """حالة البوتات الثلاثة: الغياب/الاستئذان من الإعدادات، والأعذار من خادم Node (وفي السحابي من ملفه)."""
     user = _get_current_user(request)
     if not user or user.get("role") not in ("admin", "deputy"):
         return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
     cfg = load_config()
-    excuse = False
     try:
-        import urllib.request as _ur, json as _j
-        r = _ur.urlopen("http://localhost:3000/bot-config", timeout=2)
-        excuse = bool(_j.loads(r.read()).get("bot_enabled", False))
+        import wa_evolution
+        prov = wa_evolution.provider(cfg)
     except Exception:
-        excuse = False   # الخادم غير متصل — يُعرض موقوفاً
+        prov = "local"
+    excuse = None
+    if prov != "evolution":
+        try:
+            import urllib.request as _ur, json as _j
+            r = _ur.urlopen("http://localhost:3000/bot-config", timeout=2)
+            excuse = bool(_j.loads(r.read()).get("bot_enabled", False))
+        except Exception:
+            excuse = None
+    if excuse is None and prov != "local":
+        # السحابي، والتلقائي والمحلي متوقف: الحالة من ملفها الذي يقرؤه البوت
+        try:
+            excuse = bool(wa_evolution.bot_config()["bot_enabled"])
+        except Exception:
+            excuse = None
+    excuse = bool(excuse)   # الخادم غير متصل — يُعرض موقوفاً
     return JSONResponse({
         "ok": True,
         "absence":    bool(cfg.get("absence_bot_enabled", False)),
@@ -14545,7 +14682,7 @@ async def wa_bots_status(request: Request):
 
 @router.post("/web/api/wa/bots/toggle", response_class=JSONResponse)
 async def wa_bots_toggle(request: Request):
-    """تشغيل/إيقاف بوت — الغياب/الاستئذان في الإعدادات، والأعذار عبر خادم Node."""
+    """تشغيل/إيقاف بوت — الغياب/الاستئذان في الإعدادات، والأعذار عبر خادم Node (وفي السحابي في ملفه)."""
     user = _get_current_user(request)
     if not user or user.get("role") not in ("admin", "deputy"):
         return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
@@ -14558,11 +14695,24 @@ async def wa_bots_toggle(request: Request):
             cfg = load_config(); cfg[key] = enabled; save_config(cfg)
             invalidate_config_cache()
         elif bot == "excuse":
-            import urllib.request as _ur, json as _j
-            req = _ur.Request("http://localhost:3000/bot-toggle",
-                              data=_j.dumps({"enabled": enabled}).encode(),
-                              headers={"Content-Type": "application/json"}, method="POST")
-            _ur.urlopen(req, timeout=3)
+            import wa_evolution
+            prov = wa_evolution.provider()
+            if prov != "local":
+                # لا خادم Node في السحابي يحفظ الحالة — تُكتب في ملفها الذي يقرؤه
+                # بوت السحابي وserver.js معاً (كما في المكتبي)
+                if not wa_evolution.write_bot_config(enabled=enabled):
+                    return JSONResponse({"ok": False, "msg": "تعذّر حفظ حالة البوت"})
+            if prov != "evolution":
+                import urllib.request as _ur, json as _j
+                req = _ur.Request("http://localhost:3000/bot-toggle",
+                                  data=_j.dumps({"enabled": enabled}).encode(),
+                                  headers={"Content-Type": "application/json"}, method="POST")
+                try:
+                    _ur.urlopen(req, timeout=3)
+                except Exception:
+                    if prov == "local":
+                        raise
+                    # التلقائي والمحلي متوقف: حُفظت في الملف، ويقرؤها الخادم حين يعمل
         else:
             return JSONResponse({"ok": False, "msg": "بوت غير معروف"})
         return JSONResponse({"ok": True, "bot": bot, "enabled": enabled})
@@ -14599,7 +14749,7 @@ async def wa_connect_page(request: Request):
   .sub{color:#64748b;font-size:.88rem;margin-bottom:22px}
 
   /* شارة الحالة */
-  #badge{display:inline-flex;align-items:center;gap:8px;padding:8px 20px;
+  #badge,#c-badge{display:inline-flex;align-items:center;gap:8px;padding:8px 20px;
          border-radius:999px;font-size:.92rem;font-weight:700;margin-bottom:18px;
          transition:all .3s}
   .b-init    {background:#f1f5f9;color:#475569}
@@ -14619,15 +14769,15 @@ async def wa_connect_page(request: Request):
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 
   /* منطقة QR */
-  #qr-area{min-height:230px;display:flex;flex-direction:column;align-items:center;
+  #qr-area,#c-qr-area{min-height:230px;display:flex;flex-direction:column;align-items:center;
            justify-content:center;background:#f8fafc;border-radius:12px;
            border:2px dashed #cbd5e1;margin-bottom:16px;padding:16px;gap:10px}
-  #qr-area canvas,#qr-area img{max-width:210px;max-height:210px}
-  #qr-area .qr-icon{font-size:2.8rem}
-  #qr-area .qr-msg{font-size:.85rem;color:#64748b}
+  #qr-area canvas,#qr-area img,#c-qr-area img{max-width:210px;max-height:210px}
+  #qr-area .qr-icon,#c-qr-area .qr-icon{font-size:2.8rem}
+  #qr-area .qr-msg,#c-qr-area .qr-msg{font-size:.85rem;color:#64748b}
 
   /* رسالة */
-  #msg{color:#475569;font-size:.87rem;line-height:1.7;margin-bottom:14px}
+  #msg,#c-msg{color:#475569;font-size:.87rem;line-height:1.7;margin-bottom:14px}
 
   /* أزرار */
   .btns{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-bottom:16px}
@@ -14664,6 +14814,28 @@ async def wa_connect_page(request: Request):
   .bot-tgl:hover{opacity:.85}.bot-tgl:disabled{opacity:.5;cursor:default}
   .bot-on{background:#059669;color:#fff}
   .bot-off{background:#e5e7eb;color:#64748b}
+
+  /* مزوّد الواتساب: محلي · سحابي · تلقائي */
+  .prov{text-align:right;background:#f0fdfa;border:1px solid #99f6e4;border-radius:12px;
+        padding:14px 16px;margin-bottom:18px}
+  .prov-h{font-weight:700;color:#0f766e;font-size:.95rem;margin-bottom:4px}
+  .prov-sub{color:#64748b;font-size:.78rem;line-height:1.7;margin-bottom:8px}
+  .prov-opt{display:flex;align-items:center;gap:8px;font-size:.86rem;color:#1f2937;
+            padding:5px 0;cursor:pointer}
+  .prov-opt input{accent-color:#0f766e;width:16px;height:16px;flex-shrink:0;margin:0}
+  .prov-fields{display:grid;gap:8px;margin:10px 0 12px;transition:opacity .2s}
+  .prov-fields label{display:grid;gap:3px;font-size:.78rem;color:#475569}
+  .prov-fields input{font-family:Tahoma;font-size:.85rem;padding:7px 10px;border:1px solid #cbd5e1;
+                     border-radius:8px;background:#fff;direction:ltr;text-align:left;width:100%}
+  .prov-fields input:disabled{background:#f1f5f9;color:#94a3b8}
+  .prov-fields input:focus{outline:2px solid #5eead4;outline-offset:0;border-color:#0f766e}
+  .btn-teal{background:#0f766e;color:#fff}
+  .btn-out {background:#fff;color:#991b1b;border:1px solid #fecaca}
+  #prov-msg{font-size:.8rem;line-height:1.7;margin-top:8px}
+  #prov-msg:empty{display:none}
+  .pm-ok{color:#166534}.pm-warn{color:#92400e}.pm-err{color:#991b1b}.pm-wait{color:#475569}
+  .sec-h{font-weight:700;color:#1e3a5f;font-size:.9rem;margin:2px 0 10px}
+  .sec-sep{border-top:1px solid #e2e8f0;margin:4px 0 16px}
 </style>
 </head>
 <body>
@@ -14672,6 +14844,23 @@ async def wa_connect_page(request: Request):
   <h1>ربط واتساب المدرسة</h1>
   <p class="sub">امسح رمز QR بتطبيق واتساب لربط الحساب</p>
 
+  <div class="prov" id="prov">
+    <div class="prov-h">☁️ مزوّد الواتساب</div>
+    <p class="prov-sub">المحلي يرسل من جهاز المدرسة كما كان. السحابي يرسل من خادم درب الطلاب برقمٍ تربطه المدرسة مرة واحدة بمسح رمز. والتلقائي يرسل محلياً، ويحوّل إلى السحابي إن توقف المحلي أو بلغ سقفه اليومي.</p>
+    <label class="prov-opt"><input type="radio" name="prov" value="local" onchange="provChanged()">💻 الخادم المحلي (جهاز المدرسة)</label>
+    <label class="prov-opt"><input type="radio" name="prov" value="evolution" onchange="provChanged()">☁️ الخادم السحابي (Evolution API)</label>
+    <label class="prov-opt"><input type="radio" name="prov" value="auto" onchange="provChanged()">🔄 الوضع التلقائي (محلي مع تحويل سحابي للطوارئ)</label>
+    <div class="prov-fields" id="prov-fields">
+      <label>رابط الخادم السحابي<input type="url" id="evo-url" autocomplete="off" spellcheck="false"></label>
+      <label>اسم الجلسة<input type="text" id="evo-inst" autocomplete="off" spellcheck="false"></label>
+      <label>مفتاح الجلسة<input type="password" id="evo-key" autocomplete="new-password"></label>
+    </div>
+    <button class="btn btn-teal" id="btn-prov-save" onclick="saveProvider(false)">💾 حفظ المزوّد</button>
+    <div id="prov-msg"></div>
+  </div>
+
+  <div id="local-sec">
+  <div class="sec-h" id="local-h" style="display:none">💻 الخادم المحلي — الأساسي</div>
   <div id="badge" class="b-init">
     <div class="dot d-grey" id="dot"></div>
     <span id="badge-txt">جارٍ التحقق...</span>
@@ -14701,6 +14890,35 @@ async def wa_connect_page(request: Request):
     ٤- امسح رمز QR الظاهر أعلاه<br>
     ⚠️ إن قال «متصل» والرسائل تفشل: اضغط «إعادة تشغيل الخادم» — يعود بالجلسة نفسها دون مسح QR
   </div>
+  </div>
+
+  <div id="cloud-sec" style="display:none">
+    <div class="sec-sep" id="cloud-sep"></div>
+    <div class="sec-h" id="cloud-h">☁️ الخادم السحابي</div>
+    <div id="c-badge" class="b-init">
+      <div class="dot d-grey" id="c-dot"></div>
+      <span id="c-badge-txt">جارٍ التحقق...</span>
+    </div>
+    <div id="c-qr-area">
+      <img id="c-qr" alt="رمز ربط الواتساب السحابي" width="210" height="210"
+           style="display:none;background:#fff;padding:6px;border-radius:8px">
+      <div class="qr-icon" id="c-icon" style="display:none"></div>
+      <div class="qr-msg" id="c-sub"></div>
+    </div>
+    <p id="c-msg"></p>
+    <div class="btns">
+      <button class="btn btn-teal"  id="btn-c-qr" onclick="cloudRefresh(true)">🔗 عرض رمز الربط</button>
+      <button class="btn btn-ghost" id="btn-c-check" onclick="cloudRefresh(false)">🔍 فحص الاتصال السحابي</button>
+      <button class="btn btn-out"   id="btn-c-logout" onclick="cloudLogout()">🚪 فصل الجلسة</button>
+    </div>
+    <div class="steps">
+      <strong>خطوات الربط السحابي:</strong><br>
+      ١- اختر «الخادم السحابي» أو «التلقائي»، وأدخل بيانات الجلسة، ثم «حفظ المزوّد»<br>
+      ٢- اضغط «عرض رمز الربط»<br>
+      ٣- افتح واتساب ← الأجهزة المرتبطة ← ربط جهاز<br>
+      ٤- امسح الرمز الظاهر أعلاه — يتجدد وحده حتى يُمسح
+    </div>
+  </div>
 
   <div class="bots" id="bots">
     <div class="bots-h">🤖 البوتات التلقائية (تعمل عند اتصال الواتساب)</div>
@@ -14723,6 +14941,8 @@ async def wa_connect_page(request: Request):
 
 <script>
 var _connected=false, _lastQR='', _qrInst=null, _pollTimer=null;
+// المزوّد المحفوظ — يقرّر أيّ القسمين يُعرض ويُفحص (انظر applySections)
+var PROV_SAVED='local';
 
 function setBadge(cls,dotCls,txt){
   var b=document.getElementById('badge');
@@ -14780,7 +15000,7 @@ function schedulePoll(ms){
 }
 
 async function poll(){
-  if(_connected)return;
+  if(_connected||PROV_SAVED==='evolution')return;
   try{
     var r=await fetch('/web/api/wa/qr');
     var d=await r.json();
@@ -14912,14 +15132,128 @@ async function toggleBot(k){
       body:JSON.stringify({bot:k,enabled:nv})});
     var d=await r.json();
     if(d.ok){ BOTS[k]=nv; }
-    else { setMsg('تعذّر تغيير بوت '+BOT_NAMES[k]+': '+(d.msg||'')); }
-  }catch(e){ setMsg('خطأ في الاتصال ببوت '+BOT_NAMES[k]); }
+    else { botMsg('تعذّر تغيير بوت '+BOT_NAMES[k]+': '+(d.msg||'')); }
+  }catch(e){ botMsg('خطأ في الاتصال ببوت '+BOT_NAMES[k]); }
   b.disabled=false; renderBot(k);
 }
 
-// ابدأ فور تحميل الصفحة
+// رسالة البوتات في القسم الظاهر: المحلي يُخفى في السحابي فيضيع ما يُكتب فيه
+function botMsg(t){ if(PROV_SAVED==='evolution') setCMsg(t); else setMsg(t); }
+
+// ── مزوّد الواتساب: محلي · سحابي · تلقائي ──
+// الأقسام تتبع المحفوظ لا المختار: الاختيار بلا حفظ لا يغيّر شيئاً في الإرسال.
+var _cOpen=false, _cQrAt=0, _cTimer=null, _cBusy=false, _cHasQr=false, _cWantQr=false;
+function provSel(){ var r=document.querySelector('input[name=prov]:checked'); return r?r.value:'local'; }
+function setProvMsg(t,cls){ var m=document.getElementById('prov-msg'); m.textContent=t||''; m.className=cls?'pm-'+cls:''; }
+function provChanged(){
+  var cloud=provSel()!=='local';
+  ['evo-url','evo-inst','evo-key'].forEach(function(id){ document.getElementById(id).disabled=!cloud; });
+  document.getElementById('prov-fields').style.opacity=cloud?'1':'.6';
+}
+function applySections(){
+  var showLocal=PROV_SAVED!=='evolution', showCloud=PROV_SAVED!=='local', both=showLocal&&showCloud;
+  document.getElementById('local-sec').style.display=showLocal?'':'none';
+  document.getElementById('cloud-sec').style.display=showCloud?'':'none';
+  document.getElementById('local-h').style.display=both?'':'none';
+  document.getElementById('cloud-sep').style.display=both?'':'none';
+  document.getElementById('cloud-h').textContent=both?'☁️ الخادم السحابي — للطوارئ':'☁️ الخادم السحابي';
+  if(showLocal){ if(!_connected) schedulePoll(200); } else { clearTimeout(_pollTimer); }
+  if(showCloud){ cloudSchedule(300); } else { clearTimeout(_cTimer); }
+}
+function fillProvider(d){
+  PROV_SAVED=d.provider||'local';
+  var el=document.querySelector('input[name=prov][value="'+PROV_SAVED+'"]'); if(el) el.checked=true;
+  document.getElementById('evo-url').value=d.url||'';
+  document.getElementById('evo-inst').value=d.instance||'';
+  var k=document.getElementById('evo-key'); k.value='';
+  k.placeholder=d.key_set?'محفوظ — اتركه فارغاً للإبقاء عليه':'أدخل مفتاح الجلسة';
+  provChanged();
+}
+async function loadProvider(){
+  try{
+    var r=await fetch('/web/api/wa/provider'); var d=await r.json();
+    if(d.ok) fillProvider(d); else { setProvMsg('تعذّر تحميل المزوّد: '+(d.msg||''),'err'); provChanged(); }
+  }catch(e){ setProvMsg('تعذّر تحميل المزوّد: '+e.message,'err'); provChanged(); }
+  applySections();
+}
+async function saveProvider(allowInsecure){
+  var btn=document.getElementById('btn-prov-save');
+  var body={provider:provSel(), url:document.getElementById('evo-url').value.trim(),
+            instance:document.getElementById('evo-inst').value.trim(),
+            key:document.getElementById('evo-key').value.trim(), allow_insecure:!!allowInsecure};
+  btn.disabled=true; btn.textContent='⏳ جارٍ الحفظ...';
+  setProvMsg(body.provider==='local'?'':'⏳ جارٍ الحفظ وضبط استقبال ردود أولياء الأمور...','wait');
+  var d;
+  try{
+    var r=await fetch('/web/api/wa/provider',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    d=await r.json();
+  }catch(e){ d={ok:false,msg:e.message}; }
+  btn.disabled=false; btn.textContent='💾 حفظ المزوّد';
+  if(!d.ok && d.confirm==='insecure'){ setProvMsg('',''); if(confirm(d.msg)) saveProvider(true); return; }
+  if(!d.ok){ setProvMsg('❌ '+(d.msg||'تعذّر الحفظ'),'err'); return; }
+  fillProvider(d);
+  if(d.provider!=='local' && d.webhook_ok===false) setProvMsg('✅ '+d.msg+' — ⚠️ '+d.webhook_msg,'warn');
+  else setProvMsg('✅ '+d.msg,'ok');
+  _cOpen=false; _cQrAt=0; _connected=false; _lastQR='';
+  applySections(); loadBots();
+}
+
+// ── الجلسة السحابية: كل ٦ ثوانٍ أثناء انتظار المسح، وكل دقيقة بعد الاتصال ──
+function cloudSchedule(ms){ clearTimeout(_cTimer); _cTimer=setTimeout(function(){ cloudRefresh(false); },ms); }
+function setCBadge(cls,dotCls,t){
+  document.getElementById('c-badge').className=cls;
+  document.getElementById('c-dot').className='dot '+dotCls;
+  document.getElementById('c-badge-txt').textContent=t;
+}
+function setCView(icon,sub,png){
+  var im=document.getElementById('c-qr');
+  if(png){ im.src=png; im.style.display=''; } else { im.removeAttribute('src'); im.style.display='none'; }
+  _cHasQr=!!png;
+  var ic=document.getElementById('c-icon'); ic.textContent=icon||''; ic.style.display=icon?'block':'none';
+  document.getElementById('c-sub').textContent=sub||'';
+}
+function setCMsg(t){ document.getElementById('c-msg').textContent=t||''; }
+function renderCloud(d){
+  _cOpen=(d.state==='open');
+  if(_cOpen){ setCBadge('b-ok','d-green','متصل ✅'); setCView('✅','الجلسة السحابية متصلة',''); setCMsg(d.msg); return; }
+  if(d.qr_png){ setCBadge('b-scanning','d-blue','بانتظار المسح...'); setCView('','',d.qr_png); setCMsg(d.msg); return; }
+  if(!d.ok){ setCBadge('b-error','d-red','غير متصل'); setCView('🔴','',''); setCMsg(d.msg); return; }
+  // غير مربوطة ولا رمز في هذا الطلب: يبقى الرمز المعروض إن وُجد
+  if(!_cHasQr){ setCBadge('b-waiting','d-yellow','غير مربوط'); setCView('📱','',''); setCMsg(d.msg); }
+}
+async function cloudRefresh(forceQr){
+  if(PROV_SAVED==='local') return;
+  if(_cBusy){ if(forceQr) _cWantQr=true; return; }   // ضغطةٌ أثناء فحصٍ جارٍ تُنفَّذ بعده
+  _cBusy=true;
+  var wantQr=forceQr||(!_cOpen && Date.now()-_cQrAt>18000);
+  if(forceQr) document.getElementById('btn-c-qr').disabled=true;
+  var d;
+  try{
+    var r=await fetch('/web/api/wa/cloud'+(wantQr?'?qr=1':''));
+    d=await r.json();
+  }catch(e){ d={ok:false,state:null,msg:'تعذّر الوصول: '+e.message}; }
+  if(wantQr) _cQrAt=Date.now();
+  renderCloud(d);
+  document.getElementById('btn-c-qr').disabled=false;
+  _cBusy=false;
+  if(_cWantQr){ _cWantQr=false; cloudRefresh(true); return; }
+  if(PROV_SAVED!=='local') cloudSchedule(_cOpen?60000:6000);
+}
+async function cloudLogout(){
+  if(!confirm('سيُفصل رقم الواتساب عن الخادم السحابي ويلزم مسح رمز جديد. متابعة؟')) return;
+  var btn=document.getElementById('btn-c-logout'); btn.disabled=true;
+  try{
+    var r=await fetch('/web/api/wa/cloud/logout',{method:'POST'}); var d=await r.json();
+    setCMsg(d.msg||'');
+  }catch(e){ setCMsg('خطأ: '+e.message); }
+  btn.disabled=false; _cOpen=false; _cQrAt=0;
+  setTimeout(function(){ cloudRefresh(true); },1500);
+}
+
+// ابدأ فور تحميل الصفحة: المزوّد أولاً — يقرّر أيّ القسمين يُعرض ويُفحص
 showSpinner(true); showQRDiv(false);
-poll();
+loadProvider();
 loadBots();
 </script>
 </body>
