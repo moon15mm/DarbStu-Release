@@ -1332,6 +1332,289 @@ def academic_slot(n) -> int:
         return -1
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  قفل الأرقام الأكاديمية — البصمات على أجهزة الحضور مربوطة بها
+# ═══════════════════════════════════════════════════════════════════
+# طلب ماهر (٢٦ أكتوبر ٢٠٢٦): لا يتغيّر رقمٌ أكاديمي إلا في نهاية السنة أو
+# بتدخّل يدوي من مدير النظام. كان استيرادُ كشفٍ كامل من نور يكتب السجلات
+# بلا أرقام فيمحوها كلها، فتنفصل البصمات صامتةً، وإن وُلّدت ثانيةً نُسبت
+# بصمةُ طالبٍ إلى غيره.
+#
+# المرجع سجلّ `academic_registry` في القاعدة لا الملف: لكل طالب رقمه الحالي
+# (active=1)، ولا يُعطى رقمٌ استُعمل يوماً لغير صاحبه — فالطالب المحذوف إن
+# عاد أخذ رقمه، وبصمته الباقية على الجهاز لا تُنسب لطالبٍ جديد.
+# وكل كتابةٍ لـstudents.json تمرّ بـwrite_students_file:
+#   • سجلٌّ بلا رقم ولصاحبه رقم ⇒ يُعاد رقمه دائماً (إغفالٌ لا تغيير)
+#   • رقمٌ مختلف ⇒ يُقبل إن كان القفل مفتوحاً، وإلا يُعاد الأصل
+#   • رقمٌ يملكه طالبٌ آخر في السجلّ ⇒ لا يُقبل أبداً
+ACADEMIC_YEAREND_DAYS = 14          # بعد «إنهاء السنة وترحيل الطلاب»
+ACADEMIC_UNLOCK_MINUTES = 60        # فتحٌ يدوي من مدير النظام
+
+
+class AcademicLocked(ValueError):
+    """تغيير الأرقام الأكاديمية مقفل الآن."""
+
+
+ACADEMIC_LOCKED_MSG = ("الأرقام الأكاديمية مقفلة — إعادة توليدها تُبطل تسجيل البصمات على "
+                       "الأجهزة. تُفتح بعد «إنهاء السنة وترحيل الطلاب»، أو بفتحٍ يدوي من مدير "
+                       "النظام في صفحة تسجيل البصمات.")
+
+
+def _academic_tables(con):
+    con.execute("""CREATE TABLE IF NOT EXISTS academic_registry (
+        academic_no  TEXT PRIMARY KEY,
+        student_id   TEXT NOT NULL,
+        student_name TEXT NOT NULL DEFAULT '',
+        active       INTEGER NOT NULL DEFAULT 1,
+        assigned_at  TEXT NOT NULL DEFAULT '',
+        retired_at   TEXT NOT NULL DEFAULT '')""")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_acreg_student "
+                "ON academic_registry(student_id, active)")
+    con.execute("""CREATE TABLE IF NOT EXISTS academic_lock_log (
+        id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        at      TEXT NOT NULL,
+        action  TEXT NOT NULL,
+        by_user TEXT NOT NULL DEFAULT '',
+        detail  TEXT NOT NULL DEFAULT '')""")
+
+
+def academic_lock_log(action, by_user="", detail=""):
+    con = get_db()
+    try:
+        _academic_tables(con)
+        con.execute("INSERT INTO academic_lock_log (at, action, by_user, detail) "
+                    "VALUES (?,?,?,?)",
+                    (datetime.datetime.now().isoformat(timespec="seconds"),
+                     action, by_user or "", detail or ""))
+        con.commit()
+    finally:
+        con.close()
+
+
+def academic_lock_history(limit=20):
+    con = get_db()
+    con.row_factory = sqlite3.Row
+    try:
+        _academic_tables(con)
+        rows = con.execute("SELECT at, action, by_user, detail FROM academic_lock_log "
+                           "ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        con.close()
+
+
+def academic_lock_state(now=None) -> dict:
+    """{'locked', 'reason': admin|yearend, 'until'} — مقفلٌ ما لم يُفتح بأحد الطريقين."""
+    now = now or datetime.datetime.now()
+    cfg = load_config()
+    for key, reason in (("academic_unlock_until", "admin"),
+                        ("academic_yearend_until", "yearend")):
+        try:
+            until = datetime.datetime.fromisoformat(str(cfg.get(key) or ""))
+        except ValueError:
+            continue
+        if until > now:
+            return {"locked": False, "reason": reason,
+                    "until": until.isoformat(timespec="minutes")}
+    return {"locked": True, "reason": "", "until": ""}
+
+
+def _academic_lock_cfg(**values):
+    from config_manager import save_config, invalidate_config_cache
+    cfg = load_config()
+    cfg.update(values)
+    save_config(cfg)
+    invalidate_config_cache()
+
+
+def unlock_academic_numbers(by_user, reason="", minutes=ACADEMIC_UNLOCK_MINUTES) -> dict:
+    """فتحٌ يدوي مؤقت — المُستدعي يتحقق أنه مدير النظام بكلمة مروره."""
+    until = datetime.datetime.now() + datetime.timedelta(minutes=int(minutes))
+    _academic_lock_cfg(academic_unlock_until=until.isoformat(timespec="seconds"))
+    academic_lock_log("unlock", by_user, "حتى %s — %s" % (until.strftime("%Y-%m-%d %H:%M"),
+                                                         reason or "بلا سبب"))
+    return academic_lock_state()
+
+
+def relock_academic_numbers(by_user="") -> dict:
+    _academic_lock_cfg(academic_unlock_until="", academic_yearend_until="")
+    academic_lock_log("relock", by_user, "")
+    return academic_lock_state()
+
+
+def open_yearend_academic_window(by_user="") -> dict:
+    """«إنهاء السنة وترحيل الطلاب» يفتح القفل أياماً — لإعادة الترقيم مع العام الجديد إن لزم."""
+    until = datetime.datetime.now() + datetime.timedelta(days=ACADEMIC_YEAREND_DAYS)
+    _academic_lock_cfg(academic_yearend_until=until.isoformat(timespec="seconds"))
+    academic_lock_log("yearend", by_user, "حتى %s" % until.strftime("%Y-%m-%d"))
+    return academic_lock_state()
+
+
+def _iter_students(classes):
+    for c in classes or []:
+        for s in c.get("students") or []:
+            yield s
+
+
+def _registry_read(con):
+    """({طالب: رقمه الحالي}، {رقم: صاحبه} لكل رقمٍ استُعمل يوماً)."""
+    active, owner = {}, {}
+    for an, sid, act in con.execute(
+            "SELECT academic_no, student_id, active FROM academic_registry"):
+        owner[an] = sid
+        if act:
+            active[sid] = an
+    return active, owner
+
+
+def _registry_seed(con, classes, now, active, owner):
+    """يسجّل أرقام كشفٍ قائم لم يعرفها السجلّ بعد — ترقيةٌ من إصدار قبل القفل."""
+    for s in _iter_students(classes):
+        sid = str(s.get("id") or "").strip()
+        an = str(s.get("academic_no") or "").strip()
+        if sid and an and sid not in active and an not in owner:
+            con.execute("INSERT INTO academic_registry (academic_no, student_id, student_name, "
+                        "active, assigned_at) VALUES (?,?,?,1,?)",
+                        (an, sid, s.get("name", "") or "", now))
+            active[sid] = an
+            owner[an] = sid
+
+
+def academic_registry_snapshot(classes=None):
+    """({طالب: رقمه}، {رقم: صاحبه}) بعد زرع `classes` — للتوليد."""
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    con = get_db()
+    try:
+        _academic_tables(con)
+        active, owner = _registry_read(con)
+        _registry_seed(con, classes, now, active, owner)
+        con.commit()
+        return active, owner
+    finally:
+        con.close()
+
+
+def protect_academic_numbers(classes, old_classes=None, unlocked=None) -> dict:
+    """
+    يطبّق القفل على `classes` في مكانها قبل كتابتها، ويُرجع أعداد ما جرى.
+    `old_classes`: الكشف الحالي على القرص — تُزرع أرقامه إن لم يعرفها السجلّ.
+    """
+    if unlocked is None:
+        unlocked = not academic_lock_state()["locked"]
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    rep = {"restored": 0, "blocked": 0, "changed": 0, "registered": 0, "conflicts": 0}
+    con = get_db()
+    try:
+        _academic_tables(con)
+        active, owner = _registry_read(con)
+        _registry_seed(con, old_classes, now, active, owner)
+
+        def _register(an, sid, name):
+            con.execute("INSERT INTO academic_registry (academic_no, student_id, student_name, "
+                        "active, assigned_at) VALUES (?,?,?,1,?)", (an, sid, name or "", now))
+            active[sid] = an
+            owner[an] = sid
+
+        seen = {}
+        for s in _iter_students(classes):
+            sid = str(s.get("id") or "").strip()
+            if not sid:
+                continue
+            an = str(s.get("academic_no") or "").strip()
+            reg = active.get(sid)
+            if an and seen.get(an, sid) != sid:          # رقمٌ واحد لطالبين في الكشف نفسه
+                an = ""
+                rep["conflicts"] += 1
+            if reg and not an:
+                s["academic_no"] = reg
+                rep["restored"] += 1
+                an = reg
+            elif reg and an != reg:
+                if owner.get(an) not in (None, sid):      # رقم طالبٍ آخر — حاضرٍ أو سابق
+                    s["academic_no"] = reg
+                    rep["conflicts"] += 1
+                    an = reg
+                elif unlocked:
+                    con.execute("UPDATE academic_registry SET active=0, retired_at=? "
+                                "WHERE academic_no=?", (now, reg))
+                    if an in owner:                       # رقمه هو السابق يعود إليه
+                        con.execute("UPDATE academic_registry SET active=1, retired_at='' "
+                                    "WHERE academic_no=?", (an,))
+                        active[sid] = an
+                    else:
+                        _register(an, sid, s.get("name", ""))
+                    rep["changed"] += 1
+                else:
+                    s["academic_no"] = reg
+                    rep["blocked"] += 1
+                    an = reg
+            elif not reg and an:
+                if owner.get(an) not in (None, sid):
+                    s.pop("academic_no", None)
+                    rep["conflicts"] += 1
+                    an = ""
+                elif an in owner:                         # رقمه السابق، ولا رقم حالياً له
+                    con.execute("UPDATE academic_registry SET active=1, retired_at='' "
+                                "WHERE academic_no=?", (an,))
+                    active[sid] = an
+                else:
+                    _register(an, sid, s.get("name", ""))
+                    rep["registered"] += 1
+            if an:
+                seen[an] = sid
+        con.commit()
+    finally:
+        con.close()
+    for key, action, text in (
+            ("blocked", "blocked", "مُنع تغيير %d رقماً أكاديمياً — القفل مغلق"),
+            ("changed", "changed", "تغيّر %d رقماً أكاديمياً والقفل مفتوح"),
+            ("restored", "restored", "أُعيد %d رقماً أكاديمياً سقط من كشفٍ يُكتب"),
+            ("conflicts", "conflict", "رُفض %d رقماً يملكه طالبٌ آخر")):
+        if rep[key]:
+            try:
+                academic_lock_log(action, "", text % rep[key])
+            except Exception:
+                pass
+    return rep
+
+
+def _carry_numbers_from(old_classes, classes) -> int:
+    """احتياطٌ بلا قاعدة: يُعيد لكل طالبٍ رقمه من الكشف القائم إن غاب أو تغيّر."""
+    old = {}
+    for s in _iter_students(old_classes):
+        sid, an = str(s.get("id") or "").strip(), str(s.get("academic_no") or "").strip()
+        if sid and an:
+            old[sid] = an
+    n = 0
+    for s in _iter_students(classes):
+        sid = str(s.get("id") or "").strip()
+        if sid in old and str(s.get("academic_no") or "").strip() != old[sid]:
+            s["academic_no"] = old[sid]
+            n += 1
+    return n
+
+
+def write_students_file(classes, path=None) -> dict:
+    """
+    البوابة الوحيدة لكتابة كشف الطلاب: قفل الأرقام الأكاديمية ثم الكتابة.
+    لا تكتب students.json بغيرها (يحرسه tools/test_academic_lock.py).
+    """
+    path = path or STUDENTS_JSON
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            old = (json.load(f) or {}).get("classes") or []
+    except Exception:
+        old = []
+    try:
+        rep = protect_academic_numbers(classes, old_classes=old)
+    except Exception as e:
+        # القاعدة تعذّرت؟ لا يُكتب كشفٌ بلا أرقام — يُحمل الرقم من الكشف القائم
+        print(f"[ACADEMIC-LOCK] تعذّر السجلّ ({e}) — حُملت الأرقام من الكشف القائم")
+        rep = {"carried": _carry_numbers_from(old, classes), "error": str(e)}
+    _safe_write_json(path, {"classes": classes})
+    return rep
+
+
 def assign_academic_numbers(force=False, year=2027, base=None):
     """
     يولّد رقماً أكاديمياً مُهيكلاً لكل طالب لا يملكه.
@@ -1350,18 +1633,34 @@ def assign_academic_numbers(force=False, year=2027, base=None):
 
     idempotent: لا يمسّ رقماً موجوداً أبداً (البصمات على الأجهزة مربوطة
     به). يملأ الناقص فقط. force=True يُعيد توليد الكل (للطوارئ فقط —
-    يُبطل كل تسجيلات الأجهزة القائمة). يُخزَّن الرقم في سجلّ الطالب نفسه
-    فيبقى ثابتاً عبر السنوات ويصلح للطباعة على البطاقات.
+    يُبطل كل تسجيلات الأجهزة القائمة) — **ولا يجوز والقفل مغلق**
+    (`AcademicLocked`). يُخزَّن الرقم في سجلّ الطالب نفسه فيبقى ثابتاً
+    عبر السنوات ويصلح للطباعة على البطاقات.
+
+    والسجلّ `academic_registry` يمنع إعادة الاستعمال: الطالب العائد يأخذ
+    رقمه، ولا يُعطى رقمٌ استُعمل يوماً لغير صاحبه — بصمته قد تبقى على الجهاز.
     """
+    if force and academic_lock_state()["locked"]:
+        raise AcademicLocked(ACADEMIC_LOCKED_MSG)
     store = load_students(force_reload=True)
     classes = store.get("list", [])
-    used = set()
+    reg_active, reg_owner = academic_registry_snapshot(classes)
+    used = set(reg_owner)              # كل رقمٍ استُعمل يوماً — حاضراً أو سابقاً
     if not force:
         for c in classes:
             for s in c.get("students", []):
                 an = str(s.get("academic_no") or "").strip()
                 if an:
                     used.add(an)
+    returned = 0
+    if not force:
+        # الطالب العائد (حُذف ثم أُعيد) يأخذ رقمه نفسه لا رقماً جديداً
+        for c in classes:
+            for s in c.get("students", []):
+                sid = str(s.get("id") or "").strip()
+                if not str(s.get("academic_no") or "").strip() and sid in reg_active:
+                    s["academic_no"] = reg_active[sid]
+                    returned += 1
 
     assigned = 0
     if base is not None:
@@ -1394,14 +1693,14 @@ def assign_academic_numbers(force=False, year=2027, base=None):
             assigned += 1
             k += 1
 
-    if assigned:
+    if assigned or returned:
         save_students(classes)
         try:
             constants.STUDENTS_STORE = None
         except Exception:
             pass
     total = sum(len(c.get("students", [])) for c in classes)
-    return {"assigned": assigned, "total": total,
+    return {"assigned": assigned, "returned": returned, "total": total,
             "already": total - assigned,
             "base": base, "first": lo, "last": hi}
 
@@ -3277,7 +3576,8 @@ def import_students_from_excel_sheet2_format(xlsx_path: str,
     # الأرقام الأكاديمية (الملف لا يعرفها)، فيضيع رقم كل طالب وتنفصل بصمته
     # على جهاز الحضور. المعاينة تحتاج التحليل بلا كتابة.
     if not dry_run:
-        _safe_write_json(STUDENTS_JSON, data)
+        # الملف لا يعرف الأرقام الأكاديمية — البوابة تُعيد لكل طالب رقمه
+        write_students_file(data["classes"])
 
     # تفاصيل كل رمز مجهول (العدد والفصول) لتعرضها نافذة الترميز —
     # المزوّد يقرّر بناءً على أعداد حقيقية لا على رمز مجرّد.
@@ -3582,6 +3882,63 @@ def move_or_update_student(student_id, new_class_id=None, name=None, phone=None)
     constants.STUDENTS_STORE = None
     return {"ok": True, "moved_to": moved_to,
             "academic_no": str(rec.get("academic_no") or "")}
+
+
+# ── تحديث الجوالات من نور ─────────────────────────────────────────
+# طلب ماهر (٢٦ أكتوبر ٢٠٢٦): مدرسةٌ تريد تحديث جوالات أولياء الأمور من نور.
+# الاستيراد الكامل يستبدل السجلات، و«المعاينة» تملأ الجوال الفارغ وحده —
+# فلا طريق كان يغيّر الجوال وحده. هذا يطابق بالهوية ويغيّر الجوال لا غير:
+# لا يُضيف ولا يحذف ولا ينقل، والرقم الأكاديمي والفصل والبصمة كما هي.
+def _phone_key(phone) -> str:
+    """آخر ٩ أرقام — ‎0501234567 و‎966501234567 رقمٌ واحد لا تغيير."""
+    d = re.sub(r"\D", "", str(phone or ""))
+    return d[-9:] if len(d) >= 9 else d
+
+
+def plan_phone_update(xlsx_path: str) -> Dict[str, Any]:
+    """يقارن جوالات ملف نور بالكشف بالهوية — لا يكتب شيئاً."""
+    parsed = import_students_from_excel_sheet2_format(xlsx_path, dry_run=True)
+    new_map = _index_students_by_id((parsed or {}).get("classes") or [])
+    cur_map = _index_students_by_id(_read_current_classes())
+    changes, same, file_empty = [], 0, 0
+    for sid, (cs, cc) in cur_map.items():
+        hit = new_map.get(sid)
+        if not hit:
+            continue
+        newp = str(hit[0].get("phone") or "").strip()
+        oldp = str(cs.get("phone") or "").strip()
+        if not newp:
+            file_empty += 1                     # الفارغ في الملف لا يمحو جوالاً قائماً
+        elif _phone_key(newp) == _phone_key(oldp):
+            same += 1
+        else:
+            changes.append({"id": sid, "name": cs.get("name", ""),
+                            "class_name": cc.get("name", ""), "old": oldp, "new": newp})
+    matched = sum(1 for sid in cur_map if sid in new_map)
+    return {"changes": changes,
+            "counts": {"current": len(cur_map), "in_file": len(new_map), "matched": matched,
+                       "change": len(changes), "same": same, "file_empty": file_empty,
+                       "not_in_file": len(cur_map) - matched,
+                       "not_in_list": sum(1 for sid in new_map if sid not in cur_map)},
+            "notes": (parsed or {}).get("_notes") or []}
+
+
+def apply_phone_update(xlsx_path: str) -> Dict[str, Any]:
+    """يطبّق خطة الجوالات من الملف نفسه — الجوال وحده يتغيّر."""
+    plan = plan_phone_update(xlsx_path)
+    want = {c["id"]: c["new"] for c in plan["changes"]}
+    updated = 0
+    if want:
+        classes = load_students(force_reload=True).get("list", []) or []
+        for s in _iter_students(classes):
+            sid = str(s.get("id") or "").strip()
+            if sid in want:
+                s["phone"] = want[sid]
+                updated += 1
+        if updated:
+            save_students(classes)
+            constants.STUDENTS_STORE = None
+    return {"ok": True, "updated": updated, "counts": plan["counts"]}
 
 
 # ── سجلّات المعلمين (teachers.json) ──────────────────────────────
@@ -4316,6 +4673,7 @@ def load_students(force_reload: bool = False) -> Dict[str, Any]:
             if classes:
                 try:
                     ensure_dirs()
+                    # مرآةٌ من الخادم: هو المرجع وقفله عنده — بلا بوابة عمداً
                     _safe_write_json(STUDENTS_JSON, {"classes": classes})
                 except Exception as e:
                     print(f"[SYNC-STUDENTS-ERROR] {e}")
@@ -4380,7 +4738,7 @@ def save_students(classes_list: List[Dict[str, Any]]) -> bool:
     try:
         from constants import STUDENTS_JSON, ensure_dirs
         ensure_dirs()
-        _safe_write_json(STUDENTS_JSON, {"classes": classes_list})
+        write_students_file(classes_list, path=STUDENTS_JSON)
         # تحديث المخزن في الذاكرة
         constants.STUDENTS_STORE = {"list": classes_list, "by_id": {c["id"]: c for c in classes_list}}
         return True
@@ -6037,7 +6395,11 @@ def apply_promotion_plan(plan: dict, graduate_top: bool = True) -> dict:
         moved += len(src["students"])
         src["students"] = []
 
-    _safe_write_json(STUDENTS_JSON, {"classes": classes})
+    write_students_file(classes)
     constants.STUDENTS_STORE = None
+    try:
+        open_yearend_academic_window("إنهاء السنة وترحيل الطلاب")
+    except Exception as e:
+        print(f"[ACADEMIC-LOCK] تعذّر فتح نافذة نهاية السنة: {e}")
     return {"moved": moved, "graduated": graduated, "created": created,
             "classes": len(classes)}

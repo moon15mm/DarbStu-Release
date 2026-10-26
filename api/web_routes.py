@@ -1111,6 +1111,75 @@ async def web_reports_attendance_export(request: Request):
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 
 
+# ── التقرير التفصيلي: سجلٌّ لكل فصل — الطالب صفّاً واليوم عموداً ──────────
+def _detailed_report(request: Request):
+    from attendance_report import build_detailed_register, resolve_range
+    q = request.query_params
+    start, end = resolve_range(str(q.get("preset") or "month"), q.get("from"), q.get("to"))
+    return build_detailed_register(
+        start, end, _roster_rows(), mode=str(q.get("mode") or "both").strip(),
+        class_id=(q.get("class_id") or "").strip() or None,
+        level=(q.get("level") or "").strip() or None)
+
+
+def _detailed_allowed(request: Request) -> bool:
+    user = _get_current_user(request)
+    return bool(user and user.get("role") in ("admin", "deputy"))
+
+
+@router.get("/web/api/reports/detailed", response_class=JSONResponse)
+async def web_reports_detailed(request: Request):
+    """التقرير التفصيلي للعرض: لكل فصل كشفُ طلابه بخانات الأيام ومجاميعها."""
+    if not _detailed_allowed(request):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        return JSONResponse(_detailed_report(request))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+@router.get("/web/api/reports/detailed-print")
+async def web_reports_detailed_print(request: Request):
+    """كل فصلٍ في صفحة A4 أفقية، تطبع نفسها — ومنها «حفظ PDF» في نافذة الطباعة."""
+    if not _detailed_allowed(request):
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse("/web/login")
+    try:
+        from attendance_report import build_detailed_print_html
+        html = build_detailed_print_html(_detailed_report(request),
+                                         load_config().get("school_name", ""))
+        html = html.replace(
+            "</body>", "<script>window.onload=function(){window.print();}</script></body>")
+        return HTMLResponse(html)
+    except Exception as e:
+        return HTMLResponse("<html dir='rtl'><body><h3>تعذّر تجهيز الطباعة: "
+                            + str(e) + "</h3></body></html>")
+
+
+@router.get("/web/api/reports/detailed-export")
+async def web_reports_detailed_export(request: Request):
+    """ملف Excel: ورقةٌ لكل فصل بأعمدة الطباعة نفسها."""
+    if not _detailed_allowed(request):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        from attendance_report import build_detailed_workbook
+        rep = _detailed_report(request)
+        data = build_detailed_workbook(rep, load_config().get("school_name", ""))
+        import io as _io
+        from fastapi.responses import StreamingResponse
+        name = "detailed_%s_%s_%s.xlsx" % (rep["mode"], rep["from"], rep["to"])
+        return StreamingResponse(
+            _io.BytesIO(data),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": 'attachment; filename="%s"' % name})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
 def _school_public_url() -> str:
     """
     رابط المدرسة الذي يُرسَل للطاقم — بترتيب الأوثق فالأضعف.
@@ -1412,6 +1481,66 @@ async def web_import_apply(request: Request):
             pass
         load_students(force_reload=True)
         return JSONResponse({"ok": True, **res})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+# ── تحديث الجوالات من نور: الجوال وحده يتغيّر ─────────────────────────
+# كالاستيراد بمعاينة: الملف يُحفظ مؤقتاً برمز، والتطبيق يعيد الحساب منه.
+_PHONES_PENDING = {}
+
+
+@router.post("/web/api/phones-update/preview", response_class=JSONResponse)
+async def web_phones_update_preview(request: Request):
+    user = _get_current_user(request)
+    if not user or user.get("role") not in ("admin", "deputy"):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        import tempfile, secrets as _secrets
+        form = await request.form()
+        upload = form.get("file")
+        if not upload:
+            return JSONResponse({"ok": False, "msg": "لم يتم رفع ملف"})
+        fn = getattr(upload, "filename", "") or ""
+        tmp = tempfile.NamedTemporaryFile(delete=False, prefix="phones_prev_",
+                                          suffix=".xls" if fn.lower().endswith(".xls") else ".xlsx")
+        tmp.write(await upload.read())
+        tmp.close()
+        from database import plan_phone_update
+        plan = plan_phone_update(tmp.name)
+        for _t, _p in list(_PHONES_PENDING.items()):
+            try:
+                os.unlink(_p)
+            except Exception:
+                pass
+            _PHONES_PENDING.pop(_t, None)
+        token = _secrets.token_urlsafe(16)
+        _PHONES_PENDING[token] = tmp.name
+        return JSONResponse({"ok": True, "token": token, **plan})
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
+
+
+@router.post("/web/api/phones-update/apply", response_class=JSONResponse)
+async def web_phones_update_apply(request: Request):
+    user = _get_current_user(request)
+    if not user or user.get("role") not in ("admin", "deputy"):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        body = await request.json()
+        path = _PHONES_PENDING.pop(str(body.get("token") or ""), None)
+        if not path or not os.path.exists(path):
+            return JSONResponse({"ok": False, "msg": "انتهت صلاحية المعاينة — أعد رفع الملف"})
+        from database import apply_phone_update
+        try:
+            res = apply_phone_update(path)
+        finally:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+        load_students(force_reload=True)
+        return JSONResponse(res)
     except Exception as e:
         return JSONResponse({"ok": False, "msg": str(e)}, status_code=500)
 
@@ -3193,6 +3322,7 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
   <div class="it">
     <button class="itb active" onclick="si('reports_print','rp-mon');arInit()">رصد الغياب والتأخر</button>
     <button class="itb" onclick="si('reports_print','rp-good');gdInit()">الطلاب المنضبطون</button>
+    <button class="itb" onclick="si('reports_print','rp-det');dtInit()">التقرير التفصيلي</button>
   </div>
 
   <!-- ══ الرصد الشامل: غياب وتأخر ودقائق معاً ══
@@ -3326,6 +3456,45 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
       <div id="gd-st" style="margin-top:10px;font-size:13px"></div>
     </div>
     <div id="gd-res"></div>
+  </div>
+  <!-- ══ التقرير التفصيلي: سجلٌّ لكل فصل — الطالب صفّاً واليوم عموداً ══
+       طلب ماهر: كشفٌ لكل فصل يعرض غياب كل طالب أو تأخره مع خانة المجموع،
+       للغياب وحده أو التأخر وحده أو لهما، يُطبع ويُحفظ. -->
+  <div id="rp-det" class="ip">
+    <div class="section">
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
+        <button class="btn bp2 bsm" onclick="dtPreset('week')">هذا الأسبوع</button>
+        <button class="btn bp2 bsm" onclick="dtPreset('last_week')">الأسبوع الماضي</button>
+        <button class="btn bp2 bsm" onclick="dtPreset('month')">هذا الشهر</button>
+        <button class="btn bp2 bsm" onclick="dtPreset('last_month')">الشهر الماضي</button>
+        <button class="btn bp2 bsm" onclick="dtPreset('term')">الفصل الدراسي</button>
+      </div>
+      <div class="fg2">
+        <div class="fg"><label class="fl">من تاريخ</label>
+          <input type="date" id="dt-from"></div>
+        <div class="fg"><label class="fl">إلى تاريخ</label>
+          <input type="date" id="dt-to"></div>
+        <div class="fg"><label class="fl">الصف</label>
+          <select id="dt-lvl" onchange="fillSections('dt-lvl','dt-cls')">
+            <option value="">كل الصفوف</option></select></div>
+        <div class="fg"><label class="fl">الشعبة</label>
+          <select id="dt-cls"><option value="">جميع الشعب</option></select></div>
+        <div class="fg"><label class="fl">نوع التقرير</label>
+          <select id="dt-mode">
+            <option value="both">الغياب والتأخر</option>
+            <option value="absence">الغياب فقط</option>
+            <option value="tardy">التأخر فقط</option>
+          </select></div>
+      </div>
+      <div class="ab ai" style="margin-top:10px">📋 لكل فصل كشفٌ بطلابه: كل يومٍ دراسيٍّ عمود — «غ» غياب، و«ع» غياب بعذر، والرقم دقائق التأخر — ومعه خانة المجموع لكل طالب ولكل يوم. للطباعة الأوضح اختر شهراً واحداً.</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+        <button class="btn bp1" onclick="dtRun()">📊 إنشاء التقرير</button>
+        <button class="btn bp2" onclick="dtOpen('print')">🖨️ طباعة أو حفظ PDF</button>
+        <button class="btn bp2" onclick="dtOpen('export')">⬇️ تصدير Excel</button>
+      </div>
+      <div id="dt-st" style="margin-top:10px;font-size:13px"></div>
+    </div>
+    <div id="dt-res"></div>
   </div>
 </div>
 
@@ -4028,6 +4197,19 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
 
 <div id="tab-phones">
   <h2 class="pt"><i class="fas fa-mobile-alt"></i> إدارة أرقام الجوالات</h2>
+  <div class="section" id="phup">
+    <div class="st">📥 تحديث الجوالات من ملف نور</div>
+    <div class="ab ai" style="margin-bottom:10px">يطابق كل طالب برقم هويته ويغيّر <b>الجوال وحده</b> — لا يضيف ولا يحذف ولا ينقل، والرقم الأكاديمي والبصمة كما هي. والجوال الفارغ في الملف لا يمحو جوالاً قائماً.</div>
+    <input type="file" id="phup-file" accept=".xlsx,.xls">
+    <button class="btn bp1" style="margin-top:10px" onclick="previewPhones()">🔍 معاينة التغييرات</button>
+    <div id="phup-st" style="margin-top:10px"></div>
+    <div id="phup-wrap" style="display:none;margin-top:12px">
+      <div id="phup-sum" style="display:flex;gap:7px;flex-wrap:wrap;margin-bottom:12px"></div>
+      <div id="phup-list"></div>
+      <button class="btn bp1" style="margin-top:10px" onclick="applyPhones()">✅ تطبيق التحديث</button>
+      <button class="btn bp2" style="margin-top:10px" onclick="cancelPhones()">إلغاء</button>
+    </div>
+  </div>
   <div class="section">
     <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:14px">
       <div class="fg" style="flex:1"><label class="fl">بحث</label><input type="text" id="ph-q" placeholder="اسم أو جوال..." oninput="filterStudents()"></div>
@@ -6835,6 +7017,104 @@ function arRender(d){
 function arOpen(kind){
   var path=(kind==='print')?'attendance-print':'attendance-export';
   window.open('/web/api/reports/'+path+'?'+arQuery(),'_blank');
+}
+
+/* ══ التقرير التفصيلي: سجلٌّ لكل فصل — الطالب صفّاً واليوم عموداً ══ */
+var _dtPreset='month';
+var _DT_WD=['أحد','اثنين','ثلاثاء','أربعاء','خميس','جمعة','سبت'];   // getUTCDay: الأحد=0
+
+async function dtInit(){
+  if(!(_classes||[]).length){ try{ await loadClasses(); }catch(e){} }
+  fillLevels('dt-lvl'); fillSections('dt-lvl','dt-cls');
+  if(!document.getElementById('dt-from').value) dtPreset('month');
+}
+
+function dtQuery(){
+  function v(id){var e=document.getElementById(id);return e?e.value:'';}
+  var q='preset='+encodeURIComponent(_dtPreset);
+  q+='&from='+encodeURIComponent(v('dt-from'))+'&to='+encodeURIComponent(v('dt-to'));
+  q+='&mode='+encodeURIComponent(v('dt-mode'))
+     +'&class_id='+encodeURIComponent(v('dt-cls'))+'&level='+encodeURIComponent(v('dt-lvl'));
+  return q;
+}
+
+function dtPreset(p){ _dtPreset=p; dtRun(); }
+
+// تعديل تاريخٍ يدوياً يعني «مخصص» — وإلا تجاهله الخادم وبقي الاختصار
+document.addEventListener('change',function(e){
+  if(e.target&&(e.target.id==='dt-from'||e.target.id==='dt-to')) _dtPreset='custom';
+});
+
+async function dtRun(){
+  ss('dt-st','⏳ جارٍ إعداد الكشوف...','ai');
+  try{
+    var d=await api('/web/api/reports/detailed?'+dtQuery());
+    if(!d||!d.ok){ ss('dt-st','❌ '+((d&&d.msg)||'تعذّر إنشاء التقرير'),'er'); return; }
+    // التواريخ من الخادم لا من المتصفح: ساعتُه قد تكون مضبوطة خطأً
+    document.getElementById('dt-from').value=d.from;
+    document.getElementById('dt-to').value=d.to;
+    ss('dt-st','','');
+    dtRender(d);
+  }catch(e){ ss('dt-st','❌ خطأ في الاتصال','er'); }
+}
+
+function dtEsc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// غ غياب · ع غياب بعذر · الرقم دقائق التأخر (ت بلا دقائق) — كالطباعة حرفاً
+function dtCell(c){
+  if(!c) return '';
+  var p=[];
+  if(c.a) p.push(c.a==='x'?'ع':'غ');
+  if(c.t!==undefined) p.push(c.t?String(c.t):'ت');
+  return p.join('/');
+}
+
+function dtRender(d){
+  var box=document.getElementById('dt-res');
+  var cols=[];
+  if(d.include_absence) cols.push(['الغياب','absence'],['منها بعذر','excused']);
+  if(d.include_tardy) cols.push(['التأخر','tardy'],['دقائق التأخر','minutes']);
+  var h='<div class="stat-cards">'+crd(d.classes.length,'#1565C0','عدد الفصول','🏫')
+       +crd(d.school_days,'#15616D','أيام الدراسة','📅');
+  if(d.include_absence) h+=crd(d.totals.absence,'#C62828','إجمالي الغياب','🔴');
+  if(d.include_tardy) h+=crd(d.totals.tardy,'#E06A0C','إجمالي التأخر','⏱');
+  h+='</div>';
+  if(!d.classes.length){ box.innerHTML=h+'<div class="ab ai">لا فصول مطابقة لهذه الخيارات.</div>'; return; }
+  var dh=d.days.map(function(x){
+    var dt=new Date(x+'T00:00:00Z');
+    return '<th style="min-width:30px">'+dt.getUTCDate()+'<br><small>'+_DT_WD[dt.getUTCDay()]+'</small></th>';
+  }).join('');
+  d.classes.forEach(function(c){
+    h+='<div class="section" style="margin-top:12px"><div class="st">'+dtEsc(c.class_name)
+      +' <span style="color:var(--mu);font-weight:400;font-size:13px">('+c.students.length+')</span></div>';
+    h+='<div class="tw" style="overflow-x:auto"><table><thead><tr><th>م</th><th style="text-align:right">الاسم</th>'
+      +dh+cols.map(function(k){return '<th>'+k[0]+'</th>';}).join('')+'</tr></thead><tbody>';
+    c.students.forEach(function(r,i){
+      h+='<tr><td>'+(i+1)+'</td><td style="text-align:right;white-space:nowrap">'+dtEsc(r.name)+'</td>';
+      d.days.forEach(function(x){
+        var cl=r.cells[x];
+        var col=cl?(cl.a?'#B42318':'#1849A9'):'';
+        h+='<td style="color:'+col+';font-weight:700">'+dtCell(cl)+'</td>';
+      });
+      cols.forEach(function(k){ h+='<td style="background:#F1F5F3;font-weight:700">'+r[k[1]]+'</td>'; });
+      h+='</tr>';
+    });
+    h+='<tr style="background:#E8F0EC;font-weight:700"><td colspan="2">المجموع</td>';
+    d.days.forEach(function(x){
+      var p=[];
+      if(d.include_absence) p.push(c.day_absence[x]);
+      if(d.include_tardy) p.push(c.day_tardy[x]);
+      h+='<td>'+p.join(' / ')+'</td>';
+    });
+    cols.forEach(function(k){ h+='<td>'+c.totals[k[1]]+'</td>'; });
+    h+='</tr></tbody></table></div></div>';
+  });
+  box.innerHTML=h;
+}
+
+function dtOpen(kind){
+  var path=(kind==='print')?'detailed-print':'detailed-export';
+  window.open('/web/api/reports/'+path+'?'+dtQuery(),'_blank');
 }
 
 /* ══ الطلاب المنضبطون ══ */
@@ -10018,6 +10298,56 @@ async function applyNoorImport(){
     document.getElementById('np-wrap').style.display='none';
     if(typeof loadStudents==='function')loadStudents();
   }catch(e){ss('np-st','❌ خطأ في الاتصال','er');}
+}
+
+/* ── تحديث الجوالات من نور — الجوال وحده يتغيّر، والرقم الأكاديمي كما هو ── */
+var _phToken=null;
+async function previewPhones(){
+  var f=document.getElementById('phup-file').files[0];
+  if(!f){ss('phup-st','اختر ملف نور أولاً','er');return;}
+  ss('phup-st','⏳ جارٍ مقارنة الجوالات بالكشف...','ai');
+  document.getElementById('phup-wrap').style.display='none';
+  var fd=new FormData();fd.append('file',f);
+  try{
+    var r=await fetch('/web/api/phones-update/preview',{method:'POST',body:fd});
+    var d=await r.json();
+    if(!d.ok){ss('phup-st','❌ '+(d.msg||'تعذّر التحليل'),'er');return;}
+    _phToken=d.token;
+    var c=d.counts||{};
+    document.getElementById('phup-sum').innerHTML=
+      _npChip(c.change||0,'سيتغيّر جواله','#E06A0C')+
+      _npChip(c.same||0,'مطابق','#059669')+
+      _npChip(c.file_empty||0,'فارغ في الملف (يبقى كما هو)','#6B7280')+
+      _npChip(c.not_in_file||0,'في الكشف وليس في الملف','#6B7280')+
+      _npChip(c.not_in_list||0,'في الملف وليس في الكشف (لا يُضاف)','#6B7280');
+    var rows=d.changes||[];
+    document.getElementById('phup-list').innerHTML=rows.length?
+      _npTable('📱 الجوالات التي ستتغيّر',rows,['الطالب','الفصل','الجوال الحالي','الجوال الجديد'],
+        function(x){return [x.name,x.class_name,x.old,x.new];}):
+      '<div class="ab ai">لا تغيير — جوالات الملف مطابقة للكشف.</div>';
+    document.getElementById('phup-wrap').style.display='';
+    ss('phup-st',rows.length?'✅ راجع التغييرات ثم طبّقها':'لا تغيير','ok');
+  }catch(e){ss('phup-st','❌ خطأ في الاتصال','er');}
+}
+async function applyPhones(){
+  if(!_phToken){ss('phup-st','لا توجد معاينة سارية — أعد رفع الملف','er');return;}
+  ss('phup-st','⏳ جارٍ التطبيق...','ai');
+  try{
+    var r=await fetch('/web/api/phones-update/apply',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({token:_phToken})});
+    var d=await r.json();
+    _phToken=null;
+    if(!d.ok){ss('phup-st','❌ '+(d.msg||'فشل التطبيق'),'er');return;}
+    ss('phup-st','✅ تم تحديث '+(d.updated||0)+' جوالاً — ولم يتغيّر شيءٌ غيره','ok');
+    document.getElementById('phup-wrap').style.display='none';
+    document.getElementById('phup-file').value='';
+    if(typeof loadStudents==='function')loadStudents();
+  }catch(e){ss('phup-st','❌ خطأ في الاتصال','er');}
+}
+function cancelPhones(){
+  _phToken=null;
+  document.getElementById('phup-wrap').style.display='none';
+  ss('phup-st','أُلغيت المعاينة — لم يتغيّر شيء','ai');
 }
 
 /* ── تقرير الرسائل المُرسَلة ── */

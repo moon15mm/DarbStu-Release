@@ -511,6 +511,7 @@ class AppGUI(
         m = tk.Menu(root); root.config(menu=m)
         filem = tk.Menu(m, tearoff=0); m.add_cascade(label="ملف", menu=filem)
         filem.add_command(label="إعادة استيراد الطلاب...", command=self.reimport_students)
+        filem.add_command(label="تحديث الجوالات من نور...", command=self.update_phones_from_noor)
         filem.add_command(label="إعادة استيراد المعلمين...", command=self.reimport_teachers)
         filem.add_separator()
         filem.add_command(label="إعدادات المدرسة...", command=self._open_school_settings_tab)
@@ -583,6 +584,57 @@ class AppGUI(
         path = filedialog.askopenfilename(title="اختر ملف Excel (طلاب)", filetypes=[("Excel files","*.xlsx *.xls")])
         if not path: return
         self._preview_import(path)
+
+    def update_phones_from_noor(self):
+        """
+        يغيّر جوالات أولياء الأمور من ملف نور — الجوال وحده: لا إضافة ولا حذف
+        ولا نقل، والرقم الأكاديمي (وبصمة الطالب المربوطة به) كما هو.
+        """
+        path = filedialog.askopenfilename(title="اختر ملف الطلاب من نور",
+                                          filetypes=[("Excel files", "*.xlsx *.xls")])
+        if not path:
+            return
+        try:
+            from database import plan_phone_update, apply_phone_update
+            self.root.config(cursor="watch"); self.root.update_idletasks()
+            plan = plan_phone_update(path)
+        except Exception as e:
+            messagebox.showerror("تعذّر قراءة الملف",
+                                 "تعذّرت قراءة ملف نور:\n\n%s\n\nتأكد أنه كشف الطلاب من نور "
+                                 "وأنه غير مفتوح في برنامج آخر." % e, parent=self.root)
+            return
+        finally:
+            self.root.config(cursor="")
+        c = plan.get("counts") or {}
+        if not c.get("change"):
+            messagebox.showinfo("لا تغيير",
+                                "جوالات الملف مطابقة للكشف — لا شيء يُحدَّث.\n\n"
+                                "مطابق: %d · فارغ في الملف: %d · ليس في الملف: %d"
+                                % (c.get("same", 0), c.get("file_empty", 0), c.get("not_in_file", 0)),
+                                parent=self.root)
+            return
+        sample = "\n".join("  • %s: %s ← %s" % (x["name"], x["old"] or "—", x["new"])
+                           for x in plan["changes"][:8])
+        more = "\n  …و%d غيرهم" % (c["change"] - 8) if c["change"] > 8 else ""
+        msg = ("سيتغيّر جوال %d طالباً:\n\n%s%s\n\n"
+               "مطابق: %d · فارغ في الملف (يبقى كما هو): %d\n"
+               "في الكشف وليس في الملف: %d · في الملف وليس في الكشف (لا يُضاف): %d\n\n"
+               "لا يُضاف أحد ولا يُحذف ولا يُنقل، والأرقام الأكاديمية كما هي.\n\nهل أطبّق؟"
+               % (c["change"], sample, more, c.get("same", 0), c.get("file_empty", 0),
+                  c.get("not_in_file", 0), c.get("not_in_list", 0)))
+        if not messagebox.askyesno("تحديث الجوالات من نور", msg, parent=self.root):
+            return
+        try:
+            res = apply_phone_update(path)
+        except Exception as e:
+            messagebox.showerror("فشل التحديث", str(e), parent=self.root)
+            return
+        try:
+            self.update_all_tabs_after_data_change()
+        except Exception:
+            self.store = load_students(force_reload=True)
+        messagebox.showinfo("تم", "تم تحديث %d جوالاً — ولم يتغيّر شيءٌ غيره."
+                            % res.get("updated", 0), parent=self.root)
 
     def _preview_import(self, xlsx_path: str):
         import threading as _th

@@ -357,6 +357,64 @@ async def bio_number_plan(request: Request):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
+# ── قفل الأرقام الأكاديمية ───────────────────────────────────────────
+# لا يتغيّر رقمٌ إلا بعد «إنهاء السنة وترحيل الطلاب» أو بفتحٍ يدوي مؤقت من
+# مدير النظام بكلمة مروره (database.academic_lock_state). والفتح للمدير وحده.
+def _admin_user(request):
+    from api.web_routes import _get_current_user
+    u = _get_current_user(request)
+    return u if u and u.get("role") == "admin" else None
+
+
+@router.get("/web/api/biometric/academic-lock", response_class=JSONResponse)
+async def bio_academic_lock(request: Request):
+    from api.web_routes import _get_current_user
+    u = _get_current_user(request)
+    if not u:
+        return _unauth()
+    try:
+        from database import academic_lock_state, academic_lock_history
+        return JSONResponse({"ok": True, **academic_lock_state(),
+                             "can_unlock": u.get("role") == "admin",
+                             "history": academic_lock_history(8)})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@router.post("/web/api/biometric/academic-lock/unlock", response_class=JSONResponse)
+async def bio_academic_unlock(request: Request):
+    u = _admin_user(request)
+    if not u:
+        return JSONResponse({"ok": False, "error": "فتح القفل لمدير النظام وحده"},
+                            status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        from database import authenticate, unlock_academic_numbers
+        if not authenticate(u.get("username", ""), str(body.get("password") or "")):
+            return JSONResponse({"ok": False, "error": "كلمة المرور غير صحيحة"},
+                                status_code=403)
+        st = unlock_academic_numbers(u.get("username", ""),
+                                     str(body.get("reason") or "").strip()[:200])
+        return JSONResponse({"ok": True, **st})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@router.post("/web/api/biometric/academic-lock/relock", response_class=JSONResponse)
+async def bio_academic_relock(request: Request):
+    u = _admin_user(request)
+    if not u:
+        return JSONResponse({"ok": False, "error": "لمدير النظام وحده"}, status_code=403)
+    try:
+        from database import relock_academic_numbers
+        return JSONResponse({"ok": True, **relock_academic_numbers(u.get("username", ""))})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
 @router.post("/web/api/biometric/generate-numbers", response_class=JSONResponse)
 async def bio_generate_numbers(request: Request):
     """
@@ -1244,6 +1302,19 @@ _ENROLL_PAGE = """<!DOCTYPE html>
   <button class="btn o" onclick="genNumbers()">توليد الأرقام الأكاديمية</button>
 </div>
 
+<!-- قفل الأرقام الأكاديمية: بصمات الطلاب على الأجهزة مربوطة بها، فلا تتغيّر
+     إلا بعد «إنهاء السنة وترحيل الطلاب» أو بفتحٍ مؤقت من مدير النظام -->
+<div class="bar" id="lockbar" style="display:none;flex-wrap:wrap;gap:8px">
+  <div style="flex:1 1 100%;font-size:13px;line-height:1.7" id="locktxt">—</div>
+  <div id="lockform" style="display:none;flex:1 1 100%;gap:8px;flex-wrap:wrap;align-items:center">
+    <input class="search" id="lockpw" type="password" autocomplete="current-password"
+           placeholder="كلمة مرور مدير النظام" style="max-width:220px">
+    <input class="search" id="lockwhy" placeholder="السبب — يُحفظ في السجلّ" style="max-width:260px">
+    <button class="btn o" onclick="unlockNumbers()">🔓 فتح لساعة واحدة</button>
+  </div>
+  <button class="btn gh" id="relockbtn" style="display:none" onclick="relockNumbers()">🔒 إعادة القفل الآن</button>
+</div>
+
 <!-- مدى يدوي: لمدرسةٍ بمرحلتين تتشارك أجهزة البصمة. تظهر وحدها حين
      يوجد أكثر من مرحلة على الجهاز، فلا تُربك مدرسةً بمرحلة واحدة. -->
 <div class="bar" id="spanbar" style="display:none;flex-wrap:wrap;gap:8px">
@@ -1399,11 +1470,49 @@ async function genNumbers(useSpan){
   const d=await api('/web/api/biometric/generate-numbers',
                     {method:'POST',body:JSON.stringify(body)});
   if(d&&d.ok){
-    await load(); await loadPlan();
+    await load(); await loadPlan(); await loadLock();
     alert(d.assigned ? ('تم توليد '+d.assigned+' رقماً — من '+d.first
                         +' إلى '+d.last+'.')
                      : 'كل الطلاب لديهم أرقام بالفعل — لا جديد.');
   } else { alert('تعذّر التوليد: '+((d&&d.error)||'')); }
+}
+
+// قفل الأرقام الأكاديمية — يُعرض دائماً، والفتح لمدير النظام وحده
+async function loadLock(){
+  var d=null;
+  try{ d=await api('/web/api/biometric/academic-lock'); }catch(e){ return; }
+  if(!d||!d.ok) return;
+  var bar=$('lockbar'), t=$('locktxt');
+  bar.style.display='flex';
+  if(d.locked){
+    bar.style.background='#F0FDF4'; bar.style.borderColor='#BBF7D0';
+    t.innerHTML='🔒 <b>الأرقام الأكاديمية مقفلة</b> — بصمات الطلاب على الأجهزة مربوطة بها، '
+      +'فلا يغيّرها استيرادٌ ولا توليد. تُفتح تلقائياً بعد «إنهاء السنة وترحيل الطلاب»، '
+      +'أو بفتحٍ مؤقت من مدير النظام.';
+    $('lockform').style.display=d.can_unlock?'flex':'none';
+    $('relockbtn').style.display='none';
+  } else {
+    bar.style.background='#FFF7ED'; bar.style.borderColor='#FED7AA';
+    var why=(d.reason==='yearend')?'نافذة نهاية السنة':'فتحٌ يدوي من مدير النظام';
+    t.innerHTML='🔓 <b>الأرقام الأكاديمية مفتوحة للتغيير</b> ('+why+') حتى '
+      +String(d.until||'').replace('T',' ')
+      +' — تغيير رقم طالبٍ يُبطل بصمته على الأجهزة حتى يُعاد تسجيلها.';
+    $('lockform').style.display='none';
+    $('relockbtn').style.display=d.can_unlock?'':'none';
+  }
+}
+async function unlockNumbers(){
+  var pw=$('lockpw').value;
+  if(!pw){ alert('اكتب كلمة مرور مدير النظام.'); return; }
+  const d=await api('/web/api/biometric/academic-lock/unlock',
+    {method:'POST',body:JSON.stringify({password:pw,reason:$('lockwhy').value})});
+  $('lockpw').value='';
+  if(d&&d.ok){ $('lockwhy').value=''; await loadLock(); }
+  else { alert('تعذّر الفتح: '+((d&&d.error)||'')); }
+}
+async function relockNumbers(){
+  const d=await api('/web/api/biometric/academic-lock/relock',{method:'POST',body:'{}'});
+  if(d&&d.ok){ await loadLock(); } else { alert('تعذّر: '+((d&&d.error)||'')); }
 }
 
 // حالة الأرقام عبر مراحل هذا الجهاز. جهاز البصمة لا يعرف المراحل،
@@ -1640,6 +1749,6 @@ document.addEventListener('keydown', (e)=>{
 
 // ‏loadPlan منفصلة ومتسامحة: مدرسةٌ بمرحلة واحدة لا يعنيها الأمر،
 // وسقوطها يجب ألا يمنع ظهور قائمة الطلاب
-window.onload=function(){ load(); loadPlan(); };
+window.onload=function(){ load(); loadPlan(); loadLock(); };
 </script>
 </body></html>"""

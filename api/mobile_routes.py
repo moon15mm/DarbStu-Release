@@ -239,8 +239,9 @@ async def api_delete_student(request: Request):
         return JSONResponse({"detail": "الطالب غير موجود."}, status_code=404)
 
     try:
-        with open(STUDENTS_JSON, "w", encoding="utf-8") as f:
-            json.dump({"classes": classes}, f, ensure_ascii=False, indent=2)
+        # البوابة لا open(): الأرقام الأكاديمية للباقين لا تُمسّ (قفلها)
+        from database import write_students_file
+        write_students_file(classes, path=STUDENTS_JSON)
         global STUDENTS_STORE
         STUDENTS_STORE = None
         load_students(force_reload=True)
@@ -266,8 +267,8 @@ async def api_delete_class(request: Request):
         return JSONResponse({"detail": "الفصل غير موجود."}, status_code=404)
 
     try:
-        with open(STUDENTS_JSON, "w", encoding="utf-8") as f:
-            json.dump({"classes": new_classes}, f, ensure_ascii=False, indent=2)
+        from database import write_students_file
+        write_students_file(new_classes, path=STUDENTS_JSON)
         global STUDENTS_STORE
         STUDENTS_STORE = None
         load_students(force_reload=True)

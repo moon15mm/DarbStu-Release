@@ -113,8 +113,9 @@ class StudentsTabMixin:
                     self.store["list"][old_class_index]["students"].append(student_data)
 
         if changes_made:
-            with open(STUDENTS_JSON, "w", encoding="utf-8") as f:
-                json.dump({"classes": self.store["list"]}, f, ensure_ascii=False, indent=2)
+            # البوابة لا open(): الرقم الأكاديمي يرافق الطالب ولا يُمسّ (قفله)
+            from database import write_students_file
+            write_students_file(self.store["list"], path=STUDENTS_JSON)
             messagebox.showinfo("تم الحفظ", "تم نقل الطلاب وحفظ التعديلات بنجاح.")
             self.update_all_tabs_after_data_change()
         else:

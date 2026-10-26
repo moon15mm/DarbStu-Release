@@ -644,3 +644,314 @@ def build_rows_for_export(rep):
                 row.append(r.get(k, ""))
         out.append(row)
     return out
+
+
+# ══════════════════════════════════════════════════════════════════
+#  التقرير التفصيلي — سجلٌّ لكل فصل: الطالب صفّاً واليوم عموداً
+# ══════════════════════════════════════════════════════════════════
+# طلب ماهر (٢٦ أكتوبر ٢٠٢٦): «سجل كل فصل به كشف يعرض تأخر أو غياب كل طالب مع
+# خانة للمجموع»، للتأخر وحده أو الغياب وحده أو لهما، يُطبع ويُحفظ.
+# مصدر الصفوف **الكشف** لا السجلات: الطالب الذي لم يغب يظهر بصفٍّ فارغ،
+# والطالب يُنسب لفصله في الكشف — سجلات البصمة لا تحمل معرّف فصل أصلاً.
+DETAIL_MODES = ("both", "absence", "tardy")
+DETAIL_TITLES = {"both": "التقرير التفصيلي — الغياب والتأخر",
+                 "absence": "التقرير التفصيلي — الغياب",
+                 "tardy": "التقرير التفصيلي — التأخر"}
+_AR_DAYS = ("اثنين", "ثلاثاء", "أربعاء", "خميس", "جمعة", "سبت", "أحد")   # weekday(): الاثنين=0
+_AR_MONTHS = ("يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو", "يوليو",
+              "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر")
+
+
+def build_detailed_register(start, end, students, mode="both", class_id=None, level=None):
+    """
+    `students`: الكشف مسطّحاً [{id, name, class_id, class_name}].
+    يُرجع لكل فصل صفوف طلابه، وفي كل صفّ خانات الأيام ومجاميعه، ومجموع كل يوم.
+    أيام الأعمدة: كل تاريخٍ سُجّل فيه غيابٌ أو تأخر **في المدرسة كلها** — فتتطابق
+    أعمدة الفصول، والعطل لا سجلّ فيها فلا تظهر أعمدةً فارغة.
+    """
+    if mode not in DETAIL_MODES:
+        mode = "both"
+    want_abs, want_tdy = mode in ("both", "absence"), mode in ("both", "tardy")
+    con = _con()
+    try:
+        cur = con.cursor()
+        exempt = {str(r[0]) for r in cur.execute("SELECT student_id FROM exempted_students")}
+        abs_rows = [(r["date"], str(r["student_id"])) for r in cur.execute(
+            "SELECT date, student_id FROM absences WHERE date BETWEEN ? AND ?", [start, end])]
+        tdy_rows = [(r["date"], str(r["student_id"]), int(r["mins"] or 0)) for r in cur.execute(
+            "SELECT date, student_id, COALESCE(minutes_late,0) AS mins FROM tardiness "
+            "WHERE date BETWEEN ? AND ?", [start, end])]
+        excused = {(r["date"], str(r["student_id"])) for r in cur.execute(
+            "SELECT date, student_id FROM excuses WHERE date BETWEEN ? AND ?", [start, end])}
+    finally:
+        con.close()
+
+    days = sorted({d for d, _s in abs_rows} | {d for d, _s, _m in tdy_rows})
+    ab, td = {}, {}
+    for d, sid in abs_rows:
+        ab.setdefault(sid, {})[d] = (d, sid) in excused
+    for d, sid, m in tdy_rows:
+        td.setdefault(sid, {})[d] = m
+
+    classes, order, seen = {}, [], set()
+    for s in students or []:
+        sid = str(s.get("id") or "").strip()
+        if not sid or sid in exempt or sid in seen:
+            continue
+        if not _cls_match(s.get("class_id"), class_id, level):
+            continue
+        seen.add(sid)
+        key = _norm_cid(s.get("class_id")) or str(s.get("class_name") or "—")
+        c = classes.get(key)
+        if c is None:
+            c = classes[key] = {"class_id": key, "class_name": s.get("class_name") or key,
+                                "students": []}
+            order.append(key)
+        cells, n_abs, n_exc, n_tdy, mins = {}, 0, 0, 0, 0
+        if want_abs:
+            for d, exc in (ab.get(sid) or {}).items():
+                cells.setdefault(d, {})["a"] = "x" if exc else "a"
+                n_abs += 1
+                n_exc += 1 if exc else 0
+        if want_tdy:
+            for d, m in (td.get(sid) or {}).items():
+                cells.setdefault(d, {})["t"] = m
+                n_tdy += 1
+                mins += m
+        c["students"].append({"id": sid, "name": s.get("name") or sid, "cells": cells,
+                              "absence": n_abs, "excused": n_exc, "tardy": n_tdy,
+                              "minutes": mins})
+
+    out_classes = []
+    for key in order:
+        c = classes[key]
+        c["students"].sort(key=lambda r: r["name"])
+        c["day_absence"] = {d: sum(1 for r in c["students"] if "a" in r["cells"].get(d, {}))
+                            for d in days}
+        c["day_tardy"] = {d: sum(1 for r in c["students"] if "t" in r["cells"].get(d, {}))
+                          for d in days}
+        c["totals"] = {k: sum(r[k] for r in c["students"])
+                       for k in ("absence", "excused", "tardy", "minutes")}
+        c["totals"]["students"] = len(c["students"])
+        out_classes.append(c)
+
+    return {"ok": True, "kind": "detailed", "from": start, "to": end, "mode": mode,
+            "title": DETAIL_TITLES[mode], "days": days, "school_days": len(days),
+            "include_absence": want_abs, "include_tardy": want_tdy,
+            "filters": {"class_id": class_id or "", "level": level or ""},
+            "classes": out_classes,
+            "totals": {k: sum(c["totals"][k] for c in out_classes)
+                       for k in ("absence", "excused", "tardy", "minutes", "students")}}
+
+
+def detailed_cell(cell):
+    """نصّ الخانة: غ غياب · ع غياب بعذر · رقمٌ دقائق التأخر (ت بلا دقائق)."""
+    if not cell:
+        return ""
+    parts = []
+    if "a" in cell:
+        parts.append("ع" if cell["a"] == "x" else "غ")
+    if "t" in cell:
+        parts.append(str(cell["t"]) if cell["t"] else "ت")
+    return "/".join(parts)
+
+
+def detailed_total_columns(rep):
+    cols = []
+    if rep["include_absence"]:
+        cols += [("الغياب", "absence"), ("منها بعذر", "excused")]
+    if rep["include_tardy"]:
+        cols += [("التأخر", "tardy"), ("دقائق التأخر", "minutes")]
+    return cols
+
+
+def _day_head(d):
+    dt = datetime.date.fromisoformat(d)
+    return dt.day, _AR_DAYS[dt.weekday()]
+
+
+def _month_groups(days):
+    """[(اسم الشهر والسنة، عدد أيامه)] بترتيب الأيام — لصفّ العناوين الأعلى."""
+    groups = []
+    for d in days:
+        dt = datetime.date.fromisoformat(d)
+        label = "%s %d" % (_AR_MONTHS[dt.month - 1], dt.year)
+        if groups and groups[-1][0] == label:
+            groups[-1][1] += 1
+        else:
+            groups.append([label, 1])
+    return groups
+
+
+def build_detailed_print_html(rep, school_name=""):
+    """كل فصلٍ في صفحة A4 أفقية. الخطّ يصغر كلما كثرت الأيام كي يتّسع الكشف."""
+    days = rep["days"]
+    tcols = detailed_total_columns(rep)
+    n = len(days)
+    fs = 10 if n <= 23 else (8.5 if n <= 35 else 7)
+    legend = []
+    if rep["include_absence"]:
+        legend += ["غ = غياب", "ع = غياب بعذر"]
+    if rep["include_tardy"]:
+        legend += ["الرقم = دقائق التأخر", "ت = تأخر بلا دقائق"]
+
+    pages = []
+    for c in rep["classes"]:
+        months = "".join("<th colspan='%d' class='mo'>%s</th>" % (k, _esc(lbl))
+                         for lbl, k in _month_groups(days))
+        dhead = "".join("<th class='dy'>%d<br><small>%s</small></th>" % _day_head(d) for d in days)
+        thead = ("<tr><th rowspan='2' class='ix'>م</th><th rowspan='2' class='nm'>اسم الطالب</th>"
+                 + months
+                 + "".join("<th rowspan='2' class='tt'>%s</th>" % _esc(h) for h, _ in tcols)
+                 + "</tr><tr>" + dhead + "</tr>")
+        if not days:
+            thead = ("<tr><th class='ix'>م</th><th class='nm'>اسم الطالب</th>"
+                     + "".join("<th class='tt'>%s</th>" % _esc(h) for h, _ in tcols) + "</tr>")
+        rows = []
+        for i, r in enumerate(c["students"], 1):
+            tds = "".join("<td class='%s'>%s</td>" % (
+                ("a" if "a" in r["cells"].get(d, {}) else "t") if r["cells"].get(d) else "",
+                _esc(detailed_cell(r["cells"].get(d)))) for d in days)
+            tot = "".join("<td class='tv'>%s</td>" % _esc(r[k]) for _, k in tcols)
+            rows.append("<tr><td>%d</td><td class='nm'>%s</td>%s%s</tr>"
+                        % (i, _esc(r["name"]), tds, tot))
+        if not rows:
+            rows.append("<tr><td colspan='%d' class='empty'>لا طلاب في هذا الفصل</td></tr>"
+                        % (2 + n + len(tcols)))
+
+        def _day_sum(d):
+            parts = []
+            if rep["include_absence"]:
+                parts.append(str(c["day_absence"][d]))
+            if rep["include_tardy"]:
+                parts.append(str(c["day_tardy"][d]))
+            return "<br>".join(parts)
+        foot = ("<tr class='sum'><td colspan='2'>المجموع%s</td>%s%s</tr>"
+                % ("<br><small>غياب / تأخر</small>" if rep["mode"] == "both" else "",
+                   "".join("<td>%s</td>" % _day_sum(d) for d in days),
+                   "".join("<td class='tv'>%s</td>" % _esc(c["totals"][k]) for _, k in tcols)))
+        pages.append("""<section class="page">
+  <div class="hd"><h1>%(title)s</h1><div class="sch">%(school)s</div></div>
+  <div class="meta">الفصل: <b>%(cls)s</b> · من <b>%(frm)s</b> إلى <b>%(to)s</b> ·
+       أيام الدراسة: <b>%(nd)d</b> · عدد الطلاب: <b>%(ns)d</b></div>
+  <div class="lg">%(legend)s</div>
+  <table><thead>%(thead)s</thead><tbody>%(rows)s</tbody><tfoot>%(foot)s</tfoot></table>
+  <div class="ft"><span>طُبع في %(printed)s</span><span>درب الطالب — darbstu.com</span></div>
+</section>""" % {"title": _esc(rep["title"]), "school": _esc(school_name or "المدرسة"),
+                 "cls": _esc(c["class_name"]), "frm": _esc(rep["from"]), "to": _esc(rep["to"]),
+                 "nd": n, "ns": len(c["students"]), "legend": _esc(" · ".join(legend)),
+                 "thead": thead, "rows": "".join(rows), "foot": foot,
+                 "printed": datetime.datetime.now().strftime("%Y-%m-%d %H:%M")})
+    if not pages:
+        pages.append("<section class='page'><div class='empty'>لا فصول مطابقة لهذه الخيارات</div></section>")
+
+    return """<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8">
+<title>%(title)s</title><style>
+  @page { size: A4 landscape; margin: 8mm; }
+  *{box-sizing:border-box}
+  body{font-family:"Segoe UI","Tahoma",Arial,sans-serif;margin:0;color:#111;background:#f5f6f7}
+  .page{background:#fff;padding:10mm;margin:8mm auto;max-width:281mm;
+        box-shadow:0 0 6px rgba(0,0,0,.12);page-break-after:always;break-after:page}
+  .page:last-child{page-break-after:auto;break-after:auto}
+  .hd{display:flex;justify-content:space-between;align-items:flex-end;
+      border-bottom:2px solid #15616d;padding-bottom:6px}
+  .hd h1{margin:0;font-size:17px}
+  .hd .sch{font-size:13px;color:#444;font-weight:600}
+  .meta{margin:8px 0 3px;font-size:12px;color:#444}
+  .lg{margin:0 0 6px;font-size:11px;color:#5d6b63}
+  table{width:100%%;border-collapse:collapse;font-size:%(fs)spx;table-layout:auto}
+  th,td{border:1px solid #cfd8d3;padding:2px 1px;text-align:center;line-height:1.25}
+  th{background:#15616d;color:#fff;font-weight:600}
+  th.mo{background:#0f4a53}
+  th.dy small{font-weight:400;opacity:.85;font-size:.82em}
+  th.nm,td.nm{text-align:right;padding:2px 5px;white-space:nowrap}
+  th.ix{width:22px}
+  td.a{color:#b42318;font-weight:700}
+  td.t{color:#1849a9;font-weight:600}
+  td.tv{background:#f1f5f3;font-weight:700}
+  th.tt{background:#25716f}
+  tbody tr:nth-child(even){background:#f8faf9}
+  tr.sum td{background:#e8f0ec;font-weight:700}
+  .empty{padding:22px;color:#777;text-align:center}
+  .ft{margin-top:8px;padding-top:6px;border-top:1px solid #d9e2db;
+      display:flex;justify-content:space-between;font-size:10px;color:#5d6b63}
+  @media print{ body{background:#fff} .page{box-shadow:none;margin:0;padding:0;max-width:none}
+       thead{display:table-header-group} tr{page-break-inside:avoid} }
+</style></head><body>%(pages)s</body></html>""" % {
+        "title": _esc(rep["title"]), "fs": fs, "pages": "".join(pages)}
+
+
+def _sheet_title(name, used):
+    """اسم ورقة Excel: ٣١ حرفاً بلا []:*?/\\ — ولا يتكرر."""
+    t = "".join("-" if ch in '[]:*?/\\' else ch for ch in str(name or "فصل")).strip()[:31] or "فصل"
+    base, k = t, 2
+    while t in used:
+        suffix = " (%d)" % k
+        t = base[:31 - len(suffix)] + suffix
+        k += 1
+    used.add(t)
+    return t
+
+
+def build_detailed_workbook(rep, school_name=""):
+    """ملف Excel: ورقةٌ لكل فصل بأعمدة الطباعة نفسها — الخانات نصّاً والمجاميع أرقاماً."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    wb = Workbook()
+    wb.remove(wb.active)
+    days, tcols = rep["days"], detailed_total_columns(rep)
+    hdr = PatternFill("solid", fgColor="15616D")
+    tot = PatternFill("solid", fgColor="E8F0EC")
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    used = set()
+    for c in rep["classes"] or [{"class_name": "لا فصول", "students": [], "day_absence": {},
+                                 "day_tardy": {}, "totals": {}}]:
+        ws = wb.create_sheet(_sheet_title(c["class_name"], used))
+        ws.sheet_view.rightToLeft = True
+        ws.append(["%s — %s" % (rep["title"], school_name or "المدرسة")])
+        ws.append(["الفصل: %s · من %s إلى %s · أيام الدراسة: %d"
+                   % (c["class_name"], rep["from"], rep["to"], len(days))])
+        ws.append([])
+        head = ["م", "اسم الطالب"] + ["%s\n%d %s" % (_AR_DAYS[datetime.date.fromisoformat(d).weekday()],
+                                                    datetime.date.fromisoformat(d).day,
+                                                    _AR_MONTHS[datetime.date.fromisoformat(d).month - 1])
+                                      for d in days] + [h for h, _ in tcols]
+        ws.append(head)
+        for cell in ws[4]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = hdr
+            cell.alignment = center
+        for i, r in enumerate(c["students"], 1):
+            ws.append([i, r["name"]] + [detailed_cell(r["cells"].get(d)) for d in days]
+                      + [int(r[k]) for _, k in tcols])
+        sums = []
+        for d in days:
+            parts = []
+            if rep["include_absence"]:
+                parts.append(str(c["day_absence"].get(d, 0)))
+            if rep["include_tardy"]:
+                parts.append(str(c["day_tardy"].get(d, 0)))
+            sums.append(" / ".join(parts))
+        ws.append(["", "المجموع" + (" (غياب / تأخر)" if rep["mode"] == "both" else "")] + sums
+                  + [int(c["totals"].get(k, 0)) for _, k in tcols])
+        for cell in ws[ws.max_row]:
+            cell.font = Font(bold=True)
+            cell.fill = tot
+        for row in ws.iter_rows(min_row=5, max_row=ws.max_row):
+            for cell in row:
+                if cell.column != 2:
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.column_dimensions["A"].width = 5
+        ws.column_dimensions["B"].width = max(14, min(36, max((len(r["name"]) for r in c["students"]),
+                                                             default=10) + 2))
+        for j in range(len(days)):
+            ws.column_dimensions[get_column_letter(3 + j)].width = 6.5
+        for j in range(len(tcols)):
+            ws.column_dimensions[get_column_letter(3 + len(days) + j)].width = 11
+        ws.row_dimensions[4].height = 34
+        ws.freeze_panes = "C5"
+    import io as _io
+    buf = _io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
