@@ -1906,6 +1906,149 @@ def get_biometric_daily_summary(date_str):
         con.close()
 
 
+# ══════════════════════════════════════════════════════════════════
+#  تأخرٌ كاذب من البصمة — أثرُ عطلٍ أُصلح في 3.6.49
+# ══════════════════════════════════════════════════════════════════
+# حتى 3.6.48 كان شرط «حضر في الوقت» مقيَّداً بوضع «تسجيل المتأخرين فقط»، فوضعُ
+# «تسجيل الحضور كاملاً» كتب لكل من بصم في وقته سجلّ تأخر بصفر دقيقة، وعلّم
+# بصمته «تأخر 0 د». أُصلح الشرط وبقي ما كُتب قبله: الطالب متأخرٌ في التقارير
+# وهو حاضر («ت» عند أغلب طلاب ثانوية الدرب يومي ١٥ و١٦ سبتمبر ٢٠٢٦).
+# المعيار دقيق: الكود الحالي لا يكتب من البصمة تأخراً بصفر أبداً، فكل سجلٍّ
+# كهذا من ذلك العطل. والحذف ينسخ السجلّ كاملاً في tardiness_purged فيُتراجع عنه.
+BIO_GATE_TEACHER = "بوابة البصمة"
+_FALSE_BIO_WHERE = "teacher_name=? AND COALESCE(minutes_late,0)<=0"
+_ZERO_PUNCH_OUTCOME = "تأخر 0 د"
+
+
+def _tardiness_purged_table(cur):
+    cur.execute("""CREATE TABLE IF NOT EXISTS tardiness_purged (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        batch       TEXT NOT NULL,
+        reason      TEXT NOT NULL DEFAULT '',
+        purged_by   TEXT NOT NULL DEFAULT '',
+        purged_at   TEXT NOT NULL,
+        row_json    TEXT NOT NULL,
+        punch_ids   TEXT NOT NULL DEFAULT '',
+        restored_at TEXT
+    )""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_tard_purged_batch "
+                "ON tardiness_purged(batch)")
+
+
+def last_tardiness_purge():
+    """آخر دفعة تنظيف: {batch, purged_at, purged_by, count, restored_at} أو None."""
+    con = get_db()
+    try:
+        if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                           "AND name='tardiness_purged'").fetchone():
+            return None
+        r = con.execute(
+            "SELECT batch, MAX(purged_at), MAX(purged_by), COUNT(*), MAX(restored_at) "
+            "FROM tardiness_purged GROUP BY batch ORDER BY MAX(id) DESC LIMIT 1").fetchone()
+        if not r:
+            return None
+        return {"batch": r[0], "purged_at": r[1], "purged_by": r[2] or "",
+                "count": r[3], "restored_at": r[4]}
+    finally:
+        con.close()
+
+
+def false_biometric_tardiness(names_limit=5000):
+    """سجلات التأخر الكاذبة من البصمة مجمّعةً باليوم — للمعاينة قبل الحذف."""
+    con = get_db(); con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            "SELECT date, student_id, student_name, class_name FROM tardiness WHERE "
+            + _FALSE_BIO_WHERE + " ORDER BY date, class_name, student_name",
+            (BIO_GATE_TEACHER,)).fetchall()
+    finally:
+        con.close()
+    days, order = {}, []
+    for i, r in enumerate(rows):
+        d = days.get(r["date"])
+        if d is None:
+            d = days[r["date"]] = {"date": r["date"], "count": 0, "students": []}
+            order.append(r["date"])
+        d["count"] += 1
+        if i < names_limit:
+            d["students"].append({"id": str(r["student_id"]), "name": r["student_name"],
+                                  "class_name": r["class_name"] or ""})
+    return {"total": len(rows), "days": [days[k] for k in order],
+            "last_purge": last_tardiness_purge()}
+
+
+def purge_false_biometric_tardiness(by=""):
+    """يحذف سجلات التأخر الكاذبة من البصمة بعد نسخها، ويعيد بصماتها «حاضر»."""
+    now = datetime.datetime.now()
+    batch = "bio0-" + now.strftime("%Y%m%d%H%M%S%f")
+    con = get_db(); con.row_factory = sqlite3.Row
+    try:
+        cur = con.cursor()
+        _tardiness_purged_table(cur)
+        rows = cur.execute("SELECT * FROM tardiness WHERE " + _FALSE_BIO_WHERE,
+                           (BIO_GATE_TEACHER,)).fetchall()
+        relabeled = 0
+        for r in rows:
+            # البصمة التي أنشأت السجلّ وحدها تحمل «تأخر 0 د»؛ ما بعدها في اليوم «مكرر»
+            try:
+                pids = [p[0] for p in cur.execute(
+                    "SELECT id FROM biometric_punches WHERE date=? AND student_id=? "
+                    "AND outcome=?", (r["date"], str(r["student_id"]), _ZERO_PUNCH_OUTCOME))]
+            except sqlite3.OperationalError:
+                pids = []
+            cur.execute(
+                "INSERT INTO tardiness_purged (batch,reason,purged_by,purged_at,row_json,"
+                "punch_ids) VALUES (?,?,?,?,?,?)",
+                (batch, "false-biometric-zero", str(by or ""), now.isoformat(timespec="seconds"),
+                 json.dumps(dict(r), ensure_ascii=False), ",".join(str(p) for p in pids)))
+            if pids:
+                cur.execute("UPDATE biometric_punches SET outcome='حاضر' WHERE id IN (%s)"
+                            % ",".join("?" * len(pids)), pids)
+                relabeled += len(pids)
+            cur.execute("DELETE FROM tardiness WHERE id=? AND " + _FALSE_BIO_WHERE,
+                        (r["id"], BIO_GATE_TEACHER))
+        con.commit()
+    finally:
+        con.close()
+    return {"deleted": len(rows), "punches": relabeled, "batch": batch if rows else ""}
+
+
+def restore_tardiness_purge(batch):
+    """يعيد سجلات دفعة تنظيف كما كانت بمعرّفاتها، ويعيد نتيجة بصماتها.
+    ما سُجّل له بعد الحذف تأخرٌ جديد لليوم نفسه يُتخطّى (UNIQUE تاريخ+طالب)."""
+    batch = str(batch or "").strip()
+    restored = skipped = 0
+    if not batch:
+        return {"restored": 0, "skipped": 0}
+    con = get_db(); con.row_factory = sqlite3.Row
+    try:
+        cur = con.cursor()
+        _tardiness_purged_table(cur)
+        rows = cur.execute("SELECT id, row_json, punch_ids FROM tardiness_purged "
+                           "WHERE batch=? AND restored_at IS NULL", (batch,)).fetchall()
+        cols = {c[1] for c in cur.execute("PRAGMA table_info(tardiness)")}
+        now = datetime.datetime.now().isoformat(timespec="seconds")
+        for r in rows:
+            rec = {k: v for k, v in json.loads(r["row_json"]).items() if k in cols}
+            keys = list(rec)
+            cur.execute("INSERT OR IGNORE INTO tardiness (%s) VALUES (%s)"
+                        % (",".join(keys), ",".join("?" * len(keys))), [rec[k] for k in keys])
+            if cur.rowcount:
+                restored += 1
+                pids = [int(p) for p in (r["punch_ids"] or "").split(",") if p.strip().isdigit()]
+                if pids:
+                    cur.execute("UPDATE biometric_punches SET outcome=? WHERE outcome='حاضر' "
+                                "AND id IN (%s)" % ",".join("?" * len(pids)),
+                                [_ZERO_PUNCH_OUTCOME] + pids)
+            else:
+                skipped += 1
+            cur.execute("UPDATE tardiness_purged SET restored_at=? WHERE id=?", (now, r["id"]))
+        con.commit()
+    finally:
+        con.close()
+    return {"restored": restored, "skipped": skipped}
+
+
 # --- Helper functions for Exempted Students ---
 def add_exempted_student(student_id, student_name, class_name, reason="", added_by=""):
     con = get_db(); cur = con.cursor()

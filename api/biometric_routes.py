@@ -415,6 +415,60 @@ async def bio_academic_relock(request: Request):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
+# ── تأخرٌ بصفر دقيقة من البصمة (أثر عطل ما قبل 3.6.49) ─────────────────
+# المعاينة لكل مستخدم، والحذف والتراجع للمدير. والحذف يشترط العدد الذي عاينه
+# المستخدم: لا يُحذف إلا ما رآه.
+@router.get("/web/api/biometric/false-tardiness", response_class=JSONResponse)
+async def bio_false_tardiness(request: Request):
+    from api.web_routes import _get_current_user
+    u = _get_current_user(request)
+    if not u:
+        return _unauth()
+    try:
+        from database import false_biometric_tardiness
+        return JSONResponse({"ok": True, **false_biometric_tardiness(),
+                             "can_purge": u.get("role") == "admin"})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@router.post("/web/api/biometric/false-tardiness/purge", response_class=JSONResponse)
+async def bio_false_tardiness_purge(request: Request):
+    u = _admin_user(request)
+    if not u:
+        return JSONResponse({"ok": False, "error": "الحذف لمدير النظام وحده"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        from database import false_biometric_tardiness, purge_false_biometric_tardiness
+        total = false_biometric_tardiness(names_limit=0)["total"]
+        if str(body.get("expect", "")) != str(total):
+            return JSONResponse({"ok": False, "error": "تغيّر عدد السجلات منذ المعاينة (%d الآن)"
+                                 " — أعد تحميل الصفحة وراجعها." % total}, status_code=409)
+        return JSONResponse({"ok": True, **purge_false_biometric_tardiness(
+            u.get("username", ""))})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@router.post("/web/api/biometric/false-tardiness/restore", response_class=JSONResponse)
+async def bio_false_tardiness_restore(request: Request):
+    u = _admin_user(request)
+    if not u:
+        return JSONResponse({"ok": False, "error": "التراجع لمدير النظام وحده"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        from database import restore_tardiness_purge
+        return JSONResponse({"ok": True, **restore_tardiness_purge(body.get("batch"))})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
 @router.post("/web/api/biometric/generate-numbers", response_class=JSONResponse)
 async def bio_generate_numbers(request: Request):
     """
@@ -861,6 +915,14 @@ _PAGE = r"""<!doctype html>
   <div id="runmsg" class="runmsg" style="display:none"></div>
 </div>
 
+<!-- يظهر حيث توجد سجلات العطل القديم فقط — المدارس السليمة لا تراه -->
+<div class="card" id="fz-card" style="display:none;border-color:#F5C26B;background:#FFFCF5">
+  <h2>🧹 تأخرٌ بصفر دقيقة من البصمة — أثر عطلٍ قديم</h2>
+  <p class="d">حتى الإصدار 3.6.48 كان وضع «تسجيل الحضور كاملاً» يكتب لكل طالب بصم في وقته سجلّ تأخر بصفر دقيقة، فيظهر في التقارير متأخراً (حرف «ت») وهو حاضر. أُصلح العطل في 3.6.49 وبقيت السجلات التي كُتبت قبله. حذفها لا يمسّ البصمات نفسها، ويبقى الطالب حاضراً بها، وتُحفظ نسخة تتيح التراجع.</p>
+  <div id="fz-body"></div>
+  <div id="fz-msg" class="msg"></div>
+</div>
+
 <div class="grid">
   <div>
     <div class="card">
@@ -1211,9 +1273,60 @@ async function mockSeed(){
   const d=await api('/web/api/biometric/mock-seed',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({count:8,time:'07:12'})});
   if(d&&d.ok){await runNow();}
 }
+function fzEsc(s){return String(s==null?'':s)
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+async function loadFalseTardy(){
+  const d=await api('/web/api/biometric/false-tardiness'); if(!d||!d.ok)return;
+  const card=$('fz-card'), box=$('fz-body'), lp=d.last_purge;
+  let undo='';
+  if(lp&&!lp.restored_at){
+    undo='<div class="row muted" style="margin-top:10px">آخر تنظيف: '
+      +fzEsc(String(lp.purged_at||'').replace('T',' ').slice(0,16))+' · عدد السجلات '+lp.count
+      +(lp.purged_by?(' · '+fzEsc(lp.purged_by)):'')
+      +(d.can_purge?(' <button class="btn gh sm" onclick="fzRestore(\''+fzEsc(lp.batch)+'\')">↶ تراجع عن التنظيف</button>'):'')
+      +'</div>';
+  }
+  if(!d.total&&!undo){card.style.display='none';return;}
+  card.style.display='block';
+  let h='';
+  if(d.total){
+    h+='<table><tr><th>التاريخ</th><th>السجلات</th><th>الطلاب</th></tr>'
+      +d.days.map(x=>'<tr><td>'+fzEsc(x.date)+'</td><td>'+x.count+'</td>'
+        +'<td style="text-align:right"><details><summary class="muted">عرض الأسماء</summary>'
+        +x.students.map(s=>fzEsc(s.name)+(s.class_name?(' <span class="muted">('+fzEsc(s.class_name)+')</span>'):'')).join('، ')
+        +'</details></td></tr>').join('')+'</table>';
+    h+='<div class="row" style="margin-top:10px"><b>عدد السجلات: '+d.total+' · عدد الأيام: '+d.days.length
+      +'</b><span style="flex:1"></span>'
+      +(d.can_purge?('<button class="btn o sm" onclick="fzPurge('+d.total+')">🧹 حذف هذه السجلات ('+d.total+')</button>')
+                   :'<span class="muted">الحذف لمدير النظام</span>')+'</div>';
+  } else {
+    h+='<p class="muted">لا سجلات تأخر بصفر دقيقة من البصمة الآن.</p>';
+  }
+  box.innerHTML=h+undo;
+}
+async function fzPurge(n){
+  if(!confirm('حذف سجلات التأخر بصفر دقيقة من البصمة ('+n+')؟\nتُحفظ نسخة منها، وتستطيع التراجع من هذه البطاقة.'))return;
+  const d=await api('/web/api/biometric/false-tardiness/purge',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({expect:n})});
+  const m=$('fz-msg');
+  if(d&&d.ok){m.className='msg ok';m.textContent='تم حذف السجلات ('+d.deleted+')، وأُعيدت بصماتها إلى «حاضر» ('+d.punches+').';}
+  else{m.className='msg er';m.textContent='تعذّر الحذف: '+((d&&d.error)||'');}
+  await loadFalseTardy(); loadStatus();
+}
+async function fzRestore(batch){
+  if(!confirm('إعادة السجلات المحذوفة في هذا التنظيف كما كانت؟'))return;
+  const d=await api('/web/api/biometric/false-tardiness/restore',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({batch:batch})});
+  const m=$('fz-msg');
+  if(d&&d.ok){m.className='msg ok';m.textContent='أُعيدت السجلات ('+d.restored+')'
+    +(d.skipped?(' · لم يُعَد ('+d.skipped+') لوجود تأخرٍ جديد للطالب في اليوم نفسه'):'')+'.';}
+  else{m.className='msg er';m.textContent='تعذّر التراجع: '+((d&&d.error)||'');}
+  await loadFalseTardy(); loadStatus();
+}
 async function refreshAll(){await loadStatus();await loadPunches();await loadEnroll();}
 window.onload=async function(){
   await loadConfig();await refreshAll();
+  loadFalseTardy().catch(function(){});
   const t=await api('/web/api/biometric/mock-seed',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({count:0})});
   if(t&&(t.ok!==false||(t.error&&t.error.indexOf('التطوير')<0)))$('devonly').style.display='block';
   setInterval(loadStatus,8000);
