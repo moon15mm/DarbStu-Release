@@ -264,6 +264,9 @@ class TardinessMessagesTabMixin:
             messagebox.showwarning("تنبيه","حدد طلاباً أولاً"); return
 
         date_str = self.tard_msg_date_var.get().strip()                    if hasattr(self,"tard_msg_date_var") else now_riyadh_date()
+        from alerts_service import is_message_day, NOT_TODAY_MSG
+        if not is_message_day(date_str):
+            messagebox.showwarning("تنبيه", NOT_TODAY_MSG); return
         cfg      = load_config()
         school   = cfg.get("school_name","المدرسة")
         tpl      = cfg.get("tardiness_message_template","")

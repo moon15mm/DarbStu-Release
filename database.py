@@ -1918,6 +1918,9 @@ def get_biometric_daily_summary(date_str):
 BIO_GATE_TEACHER = "بوابة البصمة"
 _FALSE_BIO_WHERE = "teacher_name=? AND COALESCE(minutes_late,0)<=0"
 _ZERO_PUNCH_OUTCOME = "تأخر 0 د"
+# tardiness_purged يحفظ أيضاً ما يحذفه «تصحيح تاريخ البصمات» (reason='redate')،
+# وتراجعه من صفحته وحدها — فبطاقة التنظيف لا ترى إلا دفعاتها
+FALSE_BIO_REASON = "false-biometric-zero"
 
 
 def _tardiness_purged_table(cur):
@@ -1944,7 +1947,8 @@ def last_tardiness_purge():
             return None
         r = con.execute(
             "SELECT batch, MAX(purged_at), MAX(purged_by), COUNT(*), MAX(restored_at) "
-            "FROM tardiness_purged GROUP BY batch ORDER BY MAX(id) DESC LIMIT 1").fetchone()
+            "FROM tardiness_purged WHERE reason=? GROUP BY batch ORDER BY MAX(id) DESC LIMIT 1",
+            (FALSE_BIO_REASON,)).fetchone()
         if not r:
             return None
         return {"batch": r[0], "purged_at": r[1], "purged_by": r[2] or "",
@@ -1999,7 +2003,7 @@ def purge_false_biometric_tardiness(by=""):
             cur.execute(
                 "INSERT INTO tardiness_purged (batch,reason,purged_by,purged_at,row_json,"
                 "punch_ids) VALUES (?,?,?,?,?,?)",
-                (batch, "false-biometric-zero", str(by or ""), now.isoformat(timespec="seconds"),
+                (batch, FALSE_BIO_REASON, str(by or ""), now.isoformat(timespec="seconds"),
                  json.dumps(dict(r), ensure_ascii=False), ",".join(str(p) for p in pids)))
             if pids:
                 cur.execute("UPDATE biometric_punches SET outcome='حاضر' WHERE id IN (%s)"
@@ -2013,9 +2017,10 @@ def purge_false_biometric_tardiness(by=""):
     return {"deleted": len(rows), "punches": relabeled, "batch": batch if rows else ""}
 
 
-def restore_tardiness_purge(batch):
+def restore_tardiness_purge(batch, reason=FALSE_BIO_REASON):
     """يعيد سجلات دفعة تنظيف كما كانت بمعرّفاتها، ويعيد نتيجة بصماتها.
-    ما سُجّل له بعد الحذف تأخرٌ جديد لليوم نفسه يُتخطّى (UNIQUE تاريخ+طالب)."""
+    ما سُجّل له بعد الحذف تأخرٌ جديد لليوم نفسه يُتخطّى (UNIQUE تاريخ+طالب).
+    `reason` يقصر الإعادة على نوع الدفعة: نقطة بطاقة التنظيف لا تعيد نصف تصحيح تاريخ."""
     batch = str(batch or "").strip()
     restored = skipped = 0
     if not batch:
@@ -2025,7 +2030,8 @@ def restore_tardiness_purge(batch):
         cur = con.cursor()
         _tardiness_purged_table(cur)
         rows = cur.execute("SELECT id, row_json, punch_ids FROM tardiness_purged "
-                           "WHERE batch=? AND restored_at IS NULL", (batch,)).fetchall()
+                           "WHERE batch=? AND reason=? AND restored_at IS NULL",
+                           (batch, reason)).fetchall()
         cols = {c[1] for c in cur.execute("PRAGMA table_info(tardiness)")}
         now = datetime.datetime.now().isoformat(timespec="seconds")
         for r in rows:
@@ -2047,6 +2053,241 @@ def restore_tardiness_purge(batch):
     finally:
         con.close()
     return {"restored": restored, "skipped": skipped}
+
+
+# ══════════════════════════════════════════════════════════════════
+#  تصحيح تاريخ البصمات — ساعة جهازٍ عادت إلى تاريخٍ قديم (2000)
+# ══════════════════════════════════════════════════════════════════
+# الجهاز يختم البصمة بساعته، فإن عادت إلى بدايتها بقيت بصمات الطلاب في ذاكرته
+# بتاريخ 2000 — والسحب لا يُدخلها بتاريخها الخاطئ (biometric.zk_device.OLD_DATE_FLOOR).
+# وسجلّ الجهاز لا يُعدَّل من الخارج، فالتصحيح عندنا:
+#   • الأصل صفٌّ «منقول» (date فارغ، processed=1): قيد UNIQUE على وقته الخاطئ
+#     يمنع السحب من إدخاله ثانيةً، والتاريخ الفارغ يُخفيه عن كل قارئٍ باليوم.
+#   • ويُضاف صفٌّ بالتاريخ الصحيح غير معالَج، فيمرّ بالمعالجة المعتادة.
+#   • ويومُ كل طالبٍ تمسّه الدفعة يُعاد حسابه من بصماته بترتيب وقتها: من بصم
+#     بعد تصحيح الساعة صارت بصمته المنقولة أسبق، فتُقرّر هي.
+# والتراجع يعيد كل شيء كما كان: لقطةٌ لكل صفٍّ قائم قبل الدفعة، ونسخةٌ من كل
+# سجلّ تأخرٍ حذفته في tardiness_purged (reason='redate').
+REDATE_PREFIX = "نُقلت إلى "
+REDATE_REASON = "redate"
+
+
+def _redate_tables(cur):
+    _tardiness_purged_table(cur)
+    cur.execute("""CREATE TABLE IF NOT EXISTS biometric_redate_log (
+        batch     TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL,
+        mapping   TEXT NOT NULL,
+        pairs     TEXT NOT NULL DEFAULT '[]',
+        moved     INTEGER NOT NULL DEFAULT 0,
+        by_user   TEXT NOT NULL DEFAULT '',
+        at        TEXT NOT NULL,
+        undone_at TEXT
+    )""")
+    # kind: 'new' صفٌّ أضافته الدفعة (يُحذف عند التراجع) · 'snap' حالُ صفٍّ قائم قبلها
+    cur.execute("""CREATE TABLE IF NOT EXISTS biometric_redate_items (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        batch     TEXT NOT NULL,
+        kind      TEXT NOT NULL,
+        punch_id  INTEGER NOT NULL,
+        date      TEXT,
+        processed INTEGER,
+        outcome   TEXT
+    )""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_redate_items_batch "
+                "ON biometric_redate_items(batch)")
+
+
+def biometric_superseded_keys(device_id):
+    """(رقم الجهاز، الوقت الخاطئ) لكل بصمةٍ نُقلت من هذا الجهاز."""
+    con = get_db()
+    try:
+        return {(r[0], r[1]) for r in con.execute(
+            "SELECT device_uid, punch_utc FROM biometric_punches WHERE device_id=? "
+            "AND outcome LIKE ?", (str(device_id), REDATE_PREFIX + "%"))}
+    finally:
+        con.close()
+
+
+def has_earlier_biometric_punch(punch_id, date_str, student_id, punch_utc):
+    """للطالب بصمةٌ معالَجة أسبق في اليوم نفسه؟ — أول بصمةٍ في اليوم تُقرّر."""
+    if not date_str or not student_id:
+        return False
+    con = get_db()
+    try:
+        return con.execute(
+            "SELECT 1 FROM biometric_punches WHERE date=? AND student_id=? AND matched=1 "
+            "AND processed=1 AND id<>? AND punch_utc<=? AND outcome NOT LIKE ? LIMIT 1",
+            (date_str, str(student_id), punch_id, punch_utc,
+             REDATE_PREFIX + "%")).fetchone() is not None
+    finally:
+        con.close()
+
+
+def apply_biometric_redate(device_id, records, mapping, resolve, by=""):
+    """
+    records: بصماتٌ قديمة التاريخ من سجلّ الجهاز {uid, punch_utc, punch_local}.
+    mapping: {تاريخ الجهاز: التاريخ الصحيح} — الوقت يبقى كما ختمه الجهاز.
+    resolve(uid) ← (رقم الطالب، مطابَق؟) بالربط الحالي.
+    لا يعالج: المُستدعي يمرّر ما صار غير معالَج بلا إشعار (poller.redate_apply).
+    """
+    did = str(device_id)
+    now = datetime.datetime.now()
+    batch = "redate-" + now.strftime("%Y%m%d%H%M%S%f")
+    con = get_db(); con.row_factory = sqlite3.Row
+    try:
+        cur = con.cursor()
+        _redate_tables(cur)
+        work, skipped = [], 0
+        for r in records:
+            try:
+                local = datetime.datetime.fromisoformat(str(r["punch_local"]).replace("Z", ""))
+            except Exception:
+                continue
+            new_d = mapping.get(local.date().isoformat())
+            if not new_d:
+                continue
+            row = cur.execute("SELECT * FROM biometric_punches WHERE device_id=? AND "
+                              "device_uid=? AND punch_utc=?",
+                              (did, str(r["uid"]), r["punch_utc"])).fetchone()
+            if row is not None and str(row["outcome"] or "").startswith(REDATE_PREFIX):
+                skipped += 1
+                continue
+            new_local = local + (datetime.date.fromisoformat(new_d) - local.date())
+            sid, matched = resolve(str(r["uid"]))
+            work.append((r, row, new_local, new_d, str(sid or ""), bool(matched)))
+        if not work:
+            return {"batch": "", "moved": 0, "skipped": skipped, "pairs": 0}
+
+        pairs = set()
+        for r, row, new_local, new_d, sid, matched in work:
+            if row is not None and row["student_id"] and row["date"]:
+                pairs.add((row["date"], str(row["student_id"])))
+            if sid:
+                pairs.add((new_d, sid))
+        snap = set()
+        for d, s in pairs:
+            snap.update(x[0] for x in cur.execute(
+                "SELECT id FROM biometric_punches WHERE date=? AND student_id=?", (d, s)))
+        snap.update(row["id"] for _r, row, *_x in work if row is not None)
+        for pid in sorted(snap):
+            x = cur.execute("SELECT date, processed, outcome FROM biometric_punches "
+                            "WHERE id=?", (pid,)).fetchone()
+            cur.execute("INSERT INTO biometric_redate_items (batch,kind,punch_id,date,"
+                        "processed,outcome) VALUES (?,'snap',?,?,?,?)",
+                        (batch, pid, x[0], x[1], x[2]))
+        # تأخر البوابة لتلك الأيام يُنسخ ثم يُحذف — يُعاد حسابه من البصمات
+        stamp = now.isoformat(timespec="seconds")
+        for d, s in sorted(pairs):
+            for t in cur.execute("SELECT * FROM tardiness WHERE date=? AND student_id=? "
+                                 "AND teacher_name=?", (d, s, BIO_GATE_TEACHER)).fetchall():
+                cur.execute("INSERT INTO tardiness_purged (batch,reason,purged_by,purged_at,"
+                            "row_json,punch_ids) VALUES (?,?,?,?,?,'')",
+                            (batch, REDATE_REASON, str(by or ""), stamp,
+                             json.dumps(dict(t), ensure_ascii=False)))
+                cur.execute("DELETE FROM tardiness WHERE id=?", (t["id"],))
+
+        created = datetime.datetime.utcnow().isoformat()
+        for r, row, new_local, new_d, sid, matched in work:
+            label = REDATE_PREFIX + new_d
+            if row is not None:
+                cur.execute("UPDATE biometric_punches SET date='', processed=1, outcome=? "
+                            "WHERE id=?", (label, row["id"]))
+            else:
+                cur.execute("INSERT INTO biometric_punches (device_id,device_uid,punch_utc,"
+                            "punch_local,date,student_id,matched,processed,outcome,created_at) "
+                            "VALUES (?,?,?,?,'',?,?,1,?,?)",
+                            (did, str(r["uid"]), r["punch_utc"], r["punch_local"], sid,
+                             1 if matched else 0, label, created))
+                cur.execute("INSERT INTO biometric_redate_items (batch,kind,punch_id) "
+                            "VALUES (?,'new',?)", (batch, cur.lastrowid))
+            cur.execute("INSERT OR IGNORE INTO biometric_punches (device_id,device_uid,punch_utc,"
+                        "punch_local,date,student_id,matched,processed,outcome,created_at) "
+                        "VALUES (?,?,?,?,?,?,?,0,'',?)",
+                        (did, str(r["uid"]),
+                         (new_local - datetime.timedelta(hours=3)).isoformat(timespec="seconds"),
+                         new_local.isoformat(timespec="seconds"), new_d, sid,
+                         1 if matched else 0, created))
+            if cur.rowcount:
+                cur.execute("INSERT INTO biometric_redate_items (batch,kind,punch_id) "
+                            "VALUES (?,'new',?)", (batch, cur.lastrowid))
+        # يوم كل طالبٍ متأثر يُعاد من أوله بترتيب الوقت
+        for d, s in pairs:
+            cur.execute("UPDATE biometric_punches SET processed=0, outcome='' "
+                        "WHERE date=? AND student_id=?", (d, s))
+        cur.execute("INSERT INTO biometric_redate_log (batch,device_id,mapping,pairs,moved,"
+                    "by_user,at) VALUES (?,?,?,?,?,?,?)",
+                    (batch, did, json.dumps(mapping, ensure_ascii=False),
+                     json.dumps(sorted(pairs), ensure_ascii=False), len(work),
+                     str(by or ""), stamp))
+        con.commit()
+    finally:
+        con.close()
+    return {"batch": batch, "moved": len(work), "skipped": skipped, "pairs": len(pairs)}
+
+
+def undo_biometric_redate(batch):
+    """يعيد ما قبل دفعة تصحيح كما كان. المُستدعي يعالج ما صار غير معالَج بلا إشعار."""
+    batch = str(batch or "").strip()
+    con = get_db(); con.row_factory = sqlite3.Row
+    try:
+        cur = con.cursor()
+        _redate_tables(cur)
+        log = cur.execute("SELECT * FROM biometric_redate_log WHERE batch=?",
+                          (batch,)).fetchone()
+        if not log or log["undone_at"]:
+            return {"undone": False, "device_id": "", "reprocess": 0, "restored_tardiness": 0}
+        pairs = [tuple(p) for p in json.loads(log["pairs"] or "[]")]
+        # ١. تأخر البوابة الذي أنتجته إعادة الحساب لتلك الأيام
+        for d, s in pairs:
+            cur.execute("DELETE FROM tardiness WHERE date=? AND student_id=? AND teacher_name=?",
+                        (d, s, BIO_GATE_TEACHER))
+        # ٢. الصفوف التي أضافتها الدفعة
+        for x in cur.execute("SELECT punch_id FROM biometric_redate_items WHERE batch=? "
+                             "AND kind='new'", (batch,)).fetchall():
+            cur.execute("DELETE FROM biometric_punches WHERE id=?", (x[0],))
+        # ٣. كل صفٍّ كان قائماً يعود كما كان
+        snap = set()
+        for x in cur.execute("SELECT punch_id, date, processed, outcome FROM "
+                             "biometric_redate_items WHERE batch=? AND kind='snap'",
+                             (batch,)).fetchall():
+            cur.execute("UPDATE biometric_punches SET date=?, processed=?, outcome=? "
+                        "WHERE id=?", (x["date"], x["processed"], x["outcome"], x["punch_id"]))
+            snap.add(x["punch_id"])
+        # ٤. بصماتٌ وصلت بعد الدفعة لتلك الأيام عولجت على حالٍ زال — تُعاد معالجتها
+        reprocess = 0
+        for d, s in pairs:
+            for x in cur.execute("SELECT id FROM biometric_punches WHERE date=? AND "
+                                 "student_id=?", (d, s)).fetchall():
+                if x[0] not in snap:
+                    cur.execute("UPDATE biometric_punches SET processed=0, outcome='' "
+                                "WHERE id=?", (x[0],))
+                    reprocess += 1
+        cur.execute("UPDATE biometric_redate_log SET undone_at=? WHERE batch=?",
+                    (datetime.datetime.now().isoformat(timespec="seconds"), batch))
+        con.commit()
+        device_id = log["device_id"]
+    finally:
+        con.close()
+    # ٥. سجلات التأخر المحذوفة تعود بمعرّفاتها
+    back = restore_tardiness_purge(batch, reason=REDATE_REASON)
+    return {"undone": True, "device_id": device_id, "reprocess": reprocess,
+            "restored_tardiness": back["restored"]}
+
+
+def biometric_redate_history(limit=10):
+    con = get_db(); con.row_factory = sqlite3.Row
+    try:
+        if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                           "AND name='biometric_redate_log'").fetchone():
+            return []
+        return [{"batch": r["batch"], "device_id": r["device_id"],
+                 "mapping": json.loads(r["mapping"] or "{}"), "moved": r["moved"],
+                 "by": r["by_user"], "at": r["at"], "undone_at": r["undone_at"]}
+                for r in con.execute("SELECT * FROM biometric_redate_log "
+                                     "ORDER BY at DESC, batch DESC LIMIT ?", (limit,))]
+    finally:
+        con.close()
 
 
 # --- Helper functions for Exempted Students ---

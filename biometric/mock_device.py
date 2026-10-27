@@ -74,16 +74,28 @@ class MockDevice:
     def enroll_student(self, uid, name="", finger=0):
         return {"ok": True, "stage": "capturing", "mock": True}
 
-    def read_punches(self, after_utc=None):
+    def read_punches(self, after_utc=None, known_records=None, include_old=False):
+        # كجهاز ZK: ذات التاريخ القديم غير المنطقي لا تُرجَع وتُعدّ في
+        # last_old_records، وinclude_old يُرجع السجلّ كاملاً بترتيبه
+        from .zk_device import OLD_DATE_FLOOR
         after_dt = None
-        if after_utc:
+        if after_utc and not include_old:
             try:
                 after_dt = datetime.datetime.fromisoformat(
                     after_utc.replace("Z", ""))
             except Exception:
                 after_dt = None
-        out = []
+        out, old = [], []
         for p in self._queue:
+            try:
+                local = datetime.datetime.fromisoformat(p["punch_local"])
+            except Exception:
+                local = None
+            if local is not None and local < OLD_DATE_FLOOR:
+                old.append(dict(p))
+                if include_old:
+                    out.append(dict(p))
+                continue
             if after_dt:
                 try:
                     if datetime.datetime.fromisoformat(
@@ -92,6 +104,7 @@ class MockDevice:
                 except Exception:
                     pass
             out.append(dict(p))
+        self.last_old_records = old
         return out
 
     def get_users_and_fingerprints(self):

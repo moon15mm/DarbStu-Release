@@ -133,7 +133,19 @@ DAILY_SKIP_TEXT = {
     "sent": "أُرسلت له اليوم",
     "unsure": "محاولة سابقة اليوم انتهت مهلتها وربما وصلت",
     "inflight": "تُرسَل له الآن من مكان آخر",
+    "not_today": "رسائل الغياب والتأخر تُرسَل في يومها فقط",
 }
+NOT_TODAY_MSG = "رسائل الغياب والتأخر تُرسَل في يومها فقط — لا تُرسَل رسائل يومٍ مضى."
+
+
+def is_message_day(date_str) -> bool:
+    """
+    رسالة الغياب أو التأخر تُرسَل في يومها وحده (طلب ماهر، ٢٧ أكتوبر ٢٠٢٦).
+    كان سحبُ البصمات بعد انقطاعٍ يعالج بصمات الأيام الماضية فيُشعر أولياء
+    أمورها اليوم، والإرسال اليدوي يقبل أي تاريخ — فوصلت رسائل يومين مضيا صباح
+    اليوم، واستهلكت سقف اليوم فتعطّلت رسائله هو.
+    """
+    return str(date_str or "")[:10] == now_riyadh_date()
 _UNSURE_MARKS = ("مهلة", "غير متوقع", "timeout", "timed out")
 _FAILED_MARKS = ("فشل", "تعذّر", "تعذر", "غير متاح", "غير متصل", "غير مسجّل",
                  "غير مسجل", "لا يوجد رقم", "غير موجود", "غير صالح", "غير مدعوم",
@@ -220,11 +232,14 @@ def claim_daily_message(date_str, student_id, mtype) -> str:
     """
     يحجز رسالة اليوم لهذا الطالب والنوع قبل إرسالها.
     '' ⇒ أرسِل، ثم استدعِ release_daily_message بعد تسجيل النتيجة.
-    وإلا سبب التخطّي (مفتاحٌ في DAILY_SKIP_TEXT): 'sent' · 'unsure' · 'inflight'.
+    وإلا سبب التخطّي (مفتاحٌ في DAILY_SKIP_TEXT): 'sent' · 'unsure' · 'inflight' ·
+    'not_today' (ليس يومها — البوابة التي تمرّ بها المسارات كلها).
     الأنواع خارج DAILY_ONCE_TYPES لا تُحجز.
     """
     if mtype not in DAILY_ONCE_TYPES:
         return ""
+    if not is_message_day(date_str):
+        return "not_today"
     key = (str(date_str), str(student_id), mtype)
     with _daily_lock:
         if key in _daily_inflight:

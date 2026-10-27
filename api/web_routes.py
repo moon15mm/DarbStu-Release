@@ -599,6 +599,10 @@ async def web_send_absence_messages(req: Request):
         students = data.get("students", [])
         if not students:
             return JSONResponse({"ok": False, "msg": "لا يوجد طلاب"})
+        # رسالة اليوم في يومها فقط — يُرفض قبل أن تبدأ دفعةٌ يُتخطّى كلّها
+        from alerts_service import is_message_day, NOT_TODAY_MSG
+        if not is_message_day(date_str):
+            return JSONResponse({"ok": False, "msg": NOT_TODAY_MSG})
 
         # render_message لا template.format: القالب فيه {guardian} و{son}، و.format
         # بأربعة حقول كان يرفع KeyError('guardian') قبل أول رسالة — فظهر
@@ -642,6 +646,9 @@ async def web_send_tardiness_messages(req: Request):
         students = data.get("students", [])
         if not students:
             return JSONResponse({"ok": False, "msg": "لا يوجد طلاب"})
+        from alerts_service import is_message_day, NOT_TODAY_MSG
+        if not is_message_day(date_str):
+            return JSONResponse({"ok": False, "msg": NOT_TODAY_MSG})
 
         cfg      = load_config()
         template = cfg.get("tardiness_message_template",

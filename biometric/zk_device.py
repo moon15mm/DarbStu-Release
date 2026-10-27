@@ -18,6 +18,12 @@ PORT = 4370
 _TCP_MAGIC = (0x5050, 0x827D)
 _RIYADH = datetime.timedelta(hours=3)
 
+# ساعة الجهاز تُرمَّز ثوانيَ منذ 2000-01-01 (انظر _decode_zk_time)، فإن فقدت
+# بطاريتها عادت إلى ما حول ذلك. فبصمةٌ قبل 2010 من ساعةٍ عادت إلى بدايتها لا من
+# يومٍ حقيقي — والحدّ بعيدٌ عمداً عن أي سجلٍّ حقيقي قديم يحمله جهازٌ مستعمل منذ سنين.
+# لا تُسحب بتاريخها الخاطئ؛ تُعدّ ليُنبَّه إليها، وتُنقل من «تصحيح تاريخ البصمات».
+OLD_DATE_FLOOR = datetime.datetime(2010, 1, 1)
+
 # ثوابت أوامر ZKTeco
 CMD_CONNECT = 1000
 CMD_EXIT = 1001
@@ -445,9 +451,14 @@ class ZKDevice:
         finally:
             self.disconnect()
 
-    def read_punches(self, after_utc=None, known_records=None) -> list:
+    def read_punches(self, after_utc=None, known_records=None, include_old=False) -> list:
         """
         يقرأ البصمات الجديدة. يُرجع قائمة، ويضع العدّ في `self.last_counts`.
+
+        البصمات ذات التاريخ القديم غير المنطقي (قبل OLD_DATE_FLOOR) لا تُرجَع،
+        وتوضع في `self.last_old_records` — و`None` فيه = لم يُنزَّل السجلّ هذه
+        المرة فلا نعرف. و`include_old=True` يُرجع السجلّ كاملاً بترتيبه بلا
+        ترشيح، لصفحة التصحيح.
 
         ⚠️ بروتوكول ZK لا يملك «أعطني ما بعد وقتٍ ما»: `get_attendance`
         يُنزّل **سجلّ الجهاز كاملاً** ثم نُرشّح نحن. فمدرسةٌ مضى عليها
@@ -458,6 +469,7 @@ class ZKDevice:
         للتنزيل إطلاقاً. والعدّاد يزيد مع كل بصمة، فتساويه يعني يقيناً
         ألّا جديد — لا تخميناً.
         """
+        self.last_old_records = None
         self.connect()
         try:
             try:
@@ -473,13 +485,15 @@ class ZKDevice:
 
             # لا سجلّ على الجهاز ⇒ لا تنزيل ولا التباس
             if cnt["records"] == 0:
+                self.last_old_records = []
                 return []
             # العدّ كما كان ⇒ لا بصمة جديدة منذ آخر دورة
-            if known_records is not None and cnt["records"] == known_records:
+            if (known_records is not None and cnt["records"] == known_records
+                    and not include_old):
                 return []
 
             after_dt = None
-            if after_utc:
+            if after_utc and not include_old:
                 try:
                     after_dt = datetime.datetime.fromisoformat(
                         after_utc.replace("Z", ""))
@@ -487,17 +501,24 @@ class ZKDevice:
                     pass
 
             attendance = self.conn.get_attendance()
-            out = []
+            out, old = [], []
             for att in attendance:
                 local_dt = att.timestamp
                 punch_utc = local_dt - _RIYADH
-                if after_dt and punch_utc <= after_dt:
-                    continue
-                out.append({
+                rec = {
                     "uid": str(att.user_id).strip(),
                     "punch_utc": punch_utc.isoformat(timespec="seconds"),
                     "punch_local": local_dt.isoformat(timespec="seconds"),
-                })
+                }
+                if local_dt < OLD_DATE_FLOOR:
+                    old.append(rec)
+                    if include_old:
+                        out.append(rec)
+                    continue
+                if after_dt and punch_utc <= after_dt:
+                    continue
+                out.append(rec)
+            self.last_old_records = old
             return out
         finally:
             self.disconnect()

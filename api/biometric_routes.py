@@ -14,6 +14,9 @@ api/biometric_routes.py — ربط جهاز البصمة وإدارته.
   POST /web/api/biometric/enroll               ربط رقم جهاز بطالب
   POST /web/api/biometric/unenroll             حذف ربط
   POST /web/api/biometric/mock-seed            حقن بصمات تجريبية (وضع التطوير)
+  GET  /web/biometric/redate                   تصحيح تاريخ البصمات (ساعة جهازٍ عادت إلى 2000)
+  GET  /web/api/biometric/redate/scan          فحص سجلّ الأجهزة عن بصماتٍ قديمة التاريخ
+  POST /web/api/biometric/redate/apply|undo    النقل إلى التاريخ الصحيح والتراجع (المدير)
 
 كل الكتابة تمرّ بالمصادقة. القراءة الحيّة للبصمات كذلك — فقد تحمل أسماء
 طلاب. أداة الاختبار (mock-seed) محجوبة إلا في وضع التطوير.
@@ -469,6 +472,92 @@ async def bio_false_tardiness_restore(request: Request):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
+# ── تصحيح تاريخ البصمات (ساعة جهازٍ عادت إلى 2000) — صفحةٌ مستقلة ──────────
+# لا تظهر في صفحة البصمة إلا ملاحظةً حين توجد المشكلة. الفحص لكل مستخدم،
+# والنقل والتراجع للمدير، والنقل يشترط العدد الذي عاينه. وقراءة الجهاز بطيئة
+# فتجري خارج حلقة الخادم كي لا تتجمّد بقية الصفحات.
+@router.get("/web/biometric/redate", response_class=HTMLResponse)
+async def biometric_redate_page(request: Request):
+    from api.web_routes import _get_current_user
+    if not _get_current_user(request):
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse("/web/login")
+    return HTMLResponse(
+        content=_REDATE_PAGE,
+        headers={"Content-Security-Policy":
+                 "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; "
+                 "script-src * 'unsafe-inline' 'unsafe-eval'; "
+                 "style-src * 'unsafe-inline';"})
+
+
+@router.get("/web/api/biometric/redate/scan", response_class=JSONResponse)
+async def bio_redate_scan(request: Request):
+    from api.web_routes import _get_current_user
+    u = _get_current_user(request)
+    if not u:
+        return _unauth()
+    try:
+        from starlette.concurrency import run_in_threadpool
+        from biometric import poller
+        from database import biometric_redate_history
+        devices = await run_in_threadpool(poller.scan_old_dated)
+        return JSONResponse({"ok": True, "devices": devices, "today": now_riyadh_date(),
+                             "history": biometric_redate_history(),
+                             "can_fix": u.get("role") == "admin"})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@router.post("/web/api/biometric/redate/apply", response_class=JSONResponse)
+async def bio_redate_apply(request: Request):
+    u = _admin_user(request)
+    if not u:
+        return JSONResponse({"ok": False, "error": "التصحيح لمدير النظام وحده"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    import datetime as _dt
+    target = str(body.get("target_date") or "").strip()
+    try:
+        expect = int(body.get("expect"))
+        t = _dt.date.fromisoformat(target)
+    except Exception:
+        return JSONResponse({"ok": False, "error": "التاريخ أو العدد غير صالح"}, status_code=400)
+    if t < _dt.date(2010, 1, 1) or target > now_riyadh_date():
+        return JSONResponse({"ok": False, "error": "التاريخ الصحيح لا يكون قبل 2010 ولا بعد اليوم"},
+                            status_code=400)
+    try:
+        from starlette.concurrency import run_in_threadpool
+        from biometric import poller
+        try:
+            res = await run_in_threadpool(poller.redate_apply, str(body.get("device_id") or ""),
+                                          target, expect, u.get("username", ""))
+        except poller.RedateConflict as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=409)
+        return JSONResponse({"ok": True, **res})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@router.post("/web/api/biometric/redate/undo", response_class=JSONResponse)
+async def bio_redate_undo(request: Request):
+    u = _admin_user(request)
+    if not u:
+        return JSONResponse({"ok": False, "error": "التراجع لمدير النظام وحده"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        from starlette.concurrency import run_in_threadpool
+        from biometric import poller
+        return JSONResponse({"ok": True, **await run_in_threadpool(
+            poller.redate_undo, str(body.get("batch") or ""))})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
 @router.post("/web/api/biometric/generate-numbers", response_class=JSONResponse)
 async def bio_generate_numbers(request: Request):
     """
@@ -907,6 +996,8 @@ _PAGE = r"""<!doctype html>
     <button class="btn o sm" id="runbtn" onclick="runNow(event)">↻ سحب ومعالجة الآن</button>
   </div>
   <div id="dev-status" class="muted" style="margin-top:6px"></div>
+  <!-- لا تظهر إلا إن عادت ساعة جهازٍ إلى تاريخٍ قديم — صفحة التصحيح مستقلة -->
+  <div id="od-warn" class="runmsg er" style="display:none"></div>
   <!-- ما كان ينقص: مكانٌ يقول ماذا يحدث وماذا حدث -->
   <div id="runbar" style="display:none;margin-top:8px">
     <div class="ptrack"><div class="pfill2" id="runfill"></div></div>
@@ -1004,6 +1095,12 @@ async function loadStatus(){
   else{dot.className='dot on';txt.textContent='الخيط: يعمل'+(p.last_run?' · آخر دورة '+p.last_run.slice(11,19):'');}
   const ds=(p.devices||[]).map(x=>x.ok?('✅ '+x.device_id+(x.new?(' +'+x.new):'')):('❌ '+x.device_id+' — '+x.error)).join('  ·  ');
   $('dev-status').textContent=ds;
+  const od=p.old_dated||{}, w=$('od-warn'); let n=0; const parts=[];
+  Object.keys(od).forEach(dv=>Object.keys(od[dv]).sort().forEach(dt=>{n+=od[dv][dt];parts.push(dt+': '+od[dv][dt]);}));
+  if(n){w.style.display='block';
+    w.innerHTML='⚠️ في سجلّ الجهاز بصماتٌ بتاريخ قديم غير منطقي ('+parts.join('، ')+') — عادت ساعة الجهاز إلى الوراء فلم تُسحب. '
+      +'<a href="/web/biometric/redate"><b>افتح «تصحيح تاريخ البصمات»</b></a>';}
+  else w.style.display='none';
 }
 async function loadConfig(){
   const d=await api('/web/api/biometric/config'); if(!d||!d.ok)return;
@@ -1863,5 +1960,151 @@ document.addEventListener('keydown', (e)=>{
 // ‏loadPlan منفصلة ومتسامحة: مدرسةٌ بمرحلة واحدة لا يعنيها الأمر،
 // وسقوطها يجب ألا يمنع ظهور قائمة الطلاب
 window.onload=function(){ load(); loadPlan(); loadLock(); };
+</script>
+</body></html>"""
+
+
+# ── صفحة «تصحيح تاريخ البصمات» — مستقلةٌ عمداً: لا تُزعج من لا مشكلة عنده ──
+# نصٌّ خام (r""") كـ_PAGE: `\n` و`\'` تصلان إلى جافاسكربت كما كُتبتا.
+_REDATE_PAGE = r"""<!doctype html>
+<html lang="ar" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>تصحيح تاريخ البصمات — درب الطلاب</title>
+<style>
+  :root{--navy:#0C2E56;--blue:#1565C0;--org:#F07A16;--mu:#5D7391;--line:#E2EAF4;--bg:#F5F8FC;}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:Tahoma,Arial,sans-serif;background:var(--bg);color:#12233B;padding:22px;max-width:980px;margin:0 auto}
+  a{color:var(--blue);text-decoration:none}
+  .top{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:18px;gap:10px;flex-wrap:wrap}
+  h1{font-size:22px;color:var(--navy)}
+  h1 small{display:block;font-size:13px;color:var(--mu);font-weight:normal;margin-top:6px;line-height:1.8;max-width:680px}
+  .card{background:#fff;border:1px solid var(--line);border-radius:13px;padding:16px 17px;margin-bottom:16px}
+  .card h2{font-size:16px;color:var(--navy);margin-bottom:8px}
+  .row{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin:10px 0 2px}
+  label{font-size:13px;color:#33475F}
+  .btn{font-family:inherit;font-size:14px;font-weight:700;border:none;border-radius:8px;padding:9px 18px;cursor:pointer;color:#fff;background:var(--blue)}
+  .btn.o{background:var(--org)}
+  .btn.gh{background:#eef3fb;color:var(--navy)}
+  .btn.sm{padding:6px 12px;font-size:12.5px}
+  .btn:disabled{opacity:.5;cursor:default}
+  input[type=date]{font-family:inherit;font-size:14px;padding:7px 9px;border:1px solid #cfd9e6;border-radius:8px}
+  table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}
+  th{background:var(--navy);color:#fff;padding:7px 6px;font-weight:700}
+  td{padding:7px 6px;border-top:1px solid #EDF2F8;text-align:center}
+  .muted{color:var(--mu);font-size:12.5px}
+  .note{padding:9px 12px;border-radius:8px;font-size:13px;line-height:1.8;margin-top:8px}
+  .note.ok{background:#ECFDF5;color:#065F46;border:1px solid #A7F3D0}
+  .note.er{background:#FEF2F2;color:#991B1B;border:1px solid #FECACA}
+  .note.wn{background:#FFFBEB;color:#92400E;border:1px solid #FDE68A}
+  .note.ai{background:#EFF6FF;color:#1E40AF;border:1px solid #BFDBFE}
+  .dev{border:1px solid var(--line);border-radius:10px;padding:12px;margin-top:10px}
+  .dev h3{font-size:14.5px;color:var(--navy)}
+  td.to{font-weight:700;color:#065F46}
+</style></head><body>
+<div class="top">
+  <h1>تصحيح تاريخ البصمات
+    <small>إذا عادت ساعة جهاز البصمة إلى تاريخٍ قديم (مثل عام 2000) بقيت بصمات الطلاب في ذاكرته بذلك التاريخ، فلا تُسحب ولا يظهر حضورهم. هنا تُنقل إلى تاريخها الصحيح ويبقى وقتها كما سجّله الجهاز، ويمكن التراجع عن أي تصحيح.</small></h1>
+  <a href="/web/biometric">← صفحة جهاز البصمة</a>
+</div>
+<div class="card">
+  <div class="row"><button class="btn o" id="scanbtn" onclick="scan()">🔍 فحص سجلّ الأجهزة</button>
+    <span class="muted">يقرأ سجلّ كل جهاز كاملاً — قد يستغرق دقيقة.</span></div>
+  <div id="res"></div>
+  <div id="msg"></div>
+</div>
+<div class="card"><h2>سجلّ التصحيحات</h2><div id="hist"><p class="muted">—</p></div></div>
+<script>
+const $=id=>document.getElementById(id);
+let D=null;
+async function api(path,opts){
+  const r=await fetch(path,opts||{});
+  if(r.status===401){location.href='/web/login';return null;}
+  return r.json();
+}
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+  .replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function note(c,h){return '<div class="note '+c+'">'+h+'</div>';}
+function addDays(iso,n){const t=new Date(iso+'T00:00:00Z');t.setUTCDate(t.getUTCDate()+n);
+  return t.toISOString().slice(0,10);}
+function dayDiff(a,b){return Math.round((Date.parse(a+'T00:00:00Z')-Date.parse(b+'T00:00:00Z'))/86400000);}
+
+async function scan(){
+  const b=$('scanbtn'); b.disabled=true; b.textContent='⏳ جارٍ قراءة سجلّ الأجهزة...';
+  $('res').innerHTML=note('ai','يتصل بالأجهزة ويقرأ سجلّها كاملاً...');
+  try{
+    const d=await api('/web/api/biometric/redate/scan');
+    if(!d||!d.ok){$('res').innerHTML=note('er','تعذّر الفحص: '+esc((d&&d.error)||'لم يردّ الخادم'));return;}
+    D=d; render();
+  }catch(e){$('res').innerHTML=note('er','خطأ في الاتصال: '+esc(e));}
+  finally{b.disabled=false;b.textContent='🔍 فحص سجلّ الأجهزة';}
+}
+function render(){
+  renderHist(D.history||[],D.can_fix);
+  if(!D.devices.length){$('res').innerHTML=note('wn','لا أجهزة مُفعّلة. أضِف الجهاز من صفحة جهاز البصمة أولاً.');return;}
+  $('res').innerHTML=D.devices.map(devHtml).join('');
+}
+function devHtml(x,i){
+  let h='<div class="dev"><h3>الجهاز '+esc(x.device_id)+'</h3>';
+  if(!x.ok) return h+note('er','❌ تعذّر الاتصال: '+esc(x.error))+'</div>';
+  if(!x.pending) return h+note('ok',x.done?('✅ كل البصمات ذات التاريخ القديم صُحّحت ('+x.done+').')
+                                        :('✅ لا بصمات بتاريخ قديم في سجلّ الجهاز ('+x.records+' سجلاً).'))+'</div>';
+  h+='<p class="muted" style="margin-top:6px">بصماتٌ بتاريخ قديم غير منطقي لم تُسحب: '+x.pending+'</p>';
+  h+='<table><tr><th>التاريخ في الجهاز</th><th>البصمات</th><th>أوقاتها</th><th>التاريخ الصحيح</th></tr>'
+    +x.days.filter(g=>g.pending).map(g=>'<tr><td>'+esc(g.date)+'</td><td>'+g.pending+'</td><td>'
+      +esc(g.first)+' إلى '+esc(g.last)+'</td><td class="to" data-from="'+esc(g.date)+'">'+esc(g.to)+'</td></tr>').join('')
+    +'</table>';
+  h+='<div class="row"><label for="tg-'+i+'">تاريخها الصحيح:</label>'
+    +'<input type="date" id="tg-'+i+'" value="'+esc(x.target)+'" min="2010-01-01" max="'+esc(D.today)+'" onchange="retarget('+i+')">'
+    +'<span class="muted">'+(x.source==='after'?'اقتُرح من أول بصمةٍ سُجّلت بعد تعديل ساعة الجهاز'
+                                         :'اليوم — لم يبصم أحدٌ بعد تعديل ساعة الجهاز')+'</span></div>';
+  if(x.days.filter(g=>g.pending).length>1)
+    h+='<p class="muted">آخر يومٍ في الجهاز يُنقل إلى هذا التاريخ، وما قبله بالفارق نفسه.</p>';
+  if(x.time_warning)
+    h+=note('wn','⚠️ أوقات هذه البصمات لا تشبه أوقات الدخول الصباحي — قد تكون ساعة الجهاز خاطئة في الوقت أيضاً لا في التاريخ وحده، فيُحسب التأخر خطأً. راجع قبل التصحيح.');
+  h+=D.can_fix?('<div class="row"><button class="btn" onclick="applyFix('+i+')">✅ نقل البصمات ('+x.pending+') إلى تاريخها الصحيح</button>'
+                +'<span class="muted">يُعاد حساب حضور الطلاب وتأخرهم لتلك الأيام بلا إرسال رسائل.</span></div>')
+              :'<p class="muted">التصحيح لمدير النظام.</p>';
+  return h+'</div>';
+}
+function retarget(i){
+  const x=D.devices[i], t=$('tg-'+i).value; if(!t)return;
+  const pend=x.days.filter(g=>g.pending).map(g=>g.date).sort(), latest=pend[pend.length-1];
+  document.querySelectorAll('#res .dev')[i].querySelectorAll('td.to').forEach(function(td){
+    td.textContent=addDays(t,-dayDiff(latest,td.dataset.from));});
+}
+async function applyFix(i){
+  const x=D.devices[i], t=$('tg-'+i).value;
+  if(!t){alert('اختر التاريخ الصحيح');return;}
+  if(!confirm('نقل البصمات ('+x.pending+') من الجهاز '+x.device_id+' إلى تاريخها الصحيح ('+t+')؟\nتستطيع التراجع من «سجلّ التصحيحات».'))return;
+  $('msg').innerHTML=note('ai','⏳ جارٍ النقل وإعادة الحساب...');
+  const r=await api('/web/api/biometric/redate/apply',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({device_id:x.device_id,target_date:t,expect:x.pending})});
+  if(r&&r.ok){const s=r.stat||{};
+    $('msg').innerHTML=note('ok','✅ نُقلت البصمات ('+r.moved+'). بعد إعادة الحساب: حاضر '+(s.present||0)+' · متأخر '+(s.tardy||0)
+      +' · مكرر '+(s.duplicate||0)+' · بلا مطابقة '+(s.unmatched||0)+'.');}
+  else $('msg').innerHTML=note('er','تعذّر التصحيح: '+esc((r&&r.error)||''));
+  await scan();
+}
+function renderHist(rows,can){
+  const box=$('hist');
+  if(!rows.length){box.innerHTML='<p class="muted">لا تصحيحات بعد.</p>';return;}
+  box.innerHTML='<table><tr><th>الوقت</th><th>الجهاز</th><th>النقل</th><th>البصمات</th><th>بواسطة</th><th></th></tr>'
+    +rows.map(r=>'<tr><td>'+esc(String(r.at||'').replace('T',' ').slice(0,16))+'</td><td>'+esc(r.device_id)+'</td><td>'
+      +Object.keys(r.mapping||{}).sort().map(a=>esc(a)+' إلى '+esc(r.mapping[a])).join('<br>')
+      +'</td><td>'+r.moved+'</td><td>'+esc(r.by)+'</td><td>'
+      +(r.undone_at?'<span class="muted">تُراجع عنه</span>'
+        :(can?'<button class="btn gh sm" onclick="undoFix(\''+esc(r.batch)+'\')">↶ تراجع</button>':''))
+      +'</td></tr>').join('')+'</table>';
+}
+async function undoFix(batch){
+  if(!confirm('التراجع عن هذا التصحيح وإعادة البصمات إلى حالها قبله؟'))return;
+  $('msg').innerHTML=note('ai','⏳ جارٍ التراجع...');
+  const r=await api('/web/api/biometric/redate/undo',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({batch:batch})});
+  $('msg').innerHTML=(r&&r.ok&&r.undone)?note('ok','↶ تمّ التراجع: عادت البصمات وسجلات التأخر إلى حالها قبل التصحيح.')
+    :note('er','تعذّر التراجع: '+esc((r&&r.error)||'التصحيح غير موجود أو تُراجع عنه سابقاً'));
+  await scan();
+}
+window.onload=scan;
 </script>
 </body></html>"""

@@ -28,6 +28,11 @@ poller_lock = threading.Lock()
 # حفظه فيصير مصدرَ حقيقةٍ ثانياً قد يُفوّت بصمات لو انحرف.
 _seen_records = {}
 
+# بصماتٌ بتاريخ قديم غير منطقي (ساعة جهازٍ عادت إلى 2000) لم تُصحَّح بعد:
+# {جهاز: {تاريخ الجهاز: عدد}}. يُحدَّث كلما نُزّل السجلّ، وتقرؤه صفحة البصمة
+# لتُنبّه — فلا يرى الملاحظةَ إلا من عنده المشكلة.
+_old_dated = {}
+
 # ── تقدّم السحب — تقرؤه الواجهة أثناء العملية ────────────────────────
 # السحب طلبٌ واحد يحجب حتى ينتهي، وقد يطول (اتصالٌ بكل جهاز ثم قراءة
 # سجلّه). فبلا هذا لا تعرف الواجهة إلا «انتهى» — فتبدو متجمّدة.
@@ -146,7 +151,7 @@ def process_pending(cfg=None):
     from database import (get_unprocessed_punches, mark_punch_processed,
                           get_biometric_enrollments, get_student_map,
                           get_academic_map, is_student_exempted,
-                          insert_tardiness)
+                          insert_tardiness, has_earlier_biometric_punch)
     cfg = cfg or load_config()
 
     mode = cfg.get("biometric_mode", "tardiness")   # 'tardiness' | 'attendance'
@@ -178,6 +183,15 @@ def process_pending(cfg=None):
         if is_student_exempted(sid):
             mark_punch_processed(p["id"], "مستثنى", student_id=sid, matched=1)
             stat["exempted"] += 1
+            continue
+
+        # أول بصمةٍ في اليوم تُقرّر. كانت كل بصمةٍ تُحسب وحدها، فمن بصم في
+        # وقته ثم بصم ثانيةً بعد بداية الدوام سُجّل متأخراً ووصل وليَّ أمره
+        # إشعار تأخر. والبصمات تُعالَج بترتيب وقتها، فالأسبق عولجت قبلها.
+        if has_earlier_biometric_punch(p["id"], p.get("date") or "", sid,
+                                       p.get("punch_utc") or ""):
+            mark_punch_processed(p["id"], "مكرر", student_id=sid, matched=1)
+            stat["duplicate"] += 1
             continue
 
         # وقت البصمة المحلّي — منه نحسب التأخر
@@ -221,7 +235,10 @@ def process_pending(cfg=None):
         mark_punch_processed(p["id"], outcome, student_id=sid, matched=1)
         stat["tardy"] += 1
 
-        if notify:
+        # الإشعار في يوم البصمة وحده: سحبٌ بعد انقطاع يعالج بصمات الأيام
+        # الماضية (العلامة المائية تعيد ثلاثة أيام) — فكان يُشعر عنها اليوم.
+        # والبوابة alerts_service.is_message_day ترفضها أيضاً من أي مسار.
+        if notify and (p["date"] or _today_local()) == _today_local():
             phone = _student_phone(sid)
             if phone:
                 _notify_parent(phone, sname, local, minutes_late, sid=sid,
@@ -240,6 +257,8 @@ def _notify_parent(phone, name, local_dt, minutes_late, sid="", cname="", cid=""
     يخرج بلا تسجيل، ثم تُرسَل رسالة التأخر يدوياً فتصل وليَّ الأمر رسالتان،
     ولا يظهر في التقرير إلا واحدة.
     """
+    if (date_str or _today_local()) != _today_local():
+        return              # ليس يومها — وفرع «بلا رقم طالب» أدناه لا يمرّ بالبوابة
     try:
         t = local_dt.strftime("%I:%M")
         msg = ("تنبيه حضور\n"
@@ -299,6 +318,10 @@ def _pull_devices(cfg):
                 entry["records"] = cnt.get("records")
                 entry["users"] = cnt.get("users")
                 entry["fingers"] = cnt.get("fingers")
+            # ذات التاريخ القديم لم تُرجَع؛ يُعدّ منها ما لم يُصحَّح بعد
+            old = getattr(dev, "last_old_records", None)
+            if old is not None:
+                _old_dated[did] = _pending_old_by_day(did, old)
             for p in punches:
                 uid = p["uid"]
                 sid = ""
@@ -385,4 +408,188 @@ def stop():
 
 
 def status():
-    return dict(_last_status)
+    st = dict(_last_status)
+    # {جهاز: {تاريخ الجهاز: عدد}} لما لم يُصحَّح — منه ملاحظة صفحة البصمة
+    st["old_dated"] = {d: dict(v) for d, v in _old_dated.items() if v}
+    return st
+
+
+# ══════════════════════════════════════════════════════════════════
+#  تصحيح تاريخ البصمات — صفحة /web/biometric/redate
+# ══════════════════════════════════════════════════════════════════
+# ساعة الجهاز إذا عادت إلى تاريخٍ قديم (2000) بقيت بصمات الطلاب في ذاكرته به،
+# والسحب لا يُدخلها (zk_device.OLD_DATE_FLOOR). هنا تُنقل إلى تاريخها الصحيح،
+# والتخزين والتراجع في database (apply_biometric_redate / undo_biometric_redate).
+class RedateConflict(Exception):
+    """ما في سجلّ الجهاز الآن غيرُ ما عاينه المستخدم — لا يُنقل شيء."""
+
+
+def _local_of(rec):
+    try:
+        return datetime.datetime.fromisoformat(
+            str(rec.get("punch_local") or "").replace("Z", ""))
+    except Exception:
+        return None
+
+
+def _pending_old_by_day(device_id, old_records):
+    """{تاريخ الجهاز: عدد} لما لم يُصحَّح من البصمات القديمة التاريخ."""
+    if not old_records:
+        return {}
+    from database import biometric_superseded_keys
+    done = biometric_superseded_keys(device_id)
+    days = {}
+    for r in old_records:
+        if (str(r["uid"]), r["punch_utc"]) in done:
+            continue
+        d = str(r.get("punch_local") or "")[:10]
+        days[d] = days.get(d, 0) + 1
+    return days
+
+
+def _resolver():
+    from database import get_biometric_enrollments, get_student_map, get_academic_map
+    enrollments, academic_map, student_map = (get_biometric_enrollments(),
+                                              get_academic_map(), get_student_map())
+
+    def resolve(uid):
+        m = _match_student(uid, enrollments, academic_map, student_map)
+        return (str(m[0]), True) if m else ("", False)
+    return resolve
+
+
+def redate_plan(records, done_keys, target=None, today=None):
+    """
+    خطة التصحيح من سجلّ الجهاز بترتيبه — نقيّة، بلا جهاز ولا قاعدة.
+
+    التاريخ المقترح: تاريخ أول بصمةٍ منطقية بعد آخر بصمةٍ قديمة في السجلّ، أي
+    يومُ تصحيح الساعة — وإلا اليوم. فإن فُتحت الصفحة بعد أيام لم تُنقل بصمات
+    الأحد إلى الثلاثاء. وآخر تاريخٍ قديم يُنقل إلى الهدف وما قبله بالفارق نفسه:
+    ساعةٌ عادت إلى 2000-01-01 يوم الأحد تقول 2000-01-02 يوم الاثنين.
+    """
+    from biometric.zk_device import OLD_DATE_FLOOR
+    today = today or _today_local()
+    plan = {"days": [], "pending": 0, "done": 0, "suggested": today, "source": "today",
+            "target": target or today, "mapping": {}, "time_warning": False,
+            "records": []}
+    old_idx = [i for i, r in enumerate(records)
+               if (_local_of(r) or OLD_DATE_FLOOR) < OLD_DATE_FLOOR]
+    if not old_idx:
+        return plan
+    for r in records[old_idx[-1] + 1:]:
+        l = _local_of(r)
+        if l is not None and l >= OLD_DATE_FLOOR:
+            plan["suggested"], plan["source"] = l.date().isoformat(), "after"
+            break
+    plan["target"] = target or plan["suggested"]
+
+    days = {}
+    for i in old_idx:
+        r = records[i]
+        l = _local_of(r)
+        d = l.date().isoformat()
+        g = days.setdefault(d, {"date": d, "count": 0, "pending": 0, "done": 0,
+                                "first": "", "last": "", "to": ""})
+        g["count"] += 1
+        if (str(r["uid"]), r["punch_utc"]) in done_keys:
+            g["done"] += 1
+            plan["done"] += 1
+            continue
+        g["pending"] += 1
+        plan["pending"] += 1
+        plan["records"].append(r)
+        t = l.strftime("%H:%M")
+        if not g["first"] or t < g["first"]:
+            g["first"] = t
+        if t > g["last"]:
+            g["last"] = t
+
+    pend = [d for d, g in days.items() if g["pending"]]
+    if pend:
+        latest = datetime.date.fromisoformat(max(pend))
+        base = datetime.date.fromisoformat(plan["target"])
+        for d in pend:
+            days[d]["to"] = plan["mapping"][d] = (
+                base - (latest - datetime.date.fromisoformat(d))).isoformat()
+    # أوقاتٌ لا تشبه الدخول الصباحي = الساعة خاطئة لا التاريخ وحده
+    plan["time_warning"] = any(g["pending"] and (g["first"] < "05:00" or g["last"] > "13:00")
+                               for g in days.values())
+    plan["days"] = sorted(days.values(), key=lambda g: g["date"], reverse=True)
+    return plan
+
+
+def _active_devices(cfg):
+    return [d for d in (cfg.get("biometric_devices") or []) if d.get("enabled", True)]
+
+
+def _device_key(dcfg):
+    return str(dcfg.get("device_id") or dcfg.get("ip") or "dev")
+
+
+def _read_all(dev):
+    return dev.read_punches(after_utc=None, known_records=None, include_old=True)
+
+
+def scan_old_dated(cfg=None):
+    """يقرأ سجلّ كل جهازٍ مُفعّل كاملاً، ويُرجع خطة تصحيح كلٍّ منها."""
+    from config_manager import load_config
+    from database import biometric_superseded_keys
+    from biometric import make_device
+    cfg = cfg or load_config()
+    out = []
+    with poller_lock:
+        for dcfg in _active_devices(cfg):
+            did = _device_key(dcfg)
+            entry = {"device_id": did, "ok": False, "error": "", "records": 0}
+            try:
+                recs = _read_all(make_device(dcfg))
+                plan = redate_plan(recs, biometric_superseded_keys(did))
+                entry.update({k: v for k, v in plan.items() if k != "records"})
+                entry["records"] = len(recs)
+                entry["ok"] = True
+                _old_dated[did] = {g["date"]: g["pending"] for g in plan["days"] if g["pending"]}
+            except Exception as e:
+                entry["error"] = str(e)
+            out.append(entry)
+    return out
+
+
+def redate_apply(device_id, target, expect, by="", cfg=None):
+    """
+    ينقل بصمات الجهاز القديمة التاريخ إلى الهدف. `expect` عدد ما عاينه المستخدم:
+    إن تغيّر سجلّ الجهاز منذها لا يُنقل شيء. والمعالجة بعدها **بلا إشعار** —
+    تصحيحٌ متأخر لا يُرسل لأولياء الأمور رسائل تأخرٍ بأثر رجعي.
+    """
+    from config_manager import load_config
+    from database import biometric_superseded_keys, apply_biometric_redate
+    from biometric import make_device
+    cfg = cfg or load_config()
+    did = str(device_id)
+    dcfg = next((d for d in _active_devices(cfg) if _device_key(d) == did), None)
+    if dcfg is None:
+        raise RedateConflict("الجهاز غير موجود أو غير مُفعّل")
+    with poller_lock:
+        process_pending(cfg)        # ما ينتظر من سحبٍ عادي يُعالَج بإشعاره أولاً
+        recs = _read_all(make_device(dcfg))
+        plan = redate_plan(recs, biometric_superseded_keys(did), target=target)
+        if plan["pending"] != int(expect):
+            raise RedateConflict("تغيّر سجلّ الجهاز منذ الفحص (%d بصمة الآن) — أعد الفحص."
+                                 % plan["pending"])
+        res = apply_biometric_redate(did, plan["records"], plan["mapping"], _resolver(), by)
+        stat = process_pending(dict(cfg, biometric_notify_parent=False))
+        _old_dated[did] = {}
+    return dict(res, mapping=plan["mapping"], stat=stat)
+
+
+def redate_undo(batch, cfg=None):
+    """يعيد ما قبل دفعة تصحيح، ويعالج ما صار غير معالَج بلا إشعار."""
+    from config_manager import load_config
+    from database import undo_biometric_redate
+    cfg = cfg or load_config()
+    with poller_lock:
+        res = undo_biometric_redate(batch)
+        if res.get("undone"):
+            res["stat"] = process_pending(dict(cfg, biometric_notify_parent=False))
+            # البصمات صارت معلّقة ثانيةً: الدورة القادمة تنزّل السجلّ فتعود الملاحظة
+            _seen_records.pop(res.get("device_id"), None)
+    return res

@@ -227,6 +227,10 @@ class MessagesTabMixin:
         if not date_str:
             messagebox.showerror("خطأ", "الرجاء إدخال تاريخ.")
             return
+        from alerts_service import is_message_day, NOT_TODAY_MSG
+        if not is_message_day(date_str):
+            messagebox.showwarning("تنبيه", NOT_TODAY_MSG)
+            return
 
         selected = []
         for cid, obj in self.msg_groups.items():
