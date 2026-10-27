@@ -109,6 +109,8 @@ async def bio_get_config(request: Request):
         "mode": cfg.get("biometric_mode", "tardiness"),
         "grace_min": int(cfg.get("biometric_grace_min", 0)),
         "notify_parent": bool(cfg.get("biometric_notify_parent", True)),
+        # المفتاح الرئيسي يعلو خانة الإشعار — تنبّه إليه الصفحة كي لا يُظنّ عطلاً
+        "parent_master": bool(cfg.get("bots_master_enabled", True)),
         "school_start_time": cfg.get("school_start_time", "07:00"),
         "devices": cfg.get("biometric_devices") or [],
     })
@@ -1031,6 +1033,7 @@ _PAGE = r"""<!doctype html>
         <span class="muted">تُضاف لوقت بداية الدوام قبل احتساب التأخر</span></div>
       <div class="row"><label>إشعار وليّ الأمر</label>
         <div class="switch"><input type="checkbox" id="c-notify" checked><span class="muted">إرسال واتساب فور تسجيل التأخر</span></div></div>
+      <div id="c-master-off" class="runmsg er" style="display:none">⛔ الإرسال لأولياء الأمور موقوف بالمفتاح الرئيسي — لن يخرج إشعار البصمة وإن كانت الخانة مفعّلة. يُشغَّل من <a href="/web/whatsapp-connect" target="_blank"><b>صفحة ربط واتساب</b></a>.</div>
       <div class="row"><label>بداية الدوام</label><span id="c-start" class="muted">—</span></div>
       <button class="btn g" onclick="saveConfig()">حفظ الإعدادات</button>
       <div id="cfg-msg" class="msg"></div>
@@ -1108,6 +1111,7 @@ async function loadConfig(){
   $('c-mode').value=d.mode;
   $('c-grace').value=d.grace_min;
   $('c-notify').checked=d.notify_parent;
+  $('c-master-off').style.display=(d.parent_master===false)?'block':'none';
   $('c-start').textContent=d.school_start_time;
   DEVICES=d.devices||[]; renderDevices();
 }

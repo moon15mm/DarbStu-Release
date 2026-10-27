@@ -339,7 +339,7 @@ def _alerts(snap):
                   "text": "بقي %d رقماً جديداً من حدّ اليوم (%d)" % (nrem, nlim)})
 
     if not tasks.get("master"):
-        a.append({"level": "warn", "text": "الإرسال لأولياء الأمور موقوف بالمفتاح الرئيسي"})
+        a.append({"level": "warn", "text": "الإرسال لأولياء الأمور موقوف بالمفتاح الرئيسي — يُشغَّل من صفحة «ربط واتساب» في الويب أو تبويب الواتساب في البرنامج"})
     elif not any(i["on"] for i in tasks.get("items", [])):
         a.append({"level": "warn", "text": "كل المهام التلقائية مطفأة — لن تصل رسائل تلقائية"})
 

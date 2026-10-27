@@ -157,7 +157,11 @@ def process_pending(cfg=None):
     mode = cfg.get("biometric_mode", "tardiness")   # 'tardiness' | 'attendance'
     grace = int(cfg.get("biometric_grace_min", 0))
     start_str = cfg.get("school_start_time", "07:00")
-    notify = bool(cfg.get("biometric_notify_parent", True))
+    # والمفتاح الرئيسي للإرسال لأولياء الأمور يعلوه: إشعار البوابة رسالةٌ تلقائية
+    # لوليّ أمر كرسائل الغياب، وكان يفلت منه — فمدرسةٌ أوقفت الإرسال أيام
+    # الاختبارات تصل أولياءَ أمورها إشعاراتُ البوابة رغم ذلك (٢٧ أكتوبر ٢٠٢٦).
+    notify = (bool(cfg.get("biometric_notify_parent", True))
+              and bool(cfg.get("bots_master_enabled", True)))
 
     try:
         start_t = datetime.datetime.strptime(start_str[:5], "%H:%M")
@@ -259,6 +263,12 @@ def _notify_parent(phone, name, local_dt, minutes_late, sid="", cname="", cid=""
     """
     if (date_str or _today_local()) != _today_local():
         return              # ليس يومها — وفرع «بلا رقم طالب» أدناه لا يمرّ بالبوابة
+    try:
+        from config_manager import parent_sending_on
+        if not parent_sending_on():
+            return          # المفتاح الرئيسي مُطفأ — لكل مُستدعٍ لا لـprocess_pending وحده
+    except Exception:
+        pass
     try:
         t = local_dt.strftime("%I:%M")
         msg = ("تنبيه حضور\n"

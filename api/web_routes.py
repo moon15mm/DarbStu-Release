@@ -14902,6 +14902,64 @@ async def wa_provider_set(request: Request):
         return JSONResponse({"ok": False, "msg": str(e)})
 
 
+# ── المفتاح الرئيسي للإرسال لأولياء الأمور — كان في المكتبي وحده ──────────
+# يوقف كل ما يخرج تلقائياً لأولياء الأمور (ومنه إشعار جهاز البصمة) والبوتَ الذي
+# يستقبل ردودهم، ولا يمسّ الإرسال اليدوي ولا ما يصل الإدارة. والضبط الفردي لكل
+# مهمة يبقى، فالتشغيل يعيد كل شيء كما كان (config_manager.set_bots_master).
+_PARENT_TASK_NAMES = (("absence_bot_enabled", "رسائل الغياب"),
+                      ("permission_bot_enabled", "رسائل الاستئذان"),
+                      ("alert_enabled", "الإشعارات الذكية"),
+                      ("tardiness_auto_send_enabled", "رابط التأخر المجدوَل"),
+                      ("weekly_reward_enabled", "مكافأة الحضور الأسبوعية"))
+
+
+def _parent_sending_view():
+    cfg = load_config()
+    items = [{"key": k, "name": n, "on": bool(cfg.get(k, False))} for k, n in _PARENT_TASK_NAMES]
+    if cfg.get("biometric_devices"):
+        items.append({"key": "biometric_notify_parent", "name": "إشعارات جهاز البصمة",
+                      "on": bool(cfg.get("biometric_notify_parent", True))})
+    return {"ok": True, "master": bool(cfg.get("bots_master_enabled", True)), "items": items}
+
+
+@router.get("/web/api/wa/parent-sending", response_class=JSONResponse)
+async def wa_parent_sending_get(request: Request):
+    if not _wa_manager(request):
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        return JSONResponse(_parent_sending_view())
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)})
+
+
+@router.post("/web/api/wa/parent-sending", response_class=JSONResponse)
+async def wa_parent_sending_set(request: Request):
+    user = _wa_manager(request)
+    if not user:
+        return JSONResponse({"ok": False, "msg": "غير مصرح"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    # قيمةٌ منطقية صريحة: النصّ "false" صحيحٌ في بايثون فكان سيُشغّل بدل أن يوقف
+    if not isinstance(body, dict) or not isinstance(body.get("on"), bool):
+        return JSONResponse({"ok": False, "msg": "قيمة غير صالحة"}, status_code=400)
+    try:
+        from starlette.concurrency import run_in_threadpool
+        from config_manager import set_bots_master
+        # يحفظ ثم ينادي خادم الواتساب لبوت الردود — قد يطول ثوانيَ
+        if not await run_in_threadpool(set_bots_master, body["on"]):
+            return JSONResponse({"ok": False, "msg": "تعذّر حفظ الإعداد"})
+        print("[BOTS] %s الإرسال لأولياء الأمور من الويب — %s"
+              % ("تشغيل" if body["on"] else "إيقاف", user.get("sub", "")))
+        out = _parent_sending_view()
+        out["msg"] = ("شُغّل الإرسال لأولياء الأمور — عادت المهام كما كانت" if body["on"]
+                      else "أُوقف الإرسال التلقائي لأولياء الأمور")
+        return JSONResponse(out)
+    except Exception as e:
+        return JSONResponse({"ok": False, "msg": str(e)})
+
+
 @router.get("/web/api/wa/cloud", response_class=JSONResponse)
 def wa_cloud_state(request: Request, qr: int = 0):
     """
@@ -15206,6 +15264,19 @@ async def wa_connect_page(request: Request):
   .prov-manual summary{cursor:pointer;font-size:.78rem;color:#475569;padding:4px 0;list-style-position:inside}
   .prov-manual[open] summary{margin-bottom:4px}
   .sec-sep{border-top:1px solid #e2e8f0;margin:4px 0 16px}
+
+  /* المفتاح الرئيسي للإرسال لأولياء الأمور */
+  .mst{text-align:right;border-radius:12px;padding:14px 16px;margin-bottom:18px;
+       border:1px solid #e2e8f0;background:#f8fafc}
+  .mst.on{background:#f0fdf4;border-color:#bbf7d0}
+  .mst.off{background:#fef2f2;border-color:#fecaca}
+  .mst-h{font-weight:700;color:#1e3a5f;font-size:.95rem;margin-bottom:4px}
+  .mst-state{font-size:.88rem;font-weight:700;margin-bottom:4px;color:#475569}
+  .mst.on .mst-state{color:#166534}
+  .mst.off .mst-state{color:#991b1b}
+  .mst-sub{color:#64748b;font-size:.78rem;line-height:1.7;margin-bottom:10px}
+  #mst-msg{font-size:.8rem;line-height:1.7;margin-top:8px}
+  #mst-msg:empty{display:none}
 </style>
 </head>
 <body>
@@ -15213,6 +15284,14 @@ async def wa_connect_page(request: Request):
   <div style="font-size:2rem;margin-bottom:6px">📱</div>
   <h1>ربط واتساب المدرسة</h1>
   <p class="sub">امسح رمز QR بتطبيق واتساب لربط الحساب</p>
+
+  <div class="mst" id="mst">
+    <div class="mst-h">🛑 الإرسال لأولياء الأمور</div>
+    <div class="mst-state" id="mst-state">جارٍ التحقق...</div>
+    <p class="mst-sub" id="mst-detail">يوقف كل ما يُرسل تلقائياً لأولياء الأمور دفعةً واحدة — للإجازات والاختبارات.</p>
+    <button class="btn btn-ghost" id="btn-mst" onclick="toggleMaster()" disabled>…</button>
+    <div id="mst-msg"></div>
+  </div>
 
   <div class="prov" id="prov">
     <div class="prov-h">☁️ مزوّد الواتساب</div>
@@ -15550,6 +15629,43 @@ function fillProvider(d){
   else{ ps.textContent='لم تُفعَّل الخدمة السحابية لهذه المدرسة بعد'; ps.className='ps-off'; }
   provChanged();
 }
+/* المفتاح الرئيسي للإرسال لأولياء الأمور — هذه الكتلة نصٌّ بايثون عادي:
+   لا شرطة مائلة فيها (كانت تصير سطراً حقيقياً داخل نصّ جافاسكربت). */
+function mstRender(d){
+  var box=document.getElementById('mst'),st=document.getElementById('mst-state'),
+      det=document.getElementById('mst-detail'),b=document.getElementById('btn-mst');
+  if(!box||!d||!d.ok)return;
+  var on=(d.items||[]).filter(function(i){return i.on;}).map(function(i){return i.name;});
+  box.className='mst '+(d.master?'on':'off');
+  b.disabled=false;
+  if(d.master){
+    st.textContent='✅ مُشغَّل';
+    det.textContent=on.length?('يعمل تلقائياً الآن: '+on.join('، ')+'.')
+      :'المفتاح مُشغَّل، لكن كل المهام التلقائية لأولياء الأمور مطفأة فردياً.';
+    b.textContent='⛔ إيقاف الإرسال لأولياء الأمور';b.className='btn btn-danger';b.setAttribute('data-on','1');
+  }else{
+    st.textContent='⛔ موقوف';
+    det.textContent='لا تخرج رسالة تلقائية لوليّ أمر — ومنها إشعارات جهاز البصمة — ولا يُستقبل ردّهم. '
+      +'الإرسال اليدوي والتقرير اليومي للإدارة يعملان كالمعتاد، وعند التشغيل يعود كل شيء كما كان.';
+    b.textContent='▶ تشغيل الإرسال لأولياء الأمور';b.className='btn btn-primary';b.setAttribute('data-on','0');
+  }
+}
+async function loadMaster(){
+  try{var r=await fetch('/web/api/wa/parent-sending');mstRender(await r.json());}catch(e){}
+}
+async function toggleMaster(){
+  var b=document.getElementById('btn-mst'),m=document.getElementById('mst-msg');
+  var turnOn=b.getAttribute('data-on')!=='1';
+  if(!turnOn&&!confirm('إيقاف كل ما يُرسل تلقائياً لأولياء الأمور، ومنه إشعارات جهاز البصمة؟ الإرسال اليدوي يبقى يعمل.'))return;
+  b.disabled=true;m.className='pm-wait';m.textContent='⏳ جارٍ الحفظ...';
+  try{
+    var r=await fetch('/web/api/wa/parent-sending',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({on:turnOn})});
+    var d=await r.json();
+    if(d&&d.ok){mstRender(d);m.className='pm-ok';m.textContent=d.msg||'';}
+    else{m.className='pm-err';m.textContent=(d&&d.msg)||'تعذّر الحفظ';b.disabled=false;}
+  }catch(e){m.className='pm-err';m.textContent='تعذّر الاتصال بالخادم';b.disabled=false;}
+}
 async function loadProvider(){
   try{
     var r=await fetch('/web/api/wa/provider'); var d=await r.json();
@@ -15654,6 +15770,7 @@ async function cloudLogout(){
 
 // ابدأ فور تحميل الصفحة: المزوّد أولاً — يقرّر أيّ القسمين يُعرض ويُفحص
 showSpinner(true); showQRDiv(false);
+loadMaster();
 loadProvider();
 loadBots();
 </script>
