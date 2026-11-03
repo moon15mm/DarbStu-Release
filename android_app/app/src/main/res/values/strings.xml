@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">درب</string>
+    <string name="title_schools">مدارسي</string>
+    <string name="subtitle_schools">اختر المدرسة للدخول إلى نظامها، أو أضف مدرسة جديدة برمزها.</string>
+    <string name="add_school">إضافة مدرسة</string>
+    <string name="no_schools">لم تُضف أي مدرسة بعد.\nاطلب رمز المدرسة من إدارتها (مثل: alnoor) ثم اضغط «إضافة مدرسة».</string>
+    <string name="dialog_add_title">ربط مدرسة</string>
+    <string name="dialog_add_hint">رمز المدرسة أو رابطها</string>
+    <string name="dialog_add_help">اكتب رمز المدرسة كما في رابطها، مثلاً alnoor من alnoor.darbstu.com — أو الصق الرابط كاملاً.</string>
+    <string name="connect">ربط</string>
+    <string name="cancel">إلغاء</string>
+    <string name="checking">جارٍ التحقق من المدرسة…</string>
+    <string name="err_empty">اكتب رمز المدرسة</string>
+    <string name="err_invalid">الرمز غير صالح — حروف إنجليزية وأرقام وشرطة فقط</string>
+    <string name="err_unreachable">تعذّر الوصول إلى هذه المدرسة. تأكد من الرمز، ومن أن جهاز المدرسة يعمل ومتصل بالإنترنت.</string>
+    <string name="err_not_darb">الرابط يعمل لكنه ليس نظام درب.</string>
+    <string name="added">تمت إضافة %1$s</string>
+    <string name="remove">حذف</string>
+    <string name="rename">إعادة تسمية</string>
+    <string name="remove_confirm">حذف «%1$s» من القائمة؟ سيُسجَّل خروجك منها على هذا الجهاز.</string>
+    <string name="offline_title">لا يوجد اتصال</string>
+    <string name="offline_body">تعذّر فتح نظام المدرسة. تحقق من اتصالك بالإنترنت، أو أن جهاز المدرسة يعمل.</string>
+    <string name="retry">إعادة المحاولة</string>
+    <string name="switch_school">تبديل المدرسة</string>
+    <string name="downloading">جارٍ التنزيل…</string>
+    <string name="downloaded">تم حفظ الملف في التنزيلات</string>
+    <string name="download_failed">تعذّر تنزيل الملف</string>
+    <string name="open">فتح</string>
+    <string name="press_back_again">اضغط رجوع مرة أخرى للعودة إلى قائمة المدارس</string>
+    <string name="choose_file">اختر ملفاً</string>
+</resources>

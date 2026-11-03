@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- أيقونة: قبّعة تخرّج فوق طريق (درب) -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M54,30 L84,44 L54,58 L24,44 Z" />
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M36,50 L36,62 C36,68 72,68 72,62 L72,50 L54,58 Z" />
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M80,46 L82,46 L82,60 L80,60 Z" />
+    <path android:fillColor="#90CAF9"
+        android:pathData="M48,72 L60,72 L66,82 L42,82 Z" />
+</vector>

@@ -364,9 +364,20 @@ async def noor_mock_page():
 
 @router.get("/health")
 async def health_check():
-    """مسار اختبار صحة الاتصال بالسيرفر."""
+    """مسار اختبار صحة الاتصال بالسيرفر.
+
+    يستعمله تطبيق الأندرويد للتحقق من رمز المدرسة وعرض اسمها قبل
+    الدخول — لذا يحمل `app` و`school_name` (الاسم معروض أصلاً في صفحة
+    الدخول العامة، فلا يكشف شيئاً جديداً).
+    """
+    try:
+        _school = load_config().get("school_name", "") or ""
+    except Exception:
+        _school = ""
     return {
         "status": "ok",
+        "app": "darbstu",
+        "school_name": _school,
         "timestamp": datetime.datetime.now().isoformat(),
         "version": "1.0.0"
     }

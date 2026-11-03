@@ -42,6 +42,7 @@ _PROTECTED = {
     "data", "my-whatsapp-server", "my-whatsapp-server/",
     "__pycache__", ".git", ".github",
     "Output", "build", "dist",
+    "android_app",        # مصدر تطبيق الأندرويد — لا شأن لأجهزة المدارس به
 }
 
 # ملفات جذر المشروع المحمية (أسرار التثبيت وبيانات الترخيص)
