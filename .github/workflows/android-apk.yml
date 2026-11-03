@@ -27,7 +27,8 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
+      # ‏Android SDK مثبّت مسبقاً على مشغّلات ubuntu-latest (ANDROID_HOME)
+      # ويُنزّل Gradle أي منصة ناقصة تلقائياً.
 
       - uses: gradle/actions/setup-gradle@v4
 
