@@ -6,6 +6,8 @@ import android.view.LayoutInflater
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.widget.EditText
+import android.webkit.WebSettings
+import androidx.core.widget.doAfterTextChanged
 import android.widget.PopupMenu
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
@@ -112,7 +114,9 @@ class SchoolsActivity : AppCompatActivity() {
             .setView(d.root)
             .setPositiveButton(R.string.connect, null)   // يُربط لاحقاً حتى لا يُغلق الحوار عند الخطأ
             .setNegativeButton(R.string.cancel, null)
+            .setNeutralButton(R.string.connect_anyway, null)
             .create()
+        var failedHost: String? = null
 
         fun submit() {
             val raw = d.input.text?.toString().orEmpty()
@@ -125,7 +129,7 @@ class SchoolsActivity : AppCompatActivity() {
             btn.isEnabled = false
             d.inputLayout.helperText = getString(R.string.checking)
             Thread {
-                val result = SchoolStore.check(host)
+                val result = SchoolStore.check(host, userAgent)
                 runOnUiThread {
                     if (isFinishing) return@runOnUiThread
                     d.progress.visibility = View.GONE
@@ -140,22 +144,50 @@ class SchoolsActivity : AppCompatActivity() {
                             dialog.dismiss()
                             open(school)
                         }
-                        SchoolCheck.NotDarb ->
+                        SchoolCheck.NotDarb -> {
                             d.inputLayout.error = getString(R.string.err_not_darb)
-                        SchoolCheck.Unreachable ->
-                            d.inputLayout.error = getString(R.string.err_unreachable)
+                            failedHost = host
+                        }
+                        is SchoolCheck.Unreachable -> {
+                            d.inputLayout.error = getString(R.string.err_unreachable) +
+                                if (result.detail.isNotBlank()) "\n(" + host + " — " + result.detail + ")" else ""
+                            failedHost = host
+                        }
                     }
+                    dialog.getButton(AlertDialog.BUTTON_NEUTRAL).visibility =
+                        if (failedHost != null) View.VISIBLE else View.GONE
                 }
             }.start()
         }
 
         dialog.setOnShowListener {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener { submit() }
+            // «اتصال على أي حال»: يظهر بعد فشل التحقق فقط، ويفتح النطاق في
+            // المتصفح الداخلي ليرى المستخدم ما يعرضه الخادم فعلاً.
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).apply {
+                visibility = View.GONE
+                setOnClickListener {
+                    val h = failedHost ?: return@setOnClickListener
+                    val school = School(h, h.substringBefore('.'))
+                    store.upsert(school)
+                    dialog.dismiss()
+                    open(school)
+                }
+            }
+        }
+        d.input.doAfterTextChanged {
+            failedHost = null
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL)?.visibility = View.GONE
         }
         d.input.setOnEditorActionListener { _, action, _ ->
             if (action == EditorInfo.IME_ACTION_DONE) { submit(); true } else false
         }
         dialog.show()
+    }
+
+    private val userAgent: String by lazy {
+        (try { WebSettings.getDefaultUserAgent(this) } catch (_: Exception) { "Mozilla/5.0 (Linux; Android)" }) +
+            " DarbStuApp/" + BuildConfig.VERSION_NAME
     }
 
     private fun open(school: School) {

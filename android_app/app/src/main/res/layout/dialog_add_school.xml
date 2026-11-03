@@ -22,6 +22,7 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="12dp"
+        android:layoutDirection="ltr"
         android:hint="@string/dialog_add_hint"
         app:suffixText=".darbstu.com">
 

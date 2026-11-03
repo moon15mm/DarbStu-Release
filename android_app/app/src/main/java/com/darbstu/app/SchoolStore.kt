@@ -18,7 +18,7 @@ data class School(val host: String, val name: String) {
 sealed class SchoolCheck {
     data class Ok(val schoolName: String) : SchoolCheck()
     object NotDarb : SchoolCheck()
-    object Unreachable : SchoolCheck()
+    data class Unreachable(val detail: String) : SchoolCheck()
 }
 
 /**
@@ -93,26 +93,48 @@ class SchoolStore(context: Context) {
             return if (HOST_RE.matches(host)) host else null
         }
 
-        /** يتحقق أن النطاق يخدم نظام درب فعلاً (عبر /health). يُستدعى خارج خيط الواجهة. */
-        fun check(host: String): SchoolCheck {
-            return try {
-                val conn = URL("https://$host/health").openConnection() as HttpURLConnection
-                conn.connectTimeout = 12000
-                conn.readTimeout = 12000
-                conn.setRequestProperty("Accept", "application/json")
-                conn.setRequestProperty("User-Agent", "DarbStuApp")
+        /**
+         * يتحقق أن النطاق يخدم نظام درب. يُستدعى خارج خيط الواجهة.
+         *
+         * يُرسل بهوية متصفح الجهاز نفسه: حماية Cloudflare قد ترفض طلباً
+         * بهوية غير معروفة فيبدو النطاق معطّلاً وهو يعمل. ويُجرّب /health
+         * ثم صفحة الدخول (المدارس الأقدم أو خوادم تحجب /health).
+         */
+        fun check(host: String, userAgent: String): SchoolCheck {
+            var lastDetail = ""
+            for (path in listOf("/health", "/web/login")) {
                 try {
-                    if (conn.responseCode != 200) return SchoolCheck.Unreachable
-                    val body = conn.inputStream.bufferedReader().use { it.readText() }
-                    val json = try { JSONObject(body) } catch (_: Exception) { return SchoolCheck.NotDarb }
-                    if (json.optString("status") != "ok") return SchoolCheck.NotDarb
-                    SchoolCheck.Ok(json.optString("school_name", ""))
-                } finally {
-                    conn.disconnect()
+                    val conn = URL("https://$host$path").openConnection() as HttpURLConnection
+                    conn.connectTimeout = 15000
+                    conn.readTimeout = 15000
+                    conn.instanceFollowRedirects = true
+                    conn.setRequestProperty("User-Agent", userAgent)
+                    conn.setRequestProperty("Accept", "application/json, text/html;q=0.9, */*;q=0.8")
+                    try {
+                        val code = conn.responseCode
+                        if (code != 200) { lastDetail = "HTTP $code"; continue }
+                        val body = conn.inputStream.bufferedReader().use { it.readText() }
+                        if (path == "/health") {
+                            val json = try { JSONObject(body) } catch (_: Exception) { null }
+                            if (json != null && json.optString("status") == "ok") {
+                                return SchoolCheck.Ok(json.optString("school_name", ""))
+                            }
+                            lastDetail = "health: not darb"
+                        } else {
+                            // صفحة دخول درب تستدعي /web/api/login
+                            if (body.contains("/web/api/login")) return SchoolCheck.Ok("")
+                            return SchoolCheck.NotDarb
+                        }
+                    } finally {
+                        conn.disconnect()
+                    }
+                } catch (e: java.net.UnknownHostException) {
+                    return SchoolCheck.Unreachable("DNS: لا يوجد نطاق بهذا الاسم")
+                } catch (e: Exception) {
+                    lastDetail = e.javaClass.simpleName + (e.message?.let { ": $it" } ?: "")
                 }
-            } catch (_: Exception) {
-                SchoolCheck.Unreachable
             }
+            return SchoolCheck.Unreachable(lastDetail)
         }
     }
 }

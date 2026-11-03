@@ -148,13 +148,14 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
-                if (request.isForMainFrame && !isPopup) showOffline(getString(R.string.offline_body))
+                if (request.isForMainFrame && !isPopup)
+                    showOffline(getString(R.string.offline_body) + "\n\n" + host + "\n" + error.description)
             }
 
             override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, response: WebResourceResponse) {
                 // 502/530 من Cloudflare = النفق يعمل لكن جهاز المدرسة مطفأ أو بلا إنترنت
                 if (request.isForMainFrame && !isPopup && response.statusCode in setOf(502, 503, 504, 521, 522, 523, 530)) {
-                    showOffline(getString(R.string.err_unreachable))
+                    showOffline(getString(R.string.err_unreachable) + "\n\n" + host + " — HTTP " + response.statusCode)
                 }
             }
         }

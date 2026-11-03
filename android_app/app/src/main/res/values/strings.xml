@@ -9,6 +9,7 @@
     <string name="dialog_add_hint">رمز المدرسة أو رابطها</string>
     <string name="dialog_add_help">اكتب رمز المدرسة كما في رابطها، مثلاً alnoor من alnoor.darbstu.com — أو الصق الرابط كاملاً.</string>
     <string name="connect">ربط</string>
+    <string name="connect_anyway">اتصال على أي حال</string>
     <string name="cancel">إلغاء</string>
     <string name="checking">جارٍ التحقق من المدرسة…</string>
     <string name="err_empty">اكتب رمز المدرسة</string>
