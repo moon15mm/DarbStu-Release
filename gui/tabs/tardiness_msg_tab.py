@@ -72,7 +72,7 @@ class TardinessMessagesTabMixin:
 
         tpl_top = ttk.Frame(tpl_lf); tpl_top.pack(fill="x", pady=(0,4))
         ttk.Label(tpl_top,
-                  text="المتغيرات: {student_name} {class_name} {date} {minutes_late} {school_name}",
+                  text="المتغيرات: {student_name} {class_name} {date} {minutes_late} {school_name} {start_time} {arrival_time}",
                   foreground="#5A6A7E", font=("Tahoma",9)).pack(side="right")
         ttk.Button(tpl_top, text="حفظ القالب",
                    command=self._tard_msg_save_template).pack(side="left")

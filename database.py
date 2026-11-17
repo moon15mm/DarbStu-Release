@@ -5468,6 +5468,8 @@ def _sync_config_from_server():
             "tardiness_message_template", "message_template",
             "alert_absence_threshold", "alert_tardiness_threshold",
             "period_times", "school_start_time",
+            # التوقيت الصيفي والشتوي — وإلا عرض الجهاز المكتبي توقيتاً غير ما على السيرفر
+            "school_timing", "school_start_time_summer", "school_start_time_winter",
         ]
         changed = False
         for key in SYNC_KEYS:

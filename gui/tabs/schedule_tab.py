@@ -73,9 +73,31 @@ class ScheduleTabMixin:
         # ─── وقت بداية الدوام (لحساب التأخر) ──────────────────
         start_frame = ttk.LabelFrame(main_controls_frame, text=" 🏫 بداية الدوام ")
         start_frame.pack(side="right", fill="y", padx=(0,6))
-        ttk.Label(start_frame, text="وقت بداية الدوام:", font=("Tahoma",10)).pack(pady=(8,2))
+        # التوقيت الصيفي والشتوي: وقتٌ محفوظ لكلٍّ منهما، والمختار هو بداية الدوام
+        from config_manager import TIMING_DEFAULTS
+        self.school_timing_var = tk.StringVar(
+            value=self.cfg.get("school_timing") if self.cfg.get("school_timing") in TIMING_DEFAULTS
+            else "summer")
+        self._timing_prev = self.school_timing_var.get()
+
+        def _season_changed():
+            prev, s = self._timing_prev, self.school_timing_var.get()
+            v = self.school_start_var.get().strip()
+            if v:          # وقتٌ عُدّل قبل التبديل لا يضيع
+                self.cfg["school_start_time_" + prev] = v
+            self.school_start_var.set(self.cfg.get("school_start_time_" + s) or TIMING_DEFAULTS[s])
+            self._timing_prev = s
+
+        season_row = ttk.Frame(start_frame)
+        season_row.pack(pady=(8, 0))
+        ttk.Radiobutton(season_row, text="☀️ صيفي", value="summer",
+                        variable=self.school_timing_var, command=_season_changed).pack(side="right", padx=3)
+        ttk.Radiobutton(season_row, text="❄️ شتوي", value="winter",
+                        variable=self.school_timing_var, command=_season_changed).pack(side="right", padx=3)
+        ttk.Label(start_frame, text="وقت بداية الدوام:", font=("Tahoma",10)).pack(pady=(6,2))
         self.school_start_var = tk.StringVar(
-            value=self.cfg.get("school_start_time","07:00"))
+            value=self.cfg.get("school_start_time_" + self.school_timing_var.get())
+            or self.cfg.get("school_start_time", "07:00"))
         start_entry = ttk.Entry(start_frame, textvariable=self.school_start_var,
                                  width=8, justify="center", font=("Courier",12,"bold"))
         start_entry.pack(padx=10, pady=4)
@@ -502,9 +524,12 @@ class ScheduleTabMixin:
 
         period_times = [self.schedule_time_vars[p].get() for p in range(1, 8)]
         self.cfg["period_times"] = period_times
-        # حفظ وقت بداية الدوام
+        # حفظ وقت بداية الدوام — وقتاً للتوقيت المختار (صيفي/شتوي)، فيصير هو بداية الدوام
         if hasattr(self, "school_start_var"):
-            self.cfg["school_start_time"] = self.school_start_var.get().strip()
+            from config_manager import apply_school_timing
+            apply_school_timing(self.cfg, season=getattr(self, "school_timing_var", None)
+                                and self.school_timing_var.get(),
+                                start=self.school_start_var.get().strip())
         try:
             with open(CONFIG_JSON, "w", encoding="utf-8") as f:
                 json.dump(self.cfg, f, ensure_ascii=False, indent=2)

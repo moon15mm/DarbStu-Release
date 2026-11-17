@@ -112,6 +112,7 @@ async def bio_get_config(request: Request):
         # المفتاح الرئيسي يعلو خانة الإشعار — تنبّه إليه الصفحة كي لا يُظنّ عطلاً
         "parent_master": bool(cfg.get("bots_master_enabled", True)),
         "school_start_time": cfg.get("school_start_time", "07:00"),
+        "school_timing": cfg.get("school_timing", ""),
         "devices": cfg.get("biometric_devices") or [],
     })
 
@@ -1112,7 +1113,8 @@ async function loadConfig(){
   $('c-grace').value=d.grace_min;
   $('c-notify').checked=d.notify_parent;
   $('c-master-off').style.display=(d.parent_master===false)?'block':'none';
-  $('c-start').textContent=d.school_start_time;
+  $('c-start').textContent=d.school_start_time+(d.school_timing==='winter'?' (التوقيت الشتوي)'
+    :(d.school_timing==='summer'?' (التوقيت الصيفي)':''));
   DEVICES=d.devices||[]; renderDevices();
 }
 function renderDevices(){

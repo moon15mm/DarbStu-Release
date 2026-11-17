@@ -85,7 +85,9 @@ async def schedule_save_day(request: Request):
             cfg["period_times"] = [str(x).strip() for x in pt]
         sst = d.get("school_start_time")
         if sst:
-            cfg["school_start_time"] = str(sst).strip()
+            # يصير وقتَ التوقيت المختار (صيفي/شتوي) — لا يُكتب منفصلاً عنه
+            from config_manager import apply_school_timing
+            apply_school_timing(cfg, start=str(sst).strip())
         save_config(cfg)
         return JSONResponse({"ok": True})
     except Exception as e:

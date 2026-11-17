@@ -52,13 +52,17 @@ def _riyadh_today():
 
 
 def _minutes_late(arrival_local, start_str, grace):
-    """دقائق التأخر من وقت الوصول مقابل بداية الدوام + السماح."""
+    """
+    دقائق التأخر من بداية الدوام **الرسمية**، وصفرٌ لمن حضر ضمن السماح —
+    فالسماح يقرّر «متأخرٌ أم لا» وحده، كما في معالجة البصمات ورسالة التأخر.
+    """
     try:
         t_arr = datetime.datetime.fromisoformat(
             arrival_local.replace("Z", "")).strftime("%H:%M")
         a = datetime.datetime.strptime(t_arr, "%H:%M")
         s = datetime.datetime.strptime(start_str[:5], "%H:%M")
-        return max(int((a - s).total_seconds() / 60) - int(grace or 0), 0)
+        d = int((a - s).total_seconds() / 60)
+        return d if d > int(grace or 0) else 0
     except Exception:
         return 0
 

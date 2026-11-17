@@ -4454,13 +4454,21 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
   <div id="ss-day" class="ip">
     <div class="section">
       <div class="st">⏰ بداية الدوام واحتساب التأخر</div>
-      <div class="ab ai">📌 على هذين الحقلين يُحسب التأخر — في التسجيل اليدوي وفي جهاز البصمة معاً.</div>
+      <div class="ab ai">📌 على بداية الدوام (للتوقيت المختار) ودقائق السماح يُحسب التأخر — في التسجيل اليدوي وفي جهاز البصمة معاً، ومنها تذكر رسالة التأخر بداية الدوام.</div>
+      <div class="fg" style="margin-bottom:6px"><label class="fl">التوقيت الحالي</label>
+        <div style="display:flex;gap:22px;align-items:center;padding:6px 0">
+          <label style="display:flex;gap:6px;align-items:center;cursor:pointer;font-weight:600"><input type="radio" name="sd-season" value="summer" onchange="sdSeason()"> ☀️ صيفي</label>
+          <label style="display:flex;gap:6px;align-items:center;cursor:pointer;font-weight:600"><input type="radio" name="sd-season" value="winter" onchange="sdSeason()"> ❄️ شتوي</label>
+        </div></div>
       <div class="fg2">
-        <div class="fg"><label class="fl">بداية الدوام</label>
-          <input type="time" id="sd-start" onchange="sdPreview()"></div>
+        <div class="fg"><label class="fl">بداية الدوام — الصيفي</label>
+          <input type="time" id="sd-start-summer" onchange="sdSeason()"></div>
+        <div class="fg"><label class="fl">بداية الدوام — الشتوي</label>
+          <input type="time" id="sd-start-winter" onchange="sdSeason()"></div>
         <div class="fg"><label class="fl">دقائق السماح بعد البداية</label>
           <input type="number" id="sd-grace" min="0" max="60" value="0" onchange="sdPreview()"></div>
       </div>
+      <input type="hidden" id="sd-start">
       <div id="sd-preview" style="margin:10px 0;font-size:13.5px"></div>
       <div class="st" style="margin-top:16px">أوقات الحصص</div>
       <div class="fg" style="max-width:220px"><label class="fl">عدد الحصص اليومية</label>
@@ -4475,7 +4483,8 @@ def _web_dashboard_html(username: str, role: str, allowed_tabs) -> str:
       <div class="st">قالب رسالة الغياب</div>
       <textarea id="ss-abs-tpl" rows="4" placeholder="{school_name} {student_name} {date} {guardian} {son}"></textarea>
       <div class="st" style="margin-top:14px">قالب رسالة التأخر</div>
-      <textarea id="ss-tard-tpl" rows="4" placeholder="{student_name} {minutes_late} {date}"></textarea>
+      <textarea id="ss-tard-tpl" rows="4" placeholder="{student_name} {minutes_late} {date} {start_time}"></textarea>
+      <div style="font-size:12px;color:#64748b;margin-top:6px;line-height:1.9">المتغيّرات: {student_name} اسم الطالب · {minutes_late} دقائق التأخر من بداية الدوام الرسمية · {date} التاريخ · <b>{start_time}</b> بداية الدوام الرسمية من «بداية الدوام واحتساب التأخر» — تتغيّر وحدها مع التوقيت الشتوي والصيفي، ولا يدخلها السماح · <b>{arrival_time}</b> وقت الحضور</div>
       <button class="btn bp1" style="margin-top:12px" onclick="saveMsgTemplates()">💾 حفظ القوالب</button>
     </div>
   </div>
@@ -7401,7 +7410,12 @@ async function loadSettings(){
   if(d.admin_report_phone)document.getElementById('ss-rpt-phone').value=d.admin_report_phone;
 
   /* الدوام والتأخر */
-  document.getElementById('sd-start').value = d.school_start_time||'07:00';
+  /* التوقيت الصيفي والشتوي: وقتٌ لكلٍّ منهما، والمختار هو بداية الدوام (sd-start مخفيّ) */
+  var _ss=(d.school_timing==='winter')?'winter':'summer';
+  document.getElementById('sd-start-summer').value = d.school_start_time_summer||'06:45';
+  document.getElementById('sd-start-winter').value = d.school_start_time_winter||'07:00';
+  var _rb=document.querySelector('input[name="sd-season"][value="'+_ss+'"]'); if(_rb)_rb.checked=true;
+  document.getElementById('sd-start').value = d.school_start_time||document.getElementById('sd-start-'+_ss).value;
   document.getElementById('sd-grace').value = (d.biometric_grace_min!=null)?d.biometric_grace_min:0;
   _sdTimes = (d.period_times&&d.period_times.length)?d.period_times.slice()
              :['07:00','07:50','08:40','09:50','10:40','11:30','12:20'];
@@ -7423,14 +7437,24 @@ async function saveSchoolSettings(){
 var _sdTimes = [];
 function _hm(s){var p=String(s||'').split(':');return (parseInt(p[0])||0)*60+(parseInt(p[1])||0);}
 function _mh(m){m=((m%1440)+1440)%1440;return ('0'+Math.floor(m/60)).slice(-2)+':'+('0'+(m%60)).slice(-2);}
+function sdSeasonSel(){
+  var r=document.querySelector('input[name="sd-season"]:checked');return r?r.value:'summer';}
+function sdSeason(){
+  /* بداية الدوام = وقت التوقيت المختار */
+  var v=document.getElementById('sd-start-'+sdSeasonSel()).value;
+  document.getElementById('sd-start').value=v||'';
+  sdPreview();
+}
 function sdPreview(){
   var el=document.getElementById('sd-preview');if(!el)return;
   var st=document.getElementById('sd-start').value||'07:00';
   var g=parseInt(document.getElementById('sd-grace').value)||0;
   var cut=_mh(_hm(st)+g);
-  el.innerHTML= g>0
-    ? 'الدوام يبدأ <b>'+st+'</b>، ومن تصل بعد <b>'+cut+'</b> تُحتسب متأخرة ('+g+' دقيقة سماح).'
-    : 'الدوام يبدأ <b>'+st+'</b>، ومن تصل بعده تُحتسب متأخرة (بلا سماح).';
+  var sn=(sdSeasonSel()==='winter')?'❄️ التوقيت الشتوي':'☀️ التوقيت الصيفي';
+  el.innerHTML= sn+': '+(g>0
+    ? 'الدوام يبدأ <b>'+st+'</b>، ومن تصل بعد <b>'+cut+'</b> تُحتسب متأخرة ('+g+' دقيقة سماح)، '
+      +'وتُعدّ دقائق تأخرها من <b>'+st+'</b> — وهي بداية الدوام التي تذكرها رسالة التأخر.'
+    : 'الدوام يبدأ <b>'+st+'</b>، ومن تصل بعده تُحتسب متأخرة (بلا سماح).');
 }
 function sdBuildPeriods(){
   var n=parseInt(document.getElementById('sd-count').value)||7;
@@ -7453,6 +7477,10 @@ function sdCollect(){
   return out.filter(function(x){return x;});
 }
 async function saveDaySettings(){
+  sdSeason();
+  var sum=document.getElementById('sd-start-summer').value,
+      win=document.getElementById('sd-start-winter').value, season=sdSeasonSel();
+  if(!sum||!win){ss('sd-st','حدّد بداية الدوام للتوقيتين الصيفي والشتوي','er');return;}
   var st=document.getElementById('sd-start').value;
   if(!st){ss('sd-st','حدّد بداية الدوام','er');return;}
   var times=sdCollect();
@@ -7465,11 +7493,13 @@ async function saveDaySettings(){
   ss('sd-st','⏳ جارٍ الحفظ...','ai');
   var r=await fetch('/web/api/save-config',{method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({school_start_time:st,
+    body:JSON.stringify({school_timing:season,school_start_time_summer:sum,
+      school_start_time_winter:win,school_start_time:st,
       biometric_grace_min:parseInt(document.getElementById('sd-grace').value)||0,
       period_times:times})});
   var d=await r.json();
-  if(d.ok){_sdTimes=times;ss('sd-st','✅ حُفظ — يسري على التسجيل اليدوي وجهاز البصمة','ok');}
+  if(d.ok){_sdTimes=times;ss('sd-st','✅ حُفظ — '+(season==='winter'?'التوقيت الشتوي':'التوقيت الصيفي')
+    +'، بداية الدوام '+st+' — يسري على التسجيل اليدوي وجهاز البصمة ورسالة التأخر','ok');}
   else ss('sd-st','❌ '+(d.msg||'خطأ'),'er');
 }
 async function saveMsgTemplates(){
@@ -11575,7 +11605,21 @@ async def web_save_config(req: Request):
     try:
         data = await req.json()
         cfg  = load_config()
+        # التوقيت الصيفي والشتوي: لا يُكتب school_start_time مباشرةً فينفصل عن
+        # التوقيت المختار — يمرّ بـapply_school_timing. والصفحة القديمة (بلا التوقيتين)
+        # ترسل الوقت وحده فيصير وقتَ التوقيت المختار.
+        _tk = ("school_timing", "school_start_time_summer", "school_start_time_winter",
+               "school_start_time")
+        timing = {k: data.pop(k) for k in _tk if k in data}
         cfg.update(data)
+        if timing:
+            from config_manager import apply_school_timing
+            if set(timing) - {"school_start_time"}:
+                apply_school_timing(cfg, season=timing.get("school_timing"),
+                                    summer=timing.get("school_start_time_summer"),
+                                    winter=timing.get("school_start_time_winter"))
+            else:
+                apply_school_timing(cfg, start=timing["school_start_time"])
         with open(CONFIG_JSON, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
         global _CONFIG_CACHE, _CONFIG_MTIME

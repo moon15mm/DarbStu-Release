@@ -8,6 +8,17 @@ import constants as _const
 from constants import (DATA_DIR, CONFIG_JSON, DB_PATH, BASE_DIR,
                        TZ_OFFSET, _ensure_matplotlib)
 
+# قالب التأخر الافتراضي حتى 3.6.77 — بلا بداية الدوام. مدرسةٌ ما زال قالبها
+# هو هذا حرفاً تنتقل إلى الجديد عند التحميل (load_config)، والمعدَّل لا يُمسّ.
+TARDY_TEMPLATE_V1 = (
+    "⏱ تنبيه تأخر من {school_name}\n"
+    "{guardian}/ {student_name}\n"
+    "نُحيطكم علماً بأن {son} {late_v} عن الحضور اليوم ({date})\n"
+    "بمقدار {minutes_late} دقيقة.\n"
+    "نأمل الاهتمام ب{his_attend} في الوقت المحدد.\n"
+    "مع التقدير،\nإدارة {school_name}"
+)
+
 DEFAULT_CONFIG = {
     "school_name": "اسم المدرسة",
     "education_region": "الإدارة العامة للتعليم",
@@ -24,7 +35,12 @@ DEFAULT_CONFIG = {
         "مع التقدير،\nإدارة المدرسة"
     ),
     "period_times": ["07:00", "07:50", "08:40", "09:50", "10:40", "11:30", "12:20"],
-    "school_start_time": "07:00",
+    # التوقيت الصيفي والشتوي للدوام: وقتان محفوظان والمختار منهما هو school_start_time
+    # (المصدر الوحيد لحساب التأخر والرسائل). انظر apply_school_timing.
+    "school_timing": "summer",
+    "school_start_time_summer": "06:45",
+    "school_start_time_winter": "07:00",
+    "school_start_time": "06:45",
     "tardiness_recipients": [],
     # ── جهاز البصمة عند البوابة ──────────────────────────────────
     # biometric_devices: قائمة أجهزة، كل عنصر:
@@ -37,11 +53,13 @@ DEFAULT_CONFIG = {
     "biometric_mode": "tardiness",
     "biometric_grace_min": 0,
     "biometric_notify_parent": True,
+    # {start_time} بداية الدوام الرسمية من الإعدادات — تتبع التوقيت الشتوي/الصيفي
+    # بلا تعديل القالب، ولا يدخلها السماح. انظر _render وTARDY_TEMPLATE_V1.
     "tardiness_message_template": (
         "⏱ تنبيه تأخر من {school_name}\n"
         "{guardian}/ {student_name}\n"
         "نُحيطكم علماً بأن {son} {late_v} عن الحضور اليوم ({date})\n"
-        "بمقدار {minutes_late} دقيقة.\n"
+        "بمقدار {minutes_late} دقيقة عن بداية الدوام الرسمي ({start_time}).\n"
         "نأمل الاهتمام ب{his_attend} في الوقت المحدد.\n"
         "مع التقدير،\nإدارة {school_name}"
     ),
@@ -199,10 +217,23 @@ def load_config() -> Dict[str, Any]:
             cfg = {}
 
     changes_made = False
+    # التوقيت الصيفي والشتوي (3.6.78): مدرسةٌ قائمة **يبقى وقتها كما هو** — يُعدّ
+    # شتوياً إن كان 7:00 فما بعد وإلا صيفياً، ويأخذ التوقيت الآخر افتراضه. قبل دمج
+    # الافتراضات، وإلا صار «صيفي 6:45» لمدرسةٍ ضبطت 7:00 فتغيّر حساب تأخرها.
+    if "school_timing" not in cfg and _hhmm(cfg.get("school_start_time")):
+        st = _hhmm(cfg.get("school_start_time"))
+        apply_school_timing(cfg, season="winter" if st >= "07:00" else "summer", start=st)
+        changes_made = True
     for key, default_value in DEFAULT_CONFIG.items():
         if key not in cfg:
             cfg[key] = default_value
             changes_made = True
+
+    # قالب التأخر الافتراضي القديم (بلا بداية الدوام) يصير الجديد — والقالب
+    # الذي عدّلته المدرسة لا يُمسّ؛ تضيف {start_time} إليه متى شاءت.
+    if cfg.get("tardiness_message_template") == TARDY_TEMPLATE_V1:
+        cfg["tardiness_message_template"] = DEFAULT_CONFIG["tardiness_message_template"]
+        changes_made = True
 
     # توليد توكن تلقائي إذا كان فارغاً (للجهاز الرئيسي)
     if not cfg.get("cloud_token"):
@@ -538,10 +569,79 @@ def render_template(tpl: str, **extra) -> str:
     return _render(tpl, **extra)
 
 
+# ═══════════════════════════════════════════════════════════════
+#  التوقيت الصيفي والشتوي للدوام (طلب ماهر ١٧ نوفمبر ٢٠٢٦)
+# ═══════════════════════════════════════════════════════════════
+# وقتان محفوظان (الصيفي 6:45 والشتوي 7:00 افتراضاً) واختيارٌ بينهما. ويبقى
+# school_start_time المصدرَ الوحيد لكل حساب — التأخر والرسائل والبصمة ورابط
+# التأخر — وهو دائماً وقتُ التوقيت المختار: كل كاتبٍ يمرّ بـapply_school_timing.
+TIMING_SEASONS = ("summer", "winter")
+TIMING_DEFAULTS = {"summer": "06:45", "winter": "07:00"}
+TIMING_NAMES = {"summer": "الصيفي", "winter": "الشتوي"}
+
+
+def _hhmm(v) -> str:
+    """'7:5' ← '07:05'، وما لا يُفهم ← ''."""
+    try:
+        return datetime.datetime.strptime(str(v).strip()[:5], "%H:%M").strftime("%H:%M")
+    except Exception:
+        return ""
+
+
+def apply_school_timing(cfg, season=None, summer=None, winter=None, start=None):
+    """
+    يضبط التوقيت في cfg ويجعل school_start_time وقتَ التوقيت المختار. يُرجع cfg.
+      season         'summer'|'winter' — التبديل
+      summer/winter  وقتا التوقيتين
+      start          وقتٌ مباشر من كاتبٍ لا يعرف التوقيتين (صفحة الجدول، والمكتبي القديم)
+                     ⇒ يصير وقتَ التوقيت المختار، فلا ينفصل عنه
+    والقيمة غير المفهومة تُتجاهل ويبقى ما كان.
+    """
+    cur = cfg.get("school_timing")
+    if cur not in TIMING_SEASONS:
+        cur = "summer"
+    if season in TIMING_SEASONS:
+        cur = season
+    for s, v in (("summer", summer), ("winter", winter)):
+        if _hhmm(v):
+            cfg["school_start_time_" + s] = _hhmm(v)
+    if _hhmm(start):
+        cfg["school_start_time_" + cur] = _hhmm(start)
+    for s in TIMING_SEASONS:
+        if not _hhmm(cfg.get("school_start_time_" + s)):
+            cfg["school_start_time_" + s] = TIMING_DEFAULTS[s]
+    cfg["school_timing"] = cur
+    cfg["school_start_time"] = cfg["school_start_time_" + cur]
+    return cfg
+
+
+def format_clock(hhmm) -> str:
+    """'07:05' ← «7:05 صباحاً» · '13:30' ← «1:30 مساءً». وما لا يُفهم يعود كما هو."""
+    try:
+        h, m = [int(x) for x in str(hhmm).strip()[:5].split(":")]
+        return "%d:%02d %s" % ((h % 12) or 12, m, "صباحاً" if h < 12 else "مساءً")
+    except Exception:
+        return str(hhmm or "")
+
+
+def _tardiness_clock(cfg, minutes_late):
+    """وقت الحضور = بداية الدوام الرسمية + دقائق التأخر (تُحسب منها لا من السماح)."""
+    try:
+        s = datetime.datetime.strptime(str(cfg.get("school_start_time", "07:00"))[:5], "%H:%M")
+        return format_clock((s + datetime.timedelta(minutes=int(minutes_late))).strftime("%H:%M"))
+    except Exception:
+        return ""
+
+
 def _render(tpl: str, **extra) -> str:
     cfg = load_config()
     data = _SafeTerms(get_terms())
     data["school_name"] = cfg.get("school_name", "المدرسة")
+    # بداية الدوام الرسمية — من الإعدادات وقت الإرسال، فتتبع التوقيت الشتوي/الصيفي
+    # بلا تعديل القالب، ولا يدخلها السماح (طلب ماهر، ١٧ نوفمبر ٢٠٢٦)
+    data["start_time"] = format_clock(cfg.get("school_start_time", "07:00"))
+    if "minutes_late" in extra and "arrival_time" not in extra:
+        data["arrival_time"] = _tardiness_clock(cfg, extra.get("minutes_late"))
     data.update(extra)
     try:
         return tpl.format_map(data)

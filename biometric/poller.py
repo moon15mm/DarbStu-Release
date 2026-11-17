@@ -206,9 +206,13 @@ def process_pending(cfg=None):
             local = _now_local()
 
         reg_t = datetime.datetime.strptime(local.strftime("%H:%M"), "%H:%M")
-        minutes_late = int((reg_t - start_t).total_seconds() / 60) - grace
+        # الدقائق من بداية الدوام **الرسمية**، والسماح يقرّر وحده «متأخرٌ أم لا».
+        # كانت تُحسب بعد السماح: من حضر 07:20 والسماح عشر دقائق صار «متأخراً ١٠
+        # دقائق» — ورسالة التأخر تذكر بداية الدوام الرسمية، ورابط التأخر يحسب منها
+        # أصلاً. فصار ٢٠ في السجلّ والرسالة كليهما (طلب ماهر، ١٧ نوفمبر ٢٠٢٦).
+        minutes_late = int((reg_t - start_t).total_seconds() / 60)
 
-        if minutes_late <= 0:
+        if minutes_late <= grace:
             # حضر في الوقت — لا تأخر. نعلّمه حاضراً ولا نُشعر.
             #
             # كان الشرط مقيَّداً بـ`mode == "tardiness"`، فمدرسةٌ في وضع
@@ -252,6 +256,28 @@ def process_pending(cfg=None):
     return stat
 
 
+def _tardy_message(name, cname, date_str, local_dt, minutes_late):
+    """
+    رسالة التأخر من **قالب المدرسة نفسه** كالإرسال اليدوي. كانت نصاً ثابتاً لا يتبع
+    القالب ولا يذكر بداية الدوام، فلا يظهر فيها تغيّر التوقيت الشتوي/الصيفي.
+    وفي القالب {start_time} بداية الدوام الرسمية و{arrival_time} وقت البصمة.
+    """
+    from config_manager import load_config, render_template, format_clock, DEFAULT_CONFIG
+    cfg = load_config()
+    tpl = ((cfg.get("tardiness_message_template") or "").strip()
+           or DEFAULT_CONFIG["tardiness_message_template"])
+    arrival = format_clock(local_dt.strftime("%H:%M"))
+    msg = render_template(tpl, student_name=name, class_name=cname, date=date_str,
+                          minutes_late=minutes_late, arrival_time=arrival)
+    # قالبٌ معطوب (قوسٌ ناقص مثلاً) يعود من التصيير كما هو — فيُرسَل نصٌّ احتياطي
+    # لا قالبٌ خام. والقالب بلا متغيّرات نصٌّ اختارته المدرسة فيُرسَل كما هو.
+    if "{" in tpl and msg == tpl:
+        msg = ("تنبيه حضور\nالطالب: %s\nسجّل دخوله الساعة %s متأخّراً %d دقيقة عن بداية "
+               "الدوام الرسمي (%s)." % (name, arrival, minutes_late,
+                                       format_clock(cfg.get("school_start_time", "07:00"))))
+    return msg
+
+
 def _notify_parent(phone, name, local_dt, minutes_late, sid="", cname="", cid="",
                    date_str=""):
     """
@@ -270,11 +296,7 @@ def _notify_parent(phone, name, local_dt, minutes_late, sid="", cname="", cid=""
     except Exception:
         pass
     try:
-        t = local_dt.strftime("%I:%M")
-        msg = ("تنبيه حضور\n"
-               "الطالب: %s\n"
-               "سجّل دخوله الساعة %s متأخّراً %d دقيقة." %
-               (name, t, minutes_late))
+        msg = _tardy_message(name, cname, date_str or _today_local(), local_dt, minutes_late)
         if sid:
             from alerts_service import send_daily_message
             send_daily_message("tardiness", date_str or _today_local(), sid, name,
